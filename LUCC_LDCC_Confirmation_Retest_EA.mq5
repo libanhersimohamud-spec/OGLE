@@ -67,6 +67,14 @@ input int    InpExcursionTrackingHours  = 120;   // Hours from ENTRY to keep tra
 input group "1W Bias Filter"
 input bool   InpUseBiasFilter        = true;  // Gate entries on the Weekly (1W) directional bias
 
+input group "Weekly-Bias Trade Rule (A/B toggle)"
+input bool   InpStopAfterFirstWin    = true;  // ON  = after a WIN in the current weekly bias direction,
+                                               //       skip all further setups in that direction until a
+                                               //       NEW weekly bias (new weekly candle) begins.
+                                               // OFF = unlimited trades per weekly bias.
+                                               // Flip this to produce the two datasets to compare.
+                                               // (Losses never stop the direction; only a win does.)
+
 input group "Filters (isolation / debugging)"
 // NOTE: the trading-session gate has been REMOVED in this version — every valid
 // setup is taken regardless of session (data-collection mode). Session/UTC are
@@ -112,6 +120,11 @@ struct SSignalState
    long     positionId;
    int      tradesToday;
    bool     doneToday;   // true once a trade in this direction has won today
+   // Weekly-bias win lock: the weekly-bias episode (weekly candle-1 time) in
+   // which this side already booked a WIN. While the current episode equals
+   // this, InpStopAfterFirstWin blocks further entries in this direction; it
+   // clears automatically once a new weekly candle (new bias) begins. 0 = none.
+   datetime winBookedEpisode;
 
    // --- trade journal state (filled in TryOpen, consumed in HandlePositionClosed) ---
    datetime entryTime;
@@ -209,6 +222,7 @@ struct SPendingLog
    double   equityBefore;
    double   weekO, weekH, weekL, weekC;
    double   dayO,  dayH,  dayL,  dayC;
+   bool     firstWinOfBias;   // this trade was the FIRST winning trade of its weekly-bias episode
 };
 
 SPendingLog g_pending[];
@@ -241,6 +255,7 @@ long g_rejSlInvalid  = 0;
 long g_rejMinStop    = 0;
 long g_rejLots       = 0;
 long g_rejOrderFail  = 0;
+long g_skippedAfterWin = 0;   // setups skipped by the stop-after-first-win-per-weekly-bias rule
 
 bool g_lastSessionOpen  = false;  // for logging session OPEN/closed transitions
 bool g_haveSessionState = false;
@@ -888,6 +903,19 @@ bool TryOpen(bool isSell, SSignalState &st)
       return false;
    }
 
+   // Stop-after-first-win rule: once this side booked a WIN in the CURRENT
+   // weekly-bias episode (same weekly candle), skip further setups in this
+   // direction until a new weekly bias begins. Auto-clears when the weekly
+   // candle rolls over (winBookedEpisode != current c1Time). Losses do not
+   // trigger this. Toggle off for the "unlimited trades per weekly bias" set.
+   if(InpStopAfterFirstWin && g_bias.c1Time != 0 && st.winBookedEpisode == g_bias.c1Time)
+   {
+      g_skippedAfterWin++;
+      RecordWeeklySkip(TimeCurrent());
+      Dbg(side + " retest SKIP: a win was already booked in the current weekly-bias episode");
+      return false;
+   }
+
    double entry = isSell ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                           : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double structuralSl = st.slLevel;
@@ -1112,7 +1140,8 @@ void WriteTradeLogHeader()
       "EquityBefore",
       "WeeklyC1_Open", "WeeklyC1_High", "WeeklyC1_Low", "WeeklyC1_Close",
       "DailyPrev_Open", "DailyPrev_High", "DailyPrev_Low", "DailyPrev_Close",
-      "EntryServerTime", "EntryUTCTime"
+      "EntryServerTime", "EntryUTCTime",
+      "FirstWinOfBias", "StopAfterWinRule"
    };
    g_logCols = ArraySize(h);
    WriteCsvRow(h);
@@ -1124,7 +1153,8 @@ void WriteTradeLogHeader()
 // open by UpdateExcursion) so the series is continuous from entry onward.
 void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
                       datetime exitTime, double exitPrice, string exitReason,
-                      double grossProfit, double commission, double swap)
+                      double grossProfit, double commission, double swap,
+                      bool firstWinOfBias)
 {
    int n = ArraySize(g_pending);
    ArrayResize(g_pending, n + 1);
@@ -1177,6 +1207,7 @@ void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
    g_pending[n].weekL = st.journalWeekL; g_pending[n].weekC = st.journalWeekC;
    g_pending[n].dayO  = st.journalDayO;  g_pending[n].dayH  = st.journalDayH;
    g_pending[n].dayL  = st.journalDayL;  g_pending[n].dayC  = st.journalDayC;
+   g_pending[n].firstWinOfBias = firstWinOfBias;
 
    datetime windowEnd = st.entryTime + InpExcursionTrackingHours * 3600;
    g_pending[n].trackUntil = InpEnableExcursionTracking ? MathMax(exitTime, windowEnd) : exitTime;
@@ -1193,6 +1224,7 @@ struct SWeekStat
    int      trades, wins, losses, breakeven;
    double   totalR;
    int      curWin, curLoss, maxWin, maxLoss;
+   int      setupsSkipped;   // setups skipped this week by the stop-after-first-win rule
 };
 SWeekStat g_weeks[];
 
@@ -1202,21 +1234,31 @@ datetime WeekStartOf(datetime t)
    return (sh < 0) ? 0 : iTime(_Symbol, PERIOD_W1, sh);
 }
 
+int WeekBucketIndex(datetime weekStart)
+{
+   for(int i = 0; i < ArraySize(g_weeks); i++)
+      if(g_weeks[i].weekStart == weekStart)
+         return i;
+   int idx = ArraySize(g_weeks);
+   ArrayResize(g_weeks, idx + 1);
+   g_weeks[idx].weekStart = weekStart;
+   g_weeks[idx].trades = 0; g_weeks[idx].wins = 0; g_weeks[idx].losses = 0; g_weeks[idx].breakeven = 0;
+   g_weeks[idx].totalR = 0; g_weeks[idx].curWin = 0; g_weeks[idx].curLoss = 0;
+   g_weeks[idx].maxWin = 0; g_weeks[idx].maxLoss = 0; g_weeks[idx].setupsSkipped = 0;
+   return idx;
+}
+
+// A setup was skipped by the stop-after-first-win rule — tally it into the
+// week it occurred in, so the weekly CSV shows skip pressure per week.
+void RecordWeeklySkip(datetime whenServerTime)
+{
+   int idx = WeekBucketIndex(WeekStartOf(whenServerTime));
+   g_weeks[idx].setupsSkipped++;
+}
+
 void UpdateWeeklyStats(datetime entryTime, double rRealized, double netProfit)
 {
-   datetime wk = WeekStartOf(entryTime);
-   int idx = -1;
-   for(int i = 0; i < ArraySize(g_weeks); i++)
-      if(g_weeks[i].weekStart == wk) { idx = i; break; }
-   if(idx == -1)
-   {
-      idx = ArraySize(g_weeks);
-      ArrayResize(g_weeks, idx + 1);
-      g_weeks[idx].weekStart = wk;
-      g_weeks[idx].trades = 0; g_weeks[idx].wins = 0; g_weeks[idx].losses = 0; g_weeks[idx].breakeven = 0;
-      g_weeks[idx].totalR = 0; g_weeks[idx].curWin = 0; g_weeks[idx].curLoss = 0;
-      g_weeks[idx].maxWin = 0; g_weeks[idx].maxLoss = 0;
-   }
+   int idx = WeekBucketIndex(WeekStartOf(entryTime));
    g_weeks[idx].trades++;
    g_weeks[idx].totalR += rRealized;
    if(netProfit > 0)
@@ -1252,15 +1294,16 @@ void WriteWeeklyStats()
       PrintFormat("LUCC/LDCC EA: could not open weekly-stats '%s', error=%d", InpWeeklyStatsFileName, GetLastError());
       return;
    }
-   FileWrite(h, "WeekStart,Trades,Wins,Losses,Breakeven,WinRatePct,TotalR,AvgR,MaxConsecWins,MaxConsecLosses");
+   FileWrite(h, "WeekStart,Trades,Wins,Losses,Breakeven,WinRatePct,TotalR,AvgR,MaxConsecWins,MaxConsecLosses,SetupsSkippedAfterWin,StopAfterWinRule");
    for(int i = 0; i < n; i++)
    {
       double winRate = (g_weeks[i].trades > 0) ? 100.0 * g_weeks[i].wins / g_weeks[i].trades : 0.0;
       double avgR    = (g_weeks[i].trades > 0) ? g_weeks[i].totalR / g_weeks[i].trades : 0.0;
-      FileWrite(h, StringFormat("%s,%d,%d,%d,%d,%.1f,%.3f,%.3f,%d,%d",
+      FileWrite(h, StringFormat("%s,%d,%d,%d,%d,%.1f,%.3f,%.3f,%d,%d,%d,%s",
                 TimeToString(g_weeks[i].weekStart, TIME_DATE),
                 g_weeks[i].trades, g_weeks[i].wins, g_weeks[i].losses, g_weeks[i].breakeven,
-                winRate, g_weeks[i].totalR, avgR, g_weeks[i].maxWin, g_weeks[i].maxLoss));
+                winRate, g_weeks[i].totalR, avgR, g_weeks[i].maxWin, g_weeks[i].maxLoss,
+                g_weeks[i].setupsSkipped, InpStopAfterFirstWin ? "ON" : "OFF"));
    }
    FileClose(h);
    PrintFormat("LUCC/LDCC EA: wrote %d weekly-stat rows to %s", n, InpWeeklyStatsFileName);
@@ -1380,7 +1423,8 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
       DoubleToString(p.equityBefore, 2),
       DoubleToString(p.weekO, _Digits), DoubleToString(p.weekH, _Digits), DoubleToString(p.weekL, _Digits), DoubleToString(p.weekC, _Digits),
       DoubleToString(p.dayO, _Digits),  DoubleToString(p.dayH, _Digits),  DoubleToString(p.dayL, _Digits),  DoubleToString(p.dayC, _Digits),
-      FmtTime(p.entryTime), FmtTime(utcEntry)
+      FmtTime(p.entryTime), FmtTime(utcEntry),
+      p.firstWinOfBias ? "true" : "false", InpStopAfterFirstWin ? "ON" : "OFF"
    };
 
    if(g_logCols > 0 && ArraySize(v) != g_logCols)
@@ -1431,8 +1475,22 @@ void HandlePositionClosed(bool isSell, SSignalState &st, long closedPosId,
 
    double netProfit = grossProfit + commission + swap;
 
+   // First win of this side's weekly-bias episode? Tracked ALWAYS (even when
+   // the toggle is off) so the "first winning trade" is identifiable in every
+   // dataset; the win-lock is keyed to the trade's ENTRY weekly-bias candle.
+   bool firstWin = false;
+   if(netProfit > 0)
+   {
+      datetime episode = st.journalBiasCandleTime;
+      if(st.winBookedEpisode != episode)
+      {
+         firstWin = true;
+         st.winBookedEpisode = episode;
+      }
+   }
+
    if(InpEnableTradeLog)
-      QueuePendingLog(isSell, st, closedPosId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
+      QueuePendingLog(isSell, st, closedPosId, exitTime, exitPrice, exitReason, grossProfit, commission, swap, firstWin);
 
    st.positionOpen = false;
    st.positionId   = 0;
@@ -1537,17 +1595,19 @@ void UpdatePanel()
 
    PanelSet(6, "SELL (LUCC): " + SideStateText(true, g_sell),
             g_sell.positionOpen ? clrRed : clrGainsboro);
-   PanelSet(7, StringFormat("   trades today %d/2%s   bias %s",
+   bool sellWinLock = InpStopAfterFirstWin && g_bias.c1Time != 0 && g_sell.winBookedEpisode == g_bias.c1Time;
+   PanelSet(7, StringFormat("   trades today %d/2%s   bias %s%s",
             g_sell.tradesToday, g_sell.doneToday ? " (done)" : "",
-            SellBiasAllowed() ? "OK" : "blocked"),
-            SellBiasAllowed() ? clrGainsboro : clrGray);
+            SellBiasAllowed() ? "OK" : "blocked", sellWinLock ? "  [WK-WIN-LOCK]" : ""),
+            sellWinLock ? clrGold : (SellBiasAllowed() ? clrGainsboro : clrGray));
 
    PanelSet(8, "BUY (LDCC): " + SideStateText(false, g_buy),
             g_buy.positionOpen ? clrLime : clrGainsboro);
-   PanelSet(9, StringFormat("   trades today %d/2%s   bias %s",
+   bool buyWinLock = InpStopAfterFirstWin && g_bias.c1Time != 0 && g_buy.winBookedEpisode == g_bias.c1Time;
+   PanelSet(9, StringFormat("   trades today %d/2%s   bias %s%s",
             g_buy.tradesToday, g_buy.doneToday ? " (done)" : "",
-            BuyBiasAllowed() ? "OK" : "blocked"),
-            BuyBiasAllowed() ? clrGainsboro : clrGray);
+            BuyBiasAllowed() ? "OK" : "blocked", buyWinLock ? "  [WK-WIN-LOCK]" : ""),
+            buyWinLock ? clrGold : (BuyBiasAllowed() ? clrGainsboro : clrGray));
 
    PanelSet(10, StringFormat("TP 1:%.1f  |  SL pad %.0f pip",
             InpTakeProfitRMultiple, InpStopPadPips), clrGainsboro);
@@ -1626,8 +1686,9 @@ void OnDeinit(const int reason)
 {
    // Funnel summary — the definitive "why no trades" readout. If refs>0 but
    // entries==0, the reject tally below shows exactly which gate stopped them.
-   PrintFormat("LUCC/LDCC EA FUNNEL: refs=%d CCs=%d retestTouches=%d ENTRIES=%d",
-               g_cntRef, g_cntCc, g_cntTouch, g_cntEntries);
+   PrintFormat("LUCC/LDCC EA FUNNEL: refs=%d CCs=%d retestTouches=%d ENTRIES=%d skippedAfterWin=%d (StopAfterWinRule=%s)",
+               g_cntRef, g_cntCc, g_cntTouch, g_cntEntries, g_skippedAfterWin,
+               InpStopAfterFirstWin ? "ON" : "OFF");
    PrintFormat("LUCC/LDCC EA REJECTS: posOpen=%d doneToday=%d maxTrades=%d bias=%d slInvalid=%d minStop=%d lots=%d orderFail=%d",
                g_rejPosOpen, g_rejDoneToday, g_rejMaxTrades, g_rejBias,
                g_rejSlInvalid, g_rejMinStop, g_rejLots, g_rejOrderFail);
