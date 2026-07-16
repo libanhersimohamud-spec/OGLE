@@ -36,12 +36,16 @@ input double InpFixedRiskBalance     = 0;       // Reference balance for risk si
 input long   InpMagicNumber          = 20260716; // Magic number
 input int    InpSlippagePoints       = 20;       // Max slippage (points)
 
-input group "Take Profit"
-input double InpTakeProfitRMultiple  = 1.0;   // TP distance = this many multiples of the SL distance
-                                               // (1.0 = original fixed 1:1 R:R; raise it and run Strategy
-                                               // Tester's Optimizer over this input to find the target
-                                               // that actually maximizes net profit, rather than guessing
-                                               // from MFE_R in the trade log)
+input group "Stop Loss & Take Profit"
+input double InpTakeProfitRMultiple  = 3.0;   // TP distance = this many x the PADDED SL distance
+                                               // (spec: fixed 1:3 R:R measured from the 5-pip-padded
+                                               // stop, so realized reward is a true 3x the money risked.
+                                               // Left as an input so Strategy Tester's Optimizer can
+                                               // still sweep it.)
+input double InpStopPadPips           = 5.0;  // Pips added BEYOND the structural SL before sizing
+                                               // (widens the stop; lots shrink so the $-risk is unchanged)
+input double InpPipSizePoints         = 0;    // Points per pip for the pad (0 = auto: 10 points on
+                                               // 3/5-digit symbols, 1 point on 2/4-digit)
 
 input group "Trading Session (Nairobi / EAT, UTC+3, no DST)"
 input double InpBrokerGmtOffsetHours = 2.0;   // Broker's STANDARD (winter) GMT offset, hours
@@ -58,6 +62,16 @@ input bool   InpEnableTradeLog       = true;                          // Write a
 input string InpTradeLogFileName     = "LUCC_LDCC_TradeLog.csv";      // File name (MQL5/Files)
 input bool   InpEnableExcursionTracking = true;  // Keep watching price past the actual exit for true MFE/MAE
 input int    InpExcursionTrackingHours  = 120;   // Hours from ENTRY to keep tracking (uncapped by SL/TP)
+
+input group "1D Bias Filter"
+input bool   InpUseBiasFilter        = true;  // Gate entries on the Daily (1D) directional bias
+
+input group "Info Panel"
+input bool   InpShowPanel            = true;         // Show the on-chart info panel
+input int    InpPanelX               = 12;           // Panel left offset (px)
+input int    InpPanelY               = 22;           // Panel top offset (px)
+input int    InpPanelFontSize        = 9;            // Panel font size
+input color  InpPanelBackColor       = C'18,18,22';  // Panel background color
 
 //======================================================================
 // Constants (indicator logic parameters — preserved exactly, not
@@ -455,6 +469,163 @@ void CheckDailyReset()
    }
 }
 
+//======================================================================
+// 1D BIAS ENGINE  (direct, CRT-free port of the reference bias patterns,
+// evaluated ONLY on the Daily timeframe — the exact mirror of the
+// indicator's Bias engine). Per the agreed design the Daily shift maps
+// 1:1 onto the reference's Pine offset, so each pattern reads exactly the
+// candle it was written against:
+//   * BC / DC / BSB / SBS   -> shifts 1 & 2 (LAST-CLOSED daily candles),
+//                              fixed the moment candle 1 closed.
+//   * 3DP / 3DP-DS / N-3DP  -> include shift 0 (the LIVE forming daily
+//     / N-DS                   candle), so an intraday sweep of the prior
+//                              candle's high/low confirms them the same day,
+//                              exactly as in the reference's live read.
+//
+// The bias only GATES whether a Retest-Candle entry is actionable — it
+// never touches the LUCC/LDCC/CC/RC detection above.
+//======================================================================
+double DOpen(int s)  { return iOpen(_Symbol, PERIOD_D1, s); }
+double DHigh(int s)  { return iHigh(_Symbol, PERIOD_D1, s); }
+double DLow(int s)   { return iLow(_Symbol, PERIOD_D1, s); }
+double DClose(int s) { return iClose(_Symbol, PERIOD_D1, s); }
+
+// --- Buy-side patterns ---
+bool Bias_BC_Buy()    { return DClose(1) > DHigh(2); }
+bool Bias_DC_Buy()    { return DLow(1) < DLow(2) && DHigh(1) > DHigh(2) && DClose(1) > DOpen(1); }
+bool Bias_BSB_Buy()   { return DClose(2) > DOpen(2) && DHigh(1) <= DHigh(2) && DLow(1) >= DLow(2); }
+bool Bias_3DP_Buy()   { return DClose(1) >= DLow(2) && DClose(1) <= DHigh(2) && DLow(0) < DLow(1) && DLow(0) < DLow(2); }
+bool Bias_DS_Buy()    { return DClose(1) < DLow(2) && DClose(1) < DLow(3) &&
+                               DClose(2) >= DLow(1) && DClose(2) >= DLow(2) && DClose(2) >= DLow(3) &&
+                               DLow(0) < DLow(1); }
+bool Bias_N3DP_Buy()  { return DHigh(1) <= DHigh(2) && DLow(1) >= DLow(2) && DLow(0) < DLow(1) && DLow(0) < DLow(2); }
+bool Bias_NDS_Buy()   { return DHigh(2) <= DHigh(3) && DLow(2) >= DLow(3) &&
+                               DClose(1) < DLow(2) && DClose(1) < DLow(3) &&
+                               DLow(0) < DLow(1) && DLow(0) < DLow(2) && DLow(0) < DLow(3) &&
+                               DHigh(1) <= DHigh(3) && DHigh(0) <= DHigh(3); }
+
+// --- Sell-side patterns ---
+bool Bias_BC_Sell()   { return DClose(1) < DLow(2); }
+bool Bias_DC_Sell()   { return DHigh(1) > DHigh(2) && DLow(1) < DLow(2) && DClose(1) < DOpen(1); }
+bool Bias_SBS_Sell()  { return DClose(2) < DOpen(2) && DHigh(1) <= DHigh(2) && DLow(1) >= DLow(2); }
+bool Bias_3DP_Sell()  { return DClose(1) >= DLow(2) && DClose(1) <= DHigh(2) && DHigh(0) > DHigh(1) && DHigh(0) > DHigh(2); }
+bool Bias_DS_Sell()   { return DClose(1) > DHigh(2) && DClose(1) > DHigh(3) &&
+                               DClose(2) <= DHigh(1) && DClose(2) <= DHigh(2) && DClose(2) <= DHigh(3) &&
+                               DHigh(0) > DHigh(1); }
+bool Bias_N3DP_Sell() { return DHigh(1) <= DHigh(2) && DLow(1) >= DLow(2) && DHigh(0) > DHigh(1) && DHigh(0) > DHigh(2); }
+bool Bias_NDS_Sell()  { return DHigh(2) <= DHigh(3) && DLow(2) >= DLow(3) &&
+                               DClose(1) > DHigh(2) && DClose(1) > DHigh(3) &&
+                               DHigh(0) > DHigh(1) && DHigh(0) > DHigh(2) && DHigh(0) > DHigh(3) &&
+                               DLow(1) >= DLow(3) && DLow(0) >= DLow(3); }
+
+string Bias_BuyText()
+{
+   string t = "";
+   if(Bias_BC_Buy())   t += "BC ";
+   if(Bias_DC_Buy())   t += "DC ";
+   if(Bias_BSB_Buy())  t += "BSB ";
+   if(Bias_3DP_Buy())  t += "3DP ";
+   if(Bias_DS_Buy())   t += "3DP-DS ";
+   if(Bias_N3DP_Buy()) t += "N-3DP ";
+   if(Bias_NDS_Buy())  t += "N-DS ";
+   return (t == "") ? "-" : t;
+}
+string Bias_SellText()
+{
+   string t = "";
+   if(Bias_BC_Sell())   t += "BC ";
+   if(Bias_DC_Sell())   t += "DC ";
+   if(Bias_SBS_Sell())  t += "SBS ";
+   if(Bias_3DP_Sell())  t += "3DP ";
+   if(Bias_DS_Sell())   t += "3DP-DS ";
+   if(Bias_N3DP_Sell()) t += "N-3DP ";
+   if(Bias_NDS_Sell())  t += "N-DS ";
+   return (t == "") ? "-" : t;
+}
+
+struct SBiasState
+{
+   datetime c1Time;      // time of the last-CLOSED daily candle (D1 shift 1) — rollover marker
+   bool     buyInvalid;  // today's price has traded ABOVE candle-1 high  -> BUY bias dead for the day
+   bool     sellInvalid; // today's price has traded BELOW candle-1 low   -> SELL bias dead for the day
+   string   dir;         // "BUY" / "SELL" / "BOTH" / "NONE"
+   string   buyText;     // active buy patterns, or "-"
+   string   sellText;    // active sell patterns, or "-"
+   bool     buyPresent;
+   bool     sellPresent;
+};
+SBiasState g_bias;
+
+// Recompute the Daily bias every tick: pattern presence/direction (read
+// LIVE, exactly like the reference), plus the price-based invalidation
+// latches. Must be called before the retest gate each tick.
+void ComputeBias(double bid, double ask)
+{
+   // A new daily candle clears both invalidation latches — an invalidation
+   // can never carry across days, exactly like the indicator resetting its
+   // bias1DInvalid once per new Daily candle.
+   datetime c1 = iTime(_Symbol, PERIOD_D1, 1);
+   if(c1 != g_bias.c1Time)
+   {
+      g_bias.c1Time      = c1;
+      g_bias.buyInvalid  = false;
+      g_bias.sellInvalid = false;
+   }
+
+   // The DS / N-DS patterns reach back to shift 3, so we need candles 0..3
+   // before any bias can be evaluated; until then there is no bias.
+   if(iBars(_Symbol, PERIOD_D1) < 4)
+   {
+      g_bias.buyText     = "-"; g_bias.sellText    = "-";
+      g_bias.buyPresent  = false; g_bias.sellPresent = false;
+      g_bias.dir         = "NONE";
+      return;
+   }
+
+   g_bias.buyText     = Bias_BuyText();
+   g_bias.sellText    = Bias_SellText();
+   g_bias.buyPresent  = (g_bias.buyText  != "-");
+   g_bias.sellPresent = (g_bias.sellText != "-");
+   g_bias.dir =
+       (g_bias.buyPresent && !g_bias.sellPresent) ? "BUY"  :
+       (g_bias.sellPresent && !g_bias.buyPresent) ? "SELL" :
+       (g_bias.buyPresent &&  g_bias.sellPresent) ? "BOTH" : "NONE";
+
+   // Invalidation — price-based and latched for the rest of the Daily candle.
+   // Reference = candle 1 (last closed daily). BUY dies once today's price
+   // trades above candle-1 high; SELL dies once it trades below candle-1 low.
+   // The two latches are INDEPENDENT so that under BOTH, one side breaking
+   // never silences the other (buy and sell run independently, per spec).
+   double c1High  = DHigh(1);
+   double c1Low   = DLow(1);
+   double dayHigh = MathMax(DHigh(0), ask); // running high so far today, incl. the live tick
+   double dayLow  = MathMin(DLow(0),  bid); // running low  so far today, incl. the live tick
+   if(dayHigh > c1High) g_bias.buyInvalid  = true;
+   if(dayLow  < c1Low)  g_bias.sellInvalid = true;
+}
+
+// A direction is tradeable only if a Daily pattern of that side is present
+// AND that side hasn't been invalidated. With the filter switched off the
+// gate is transparent (always allowed).
+bool BuyBiasAllowed()  { return !InpUseBiasFilter || (g_bias.buyPresent  && !g_bias.buyInvalid); }
+bool SellBiasAllowed() { return !InpUseBiasFilter || (g_bias.sellPresent && !g_bias.sellInvalid); }
+
+//+------------------------------------------------------------------+
+//| 1 pip in price terms. Auto = 10 points on 3/5-digit symbols, 1   |
+//| point on 2/4-digit; override via InpPipSizePoints.               |
+//+------------------------------------------------------------------+
+double PipSize()
+{
+   double point     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pipPoints = InpPipSizePoints;
+   if(pipPoints <= 0)
+   {
+      int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      pipPoints = (digits == 3 || digits == 5) ? 10.0 : 1.0;
+   }
+   return pipPoints * point;
+}
+
 //+------------------------------------------------------------------+
 //| Position sizing — fixed risk only, no compounding.                |
 //| lots = riskAmount / (SL distance expressed in money/lot)          |
@@ -508,15 +679,30 @@ void TryOpen(bool isSell, SSignalState &st)
    if(!IsWithinSession())
       return;
 
+   // 1D bias gate — a Retest Candle only becomes an actionable entry if the
+   // Daily bias currently supports this direction and hasn't been invalidated.
+   // Buy and sell are gated independently, so under a BOTH-bias day each side
+   // can still trade on its own. This gates ONLY the entry; the LUCC/LDCC/
+   // CC/RC detection above is untouched.
+   if(isSell) { if(!SellBiasAllowed()) return; }
+   else       { if(!BuyBiasAllowed())  return; }
+
    double entry = isSell ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                           : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double sl = st.slLevel;
+   double structuralSl = st.slLevel;
 
    // Sanity guard: the indicator's SL level is a high (sell) / low (buy)
    // spanning the reference-to-CC range, so it must sit on the correct
    // side of the current market price for a valid stop.
-   if(isSell && sl <= entry) return;
-   if(!isSell && sl >= entry) return;
+   if(isSell && structuralSl <= entry) return;
+   if(!isSell && structuralSl >= entry) return;
+
+   // 5-pip padding — widen the stop beyond the structural level. Risk stays
+   // constant (CalcLotSize sizes off this PADDED distance, so lots shrink),
+   // and the fixed-RR TP is measured from the PADDED stop — giving a true
+   // monetary 1:InpTakeProfitRMultiple on the stop the trade actually carries.
+   double pad = InpStopPadPips * PipSize();
+   double sl  = isSell ? structuralSl + pad : structuralSl - pad;
 
    double dist   = MathAbs(entry - sl);
    double tpDist = dist * InpTakeProfitRMultiple;
@@ -781,6 +967,127 @@ void HandlePositionClosed(bool isSell, SSignalState &st, long closedPosId,
 }
 
 //======================================================================
+// On-chart info panel — a compact live readout of the Bias state, each
+// side's LUCC/LDCC setup progress, the daily trade counters and the risk/
+// TP configuration. Purely informational; it never influences trading.
+//======================================================================
+#define PANEL_PREFIX "LUCC_LDCC_Panel_"
+#define PANEL_ROWS   12
+
+int PanelRowY(int row)
+{
+   return InpPanelY + 8 + row * (InpPanelFontSize + 8);
+}
+
+void PanelEnsureBackground()
+{
+   string name = PANEL_PREFIX + "BG";
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, InpPanelX);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, InpPanelY);
+      ObjectSetInteger(0, name, OBJPROP_XSIZE, 360);
+      ObjectSetInteger(0, name, OBJPROP_YSIZE, PANEL_ROWS * (InpPanelFontSize + 8) + 12);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, InpPanelBackColor);
+      ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, C'60,60,70');
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   }
+}
+
+void PanelSet(int row, string text, color clr)
+{
+   string name = PANEL_PREFIX + "R" + (string)row;
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, InpPanelX + 10);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, PanelRowY(row));
+      ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, InpPanelFontSize);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+   }
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+}
+
+string SideStateText(bool isSell, const SSignalState &st)
+{
+   string tag = isSell ? "LUCC" : "LDCC";
+   if(st.positionOpen) return "position OPEN";
+   if(st.doneToday)    return "done today (win booked)";
+   if(st.refTime == 0) return "scanning - no " + tag;
+   if(st.ccTime  == 0) return tag + " @ " + TimeToString(st.refTime, TIME_DATE|TIME_MINUTES) + " (awaiting CC)";
+   double lvl = isSell ? st.refLow : st.refHigh;
+   return "CC set - awaiting retest @ " + DoubleToString(lvl, _Digits);
+}
+
+void UpdatePanel()
+{
+   if(!InpShowPanel)
+      return;
+
+   PanelEnsureBackground();
+
+   PanelSet(0, "LUCC / LDCC  +  1D Bias EA", clrDeepSkyBlue);
+
+   bool inSession = IsWithinSession();
+   MqlDateTime nd; TimeToStruct(GetNairobiTime(TimeCurrent()), nd);
+   PanelSet(1, StringFormat("Session: %s   Nairobi %02d:%02d",
+            inSession ? "OPEN" : "closed", nd.hour, nd.min),
+            inSession ? clrLime : clrSilver);
+
+   color dirClr = g_bias.dir == "BUY"  ? clrLime :
+                  g_bias.dir == "SELL" ? clrRed  :
+                  g_bias.dir == "BOTH" ? clrOrange : clrSilver;
+   PanelSet(2, "1D Bias: " + g_bias.dir, dirClr);
+
+   string buyStat  = !g_bias.buyPresent  ? "-" : (g_bias.buyInvalid  ? "INVALIDATED" : "ACTIVE");
+   color  buyClr   = !g_bias.buyPresent  ? clrSilver : (g_bias.buyInvalid  ? clrOrangeRed : clrLime);
+   string sellStat = !g_bias.sellPresent ? "-" : (g_bias.sellInvalid ? "INVALIDATED" : "ACTIVE");
+   color  sellClr  = !g_bias.sellPresent ? clrSilver : (g_bias.sellInvalid ? clrOrangeRed : clrRed);
+   PanelSet(3, StringFormat("Buy  bias: %-10s [%s]", g_bias.buyText,  buyStat),  buyClr);
+   PanelSet(4, StringFormat("Sell bias: %-10s [%s]", g_bias.sellText, sellStat), sellClr);
+
+   PanelSet(5, InpUseBiasFilter ? "Bias gate: ENFORCED" : "Bias gate: OFF (all entries)",
+            InpUseBiasFilter ? clrGold : clrSilver);
+
+   PanelSet(6, "SELL (LUCC): " + SideStateText(true, g_sell),
+            g_sell.positionOpen ? clrRed : clrGainsboro);
+   PanelSet(7, StringFormat("   trades today %d/2%s   bias %s",
+            g_sell.tradesToday, g_sell.doneToday ? " (done)" : "",
+            SellBiasAllowed() ? "OK" : "blocked"),
+            SellBiasAllowed() ? clrGainsboro : clrGray);
+
+   PanelSet(8, "BUY (LDCC): " + SideStateText(false, g_buy),
+            g_buy.positionOpen ? clrLime : clrGainsboro);
+   PanelSet(9, StringFormat("   trades today %d/2%s   bias %s",
+            g_buy.tradesToday, g_buy.doneToday ? " (done)" : "",
+            BuyBiasAllowed() ? "OK" : "blocked"),
+            BuyBiasAllowed() ? clrGainsboro : clrGray);
+
+   PanelSet(10, StringFormat("TP 1:%.1f  |  SL pad %.0f pip",
+            InpTakeProfitRMultiple, InpStopPadPips), clrGainsboro);
+
+   PanelSet(11, StringFormat("Risk %.2f%% of %.2f = %.2f",
+            InpRiskPercent, g_riskBalance, g_riskBalance * InpRiskPercent / 100.0), clrGainsboro);
+}
+
+void DestroyPanel()
+{
+   ObjectsDeleteAll(0, PANEL_PREFIX);
+}
+
+//======================================================================
 // Event handlers
 //======================================================================
 int OnInit()
@@ -793,6 +1100,15 @@ int OnInit()
    g_lastResetDay = 0;
    g_prevMid      = 0.0;
    g_havePrevMid  = false;
+
+   g_bias.c1Time      = 0;
+   g_bias.buyInvalid  = false;
+   g_bias.sellInvalid = false;
+   g_bias.dir         = "NONE";
+   g_bias.buyText     = "-";
+   g_bias.sellText    = "-";
+   g_bias.buyPresent  = false;
+   g_bias.sellPresent = false;
 
    // Freeze the risk-sizing reference balance once, here, so it can never
    // drift with wins/losses (no compounding). InpFixedRiskBalance = 0 means
@@ -822,6 +1138,8 @@ void OnDeinit(const int reason)
    }
    ArrayFree(g_pending);
 
+   DestroyPanel();
+
    if(g_logHandle != INVALID_HANDLE)
    {
       FileClose(g_logHandle);
@@ -847,12 +1165,21 @@ void OnTick()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mid = (bid + ask) / 2.0;
 
+   // Refresh the Daily bias (direction + invalidation latches) before the
+   // retest gate reads it this tick.
+   ComputeBias(bid, ask);
+
    MonitorRetest(true,  g_sell, bid, ask, mid);
    MonitorRetest(false, g_buy,  bid, ask, mid);
    UpdateExcursion(true,  g_sell, bid, ask);
    UpdateExcursion(false, g_buy,  bid, ask);
    if(InpEnableTradeLog)
       UpdatePendingExcursions(bid, ask);
+
+   // Info panel — skip entirely during optimization (no chart, and the
+   // object churn would only slow the agents down).
+   if(InpShowPanel && !(bool)MQLInfoInteger(MQL_OPTIMIZATION))
+      UpdatePanel();
 
    g_prevMid     = mid;
    g_havePrevMid = true;
