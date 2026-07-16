@@ -60,7 +60,11 @@ input int    InpWinterEndHour        = 19;    // Session end,   Nairobi time, wi
 input group "Trade Journal"
 input bool   InpEnableTradeLog       = true;                          // Write a per-trade CSV log
 input string InpTradeLogFileName     = "LUCC_LDCC_TradeLog.csv";      // Per-trade CSV file (MQL5/Files)
-input string InpWeeklyStatsFileName  = "LUCC_LDCC_WeeklyStats.csv";   // Per-week summary CSV (MQL5/Files)
+input string InpWeeklyStatsFileName  = "LUCC_LDCC_WeeklyStats.csv";   // Per-week summary CSV
+input bool   InpFilesToCommonFolder  = true;  // Write CSVs to the shared Common\Files folder (ONE fixed,
+                                               // easy-to-find location — strongly recommended for the
+                                               // Strategy Tester, whose per-agent sandbox is hard to find).
+                                               // The exact full path is printed to the Experts log.
 input bool   InpEnableExcursionTracking = true;  // Keep watching price past the actual exit for true MFE/MAE
 input int    InpExcursionTrackingHours  = 120;   // Hours from ENTRY to keep tracking (uncapped by SL/TP)
 
@@ -290,6 +294,25 @@ void Dbg(const string msg)
 {
    if(InpDebugLog)
       Print("[DBG ", TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES | TIME_SECONDS), "] ", msg);
+}
+
+// FileOpen flags for the CSVs — adds FILE_COMMON when writing to the shared
+// Common\Files folder (a single fixed location, easy to find after a test).
+int FileFlagsCsv()
+{
+   int f = FILE_WRITE | FILE_CSV | FILE_ANSI;
+   if(InpFilesToCommonFolder)
+      f |= FILE_COMMON;
+   return f;
+}
+
+// The absolute on-disk path a given output file will land at, so it can be
+// printed to the Experts log (the reliable way to find tester output).
+string FullFilePath(const string name)
+{
+   if(InpFilesToCommonFolder)
+      return TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\" + name;
+   return TerminalInfoString(TERMINAL_DATA_PATH) + "\\MQL5\\Files\\" + name;
 }
 
 //======================================================================
@@ -1301,7 +1324,7 @@ void WriteWeeklyStats()
       g_weeks[j + 1] = key;
    }
 
-   int h = FileOpen(InpWeeklyStatsFileName, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   int h = FileOpen(InpWeeklyStatsFileName, FileFlagsCsv(), ',');
    if(h == INVALID_HANDLE)
    {
       PrintFormat("LUCC/LDCC EA: could not open weekly-stats '%s', error=%d", InpWeeklyStatsFileName, GetLastError());
@@ -1319,7 +1342,7 @@ void WriteWeeklyStats()
                 g_weeks[i].setupsSkipped, InpStopAfterFirstWin ? "ON" : "OFF"));
    }
    FileClose(h);
-   PrintFormat("LUCC/LDCC EA: wrote %d weekly-stat rows to %s", n, InpWeeklyStatsFileName);
+   PrintFormat("LUCC/LDCC EA: wrote %d weekly-stat rows -> %s", n, FullFilePath(InpWeeklyStatsFileName));
 }
 
 void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
@@ -1682,11 +1705,15 @@ int OnInit()
 
    if(InpEnableTradeLog)
    {
-      g_logHandle = FileOpen(InpTradeLogFileName, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+      g_logHandle = FileOpen(InpTradeLogFileName, FileFlagsCsv(), ',');
       if(g_logHandle == INVALID_HANDLE)
          PrintFormat("LUCC/LDCC EA: could not open trade log '%s', error=%d", InpTradeLogFileName, GetLastError());
       else
+      {
          WriteTradeLogHeader();
+         Print("LUCC/LDCC EA: TRADE LOG -> ", FullFilePath(InpTradeLogFileName));
+         Print("LUCC/LDCC EA: WEEKLY STATS -> ", FullFilePath(InpWeeklyStatsFileName), "  (written at end of run)");
+      }
    }
 
    // One-shot config snapshot so the current filter setup is always visible at
