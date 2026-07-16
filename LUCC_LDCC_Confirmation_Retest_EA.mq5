@@ -126,6 +126,19 @@ struct SSignalState
    double   journalRefLow;
    datetime journalCcTime;
    datetime journalRcTime;
+
+   // --- extended research snapshot, all frozen at entry in TryOpen ---
+   double   journalStructuralSl;   // original SL level BEFORE the +pad
+   double   journalRequestedEntry; // intended entry price (pre-fill) — for slippage
+   double   journalBidAtEntry;     // market conditions at the entry tick
+   double   journalAskAtEntry;
+   double   journalSpreadPoints;   // spread at entry, in points
+   double   journalAtrH1AtEntry;   // H1 ATR(14), last closed — volatility context
+   string   journalBiasDir;        // Weekly bias direction at entry (BUY/SELL/BOTH/NONE)
+   string   journalBiasBuyText;    // full Weekly buy-pattern text at entry
+   string   journalBiasSellText;   // full Weekly sell-pattern text at entry
+   string   journalSideBiasText;   // Weekly bias text for THIS trade's side (what authorized it)
+   datetime journalBiasCandleTime; // Weekly candle-1 time the bias was read from
 };
 
 SSignalState g_sell;   // SELL side, driven by the Bullish LUCC
@@ -164,6 +177,19 @@ struct SPendingLog
    double   mfePrice;        // continues updating past the actual exit, until trackUntil —
    double   maePrice;        // answers "how far could price have run", NOT "in-trade excursion"
    datetime trackUntil;
+
+   // --- extended research snapshot (carried over from SSignalState at close) ---
+   double   structuralSl;
+   double   requestedEntry;
+   double   bidAtEntry;
+   double   askAtEntry;
+   double   spreadPoints;
+   double   atrH1AtEntry;
+   string   biasDir;
+   string   biasBuyText;
+   string   biasSellText;
+   string   sideBiasText;
+   datetime biasCandleTime;
 };
 
 SPendingLog g_pending[];
@@ -174,6 +200,8 @@ datetime g_lastResetDay = 0;
 double   g_prevMid      = 0.0;   // previous tick's mid price, for level-crossing detection
 bool     g_havePrevMid  = false;
 int      g_logHandle    = INVALID_HANDLE;
+int      g_logCols      = 0;                // column count from the header — row-width sanity guard
+int      g_atrHandle    = INVALID_HANDLE;   // H1 ATR(14) — logged as volatility context at entry
 double   g_riskBalance  = 0.0;   // frozen once in OnInit; every trade's risk% is % of THIS, not of
                                   // the live/current balance, so wins/losses never change position size
 
@@ -418,6 +446,34 @@ datetime GetNairobiTime(datetime serverTime)
    return utcTime + 3 * 3600; // Nairobi = UTC+3, year-round
 }
 
+// True UTC for a broker server time (same offset/DST compensation as the
+// Nairobi conversion, minus the +3). Used to classify the FX session an
+// entry fell in, independent of the broker's own clock.
+datetime GetUtcTime(datetime serverTime)
+{
+   return GetNairobiTime(serverTime) - 3 * 3600;
+}
+
+// Coarse FX-session label from a UTC timestamp. Sessions overlap, so more
+// than one can be active — they are '+'-joined (e.g. "London+NewYork"),
+// which is exactly the high-value window to filter on later. "Off" = none.
+string SessionNameUtc(datetime utc)
+{
+   MqlDateTime d;
+   TimeToStruct(utc, d);
+   int h = d.hour;
+   bool tokyo  = (h >= 0  && h < 9);            // Tokyo      00:00-09:00 UTC
+   bool london = (h >= 7  && h < 16);           // London     07:00-16:00 UTC
+   bool ny     = (h >= 12 && h < 21);           // New York   12:00-21:00 UTC
+   bool sydney = (h >= 21 || h < 6);            // Sydney     21:00-06:00 UTC
+   string s = "";
+   if(london) s += (StringLen(s) ? "+" : "") + "London";
+   if(ny)     s += (StringLen(s) ? "+" : "") + "NewYork";
+   if(tokyo)  s += (StringLen(s) ? "+" : "") + "Tokyo";
+   if(sydney) s += (StringLen(s) ? "+" : "") + "Sydney";
+   return (StringLen(s) == 0) ? "Off" : s;
+}
+
 // Session window widens/shifts seasonally per spec: 04:00-18:00 Nairobi
 // during the summer months, 05:00-19:00 the rest of the year. Shared core
 // so both "is it in-session right now" (entries) and "was this specific
@@ -611,6 +667,38 @@ bool BuyBiasAllowed()  { return !InpUseBiasFilter || (g_bias.buyPresent  && !g_b
 bool SellBiasAllowed() { return !InpUseBiasFilter || (g_bias.sellPresent && !g_bias.sellInvalid); }
 
 //+------------------------------------------------------------------+
+//| Pattern-text helpers for the research log. A pattern text looks   |
+//| like "BC DC 3DP " (space-separated tokens, "-" when none).        |
+//| PatternCount = how many patterns fired; ComboKey collapses them   |
+//| to a stable "BC+DC+3DP" so the CSV can be GROUP-BY'd directly.    |
+//+------------------------------------------------------------------+
+int PatternCount(string patterns)
+{
+   if(patterns == "-" || patterns == "")
+      return 0;
+   string parts[];
+   int n = StringSplit(patterns, ' ', parts);
+   int c = 0;
+   for(int i = 0; i < n; i++)
+      if(StringLen(parts[i]) > 0)
+         c++;
+   return c;
+}
+
+string ComboKey(string patterns)
+{
+   if(patterns == "-" || patterns == "")
+      return "NONE";
+   string parts[];
+   int n = StringSplit(patterns, ' ', parts);
+   string outKey = "";
+   for(int i = 0; i < n; i++)
+      if(StringLen(parts[i]) > 0)
+         outKey += (StringLen(outKey) == 0 ? "" : "+") + parts[i];
+   return (StringLen(outKey) == 0) ? "NONE" : outKey;
+}
+
+//+------------------------------------------------------------------+
 //| 1 pip in price terms. Auto = 10 points on 3/5-digit symbols, 1   |
 //| point on 2/4-digit; override via InpPipSizePoints.               |
 //+------------------------------------------------------------------+
@@ -657,6 +745,20 @@ double CalcLotSize(double slDistance, double riskAmount)
 
    int stepDigits = (int)MathRound(-MathLog10(step));
    return NormalizeDouble(lots, MathMax(0, stepDigits));
+}
+
+//+------------------------------------------------------------------+
+//| H1 ATR(14), last CLOSED bar — a stable volatility reading logged  |
+//| as market context at entry. 0 if the handle/history isn't ready.  |
+//+------------------------------------------------------------------+
+double CurrentAtrH1()
+{
+   if(g_atrHandle == INVALID_HANDLE)
+      return 0.0;
+   double buf[];
+   if(CopyBuffer(g_atrHandle, 0, 1, 1, buf) == 1)
+      return buf[0];
+   return 0.0;
 }
 
 //+------------------------------------------------------------------+
@@ -732,6 +834,12 @@ void TryOpen(bool isSell, SSignalState &st)
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpSlippagePoints);
 
+   // Market-condition snapshot at the entry tick (for the research log).
+   double bidAtEntry   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double askAtEntry   = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double spreadPoints = (point > 0) ? (askAtEntry - bidAtEntry) / point : 0.0;
+   double atrH1AtEntry = CurrentAtrH1();
+
    bool ok = isSell
       ? g_trade.Sell(lots, _Symbol, entry, sl, tp, "LUCC-RC Sell")
       : g_trade.Buy(lots, _Symbol, entry, sl, tp, "LDCC-RC Buy");
@@ -766,6 +874,21 @@ void TryOpen(bool isSell, SSignalState &st)
       st.journalRefLow  = st.refLow;
       st.journalCcTime  = st.ccTime;
       st.journalRcTime  = st.rcTime;
+
+      // Extended research snapshot — the Weekly-bias context and market
+      // conditions AT THE ENTRY TICK, frozen now because g_bias and the
+      // spread keep moving after entry and would otherwise be lost.
+      st.journalStructuralSl   = structuralSl;
+      st.journalRequestedEntry = entry;                 // normalized intended price (pre-fill)
+      st.journalBidAtEntry     = bidAtEntry;
+      st.journalAskAtEntry     = askAtEntry;
+      st.journalSpreadPoints   = spreadPoints;
+      st.journalAtrH1AtEntry   = atrH1AtEntry;
+      st.journalBiasDir        = g_bias.dir;
+      st.journalBiasBuyText    = g_bias.buyText;
+      st.journalBiasSellText   = g_bias.sellText;
+      st.journalSideBiasText   = isSell ? g_bias.sellText : g_bias.buyText;
+      st.journalBiasCandleTime = g_bias.c1Time;
    }
    else
    {
@@ -809,23 +932,66 @@ void ProcessNewBar()
 string CsvEscape(string s)
 {
    StringReplace(s, ",", ";");
+   StringReplace(s, "\n", " ");
+   StringReplace(s, "\r", " ");
    return s;
 }
 
+string FmtTime(datetime t)
+{
+   return (t == 0) ? "-" : TimeToString(t, TIME_DATE | TIME_MINUTES | TIME_SECONDS);
+}
+
+// Joins one row of fields with commas and writes it as a single line. Using
+// one string (rather than a variadic FileWrite) keeps the ~70-column row
+// safely under FileWrite's argument limit and guarantees the header and the
+// data rows share the exact same column count / order.
+void WriteCsvRow(const string &fields[])
+{
+   string line = "";
+   for(int i = 0; i < ArraySize(fields); i++)
+      line += (i == 0 ? "" : ",") + fields[i];
+   FileWrite(g_logHandle, line);
+   FileFlush(g_logHandle);
+}
+
+// The single source of truth for the column layout. FinalizePendingLog()
+// builds its value array in this exact order.
 void WriteTradeLogHeader()
 {
-   FileWrite(g_logHandle,
-      "Direction", "PositionID",
-      "RefCandleTime", "RefHigh", "RefLow",
-      "CCTime", "RCTime_TouchTime",
-      "EntryTime", "EntryPrice", "SL", "TP",
-      "RiskPercent", "RiskAmount", "Lots", "TradeSeqToday",
-      "NairobiDate", "NairobiWeekday", "NairobiHour",
-      "ExitTime", "ExitPrice", "ExitReason",
+   string h[] =
+   {
+      // --- identity / pattern taxonomy (the columns to GROUP BY) ---
+      "TradeID", "Direction", "EntryPattern", "Symbol", "EntryTF", "BiasTF",
+      "BiasDirection", "WeeklyBiasBuyPatterns", "WeeklyBiasSellPatterns",
+      "TradeSideBiasPatterns", "BiasPatternCount", "BiasComboKey",
+      "PatternSequence", "SetupQualityScore", "FiltersPassed",
+      // --- timestamps ---
+      "BiasCandleTime", "RefCandleTime", "CCTime", "RCTime_TouchTime",
+      "EntryTime", "ExitTime", "HoldingMinutes", "CCToEntryMin", "RCToEntryMin",
+      // --- prices / levels / risk geometry ---
+      "RefHigh", "RefLow", "RefRange",
+      "RequestedEntry", "EntryPrice", "EntrySlippagePips",
+      "StructuralSL", "AdjustedSL", "SLPadPips", "TP",
+      "RR_Planned", "RR_Realized", "SLDistancePips", "TPDistancePips",
+      // --- market conditions at entry ---
+      "BidAtEntry", "AskAtEntry", "SpreadPoints", "SpreadPips", "AtrH1AtEntry",
+      "Lots", "RiskPercent", "RiskAmount",
+      // --- outcome ---
+      "ExitPrice", "ExitReason", "ExitType", "ProfitPips",
       "GrossProfit", "Commission", "Swap", "NetProfit",
-      "R_Realized", "MFE_R_InTrade", "MAE_R_InTrade", "MFE_R_Extended", "MAE_R_Extended",
+      // --- excursions ---
+      "MFE_R_InTrade", "MAE_R_InTrade", "MFE_R_Extended", "MAE_R_Extended",
+      "MFE_Pips_InTrade", "MAE_Pips_InTrade",
+      "HighestFloatingProfitMoney", "LargestFloatingDrawdownMoney",
       "ExcursionWindowHours", "ExcursionComplete",
-      "HoldingMinutes", "BalanceBefore", "BalanceAfter");
+      // --- calendar / session context ---
+      "SessionUTC", "UTCHour", "NairobiDate", "NairobiWeekday", "NairobiHour",
+      // --- account ---
+      "BalanceBefore", "BalanceAfter", "Magic"
+   };
+   g_logCols = ArraySize(h);
+   WriteCsvRow(h);
 }
 
 // Queues a just-closed trade for extended tracking rather than writing it
@@ -870,6 +1036,19 @@ void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
    g_pending[n].mfePrice           = st.mfePrice;
    g_pending[n].maePrice           = st.maePrice;
 
+   // Extended research snapshot, carried through from the frozen entry values.
+   g_pending[n].structuralSl       = st.journalStructuralSl;
+   g_pending[n].requestedEntry     = st.journalRequestedEntry;
+   g_pending[n].bidAtEntry         = st.journalBidAtEntry;
+   g_pending[n].askAtEntry         = st.journalAskAtEntry;
+   g_pending[n].spreadPoints       = st.journalSpreadPoints;
+   g_pending[n].atrH1AtEntry       = st.journalAtrH1AtEntry;
+   g_pending[n].biasDir            = st.journalBiasDir;
+   g_pending[n].biasBuyText        = st.journalBiasBuyText;
+   g_pending[n].biasSellText       = st.journalBiasSellText;
+   g_pending[n].sideBiasText       = st.journalSideBiasText;
+   g_pending[n].biasCandleTime     = st.journalBiasCandleTime;
+
    datetime windowEnd = st.entryTime + InpExcursionTrackingHours * 3600;
    g_pending[n].trackUntil = InpEnableExcursionTracking ? MathMax(exitTime, windowEnd) : exitTime;
 }
@@ -879,42 +1058,104 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
    if(g_logHandle == INVALID_HANDLE)
       return;
 
+   double point     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pip       = PipSize();
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE) > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) : 0.0;
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
    double netProfit    = p.grossProfit + p.commission + p.swap;
    double riskDistance = MathAbs(p.entryPrice - p.slPrice);
    double rRealized    = (p.riskAmount > 0) ? netProfit / p.riskAmount : 0.0;
-   // In-trade: excursion while the real position was actually open — the
-   // only valid basis for "what R would a breakeven-stop / trailing rule
-   // have triggered on". Extended: keeps tracking past the real exit, for
-   // "how far could price have run" / target-selection questions only.
-   double mfeRInTrade   = (riskDistance > 0) ? MathAbs(p.entryPrice - p.mfePriceAtClose) / riskDistance : 0.0;
-   double maeRInTrade    = (riskDistance > 0) ? MathAbs(p.entryPrice - p.maePriceAtClose) / riskDistance : 0.0;
-   double mfeRExtended     = (riskDistance > 0) ? MathAbs(p.entryPrice - p.mfePrice) / riskDistance : 0.0;
-   double maeRExtended      = (riskDistance > 0) ? MathAbs(p.entryPrice - p.maePrice) / riskDistance : 0.0;
-   double holdingMinutes  = (double)(p.exitTime - p.entryTime) / 60.0;
-   double balanceAfter    = p.balanceBeforeEntry + netProfit;
+
+   // In-trade: excursion while the real position was actually open — the only
+   // valid basis for "what R would a breakeven / trailing rule have triggered
+   // on". Extended: keeps tracking past the real exit, for "how far could
+   // price have run" / target-selection questions only.
+   double mfeRInTrade  = (riskDistance > 0) ? MathAbs(p.entryPrice - p.mfePriceAtClose) / riskDistance : 0.0;
+   double maeRInTrade  = (riskDistance > 0) ? MathAbs(p.entryPrice - p.maePriceAtClose) / riskDistance : 0.0;
+   double mfeRExtended = (riskDistance > 0) ? MathAbs(p.entryPrice - p.mfePrice) / riskDistance : 0.0;
+   double maeRExtended = (riskDistance > 0) ? MathAbs(p.entryPrice - p.maePrice) / riskDistance : 0.0;
+
+   double mfePipsInTrade = (pip > 0) ? MathAbs(p.entryPrice - p.mfePriceAtClose) / pip : 0.0;
+   double maePipsInTrade = (pip > 0) ? MathAbs(p.entryPrice - p.maePriceAtClose) / pip : 0.0;
+   double floatProfitMoney = (tickSize > 0) ? MathAbs(p.entryPrice - p.mfePriceAtClose) / tickSize * tickValue * p.lots : 0.0;
+   double floatDrawdownMoney = (tickSize > 0) ? MathAbs(p.entryPrice - p.maePriceAtClose) / tickSize * tickValue * p.lots : 0.0;
+
+   double holdingMinutes = (double)(p.exitTime - p.entryTime) / 60.0;
+   double ccToEntryMin   = (p.ccTime > 0) ? (double)(p.entryTime - p.ccTime) / 60.0 : 0.0;
+   double rcToEntryMin   = (p.rcTime > 0) ? (double)(p.entryTime - p.rcTime) / 60.0 : 0.0;
+   double balanceAfter   = p.balanceBeforeEntry + netProfit;
+
+   double refRange       = p.refHigh - p.refLow;
+   double slippagePips   = (pip > 0) ? (p.entryPrice - p.requestedEntry) / pip : 0.0;
+   double slPadPips      = (pip > 0) ? MathAbs(p.slPrice - p.structuralSl) / pip : 0.0;
+   double slDistPips     = (pip > 0) ? MathAbs(p.entryPrice - p.slPrice) / pip : 0.0;
+   double tpDistPips     = (pip > 0) ? MathAbs(p.entryPrice - p.tpPrice) / pip : 0.0;
+   double spreadPips     = (pip > 0) ? (p.askAtEntry - p.bidAtEntry) / pip : 0.0;
+   double profitPips     = (pip > 0) ? (p.isSell ? (p.entryPrice - p.exitPrice) : (p.exitPrice - p.entryPrice)) / pip : 0.0;
+
+   // Derived exit classification, independent of the broker's deal comment.
+   string exitType;
+   double exitTol = MathMax(2 * point, riskDistance * 0.10);
+   if(MathAbs(p.exitPrice - p.slPrice) <= exitTol)      exitType = "SL";
+   else if(MathAbs(p.exitPrice - p.tpPrice) <= exitTol) exitType = "TP";
+   else                                                 exitType = "OTHER";
+
+   string entryPattern   = p.isSell ? "LUCC" : "LDCC";
+   string sideCombo      = ComboKey(p.sideBiasText);
+   int    biasCount      = PatternCount(p.sideBiasText);
+   string patternSeq     = "WK[" + sideCombo + "]>" + entryPattern + ">CC>RC";
+   // Every gate that had to pass for this trade to exist (all true by
+   // construction — recorded so a future filter change is auditable).
+   string filtersPassed  = "position_free;not_done_today;under_2_today;in_session;bias_allowed;sl_valid;min_stop_ok";
 
    datetime nairobiEntry = GetNairobiTime(p.entryTime);
-   MqlDateTime dt;
+   datetime utcEntry     = GetUtcTime(p.entryTime);
+   MqlDateTime dt, du;
    TimeToStruct(nairobiEntry, dt);
+   TimeToStruct(utcEntry, du);
    string weekdayNames[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
    string nairobiDate = StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day);
 
-   FileWrite(g_logHandle,
-      p.isSell ? "SELL" : "BUY", (string)p.posId,
-      TimeToString(p.refTime, TIME_DATE|TIME_MINUTES), DoubleToString(p.refHigh, _Digits), DoubleToString(p.refLow, _Digits),
-      TimeToString(p.ccTime, TIME_DATE|TIME_MINUTES), TimeToString(p.rcTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS),
-      TimeToString(p.entryTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(p.entryPrice, _Digits),
-      DoubleToString(p.slPrice, _Digits), DoubleToString(p.tpPrice, _Digits),
-      DoubleToString(InpRiskPercent, 2), DoubleToString(p.riskAmount, 2), DoubleToString(p.lots, 2), (string)p.tradeSeqToday,
-      nairobiDate, weekdayNames[dt.day_of_week], (string)dt.hour,
-      TimeToString(p.exitTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(p.exitPrice, _Digits), CsvEscape(p.exitReason),
+   string v[] =
+   {
+      // identity / pattern taxonomy
+      (string)p.posId, p.isSell ? "SELL" : "BUY", entryPattern, _Symbol, "H1", "W1",
+      p.biasDir, CsvEscape(p.biasBuyText), CsvEscape(p.biasSellText),
+      CsvEscape(p.sideBiasText), (string)biasCount, sideCombo,
+      patternSeq, (string)biasCount, filtersPassed,
+      // timestamps
+      FmtTime(p.biasCandleTime), FmtTime(p.refTime), FmtTime(p.ccTime), FmtTime(p.rcTime),
+      FmtTime(p.entryTime), FmtTime(p.exitTime),
+      DoubleToString(holdingMinutes, 1), DoubleToString(ccToEntryMin, 1), DoubleToString(rcToEntryMin, 1),
+      // prices / levels / risk geometry
+      DoubleToString(p.refHigh, _Digits), DoubleToString(p.refLow, _Digits), DoubleToString(refRange, _Digits),
+      DoubleToString(p.requestedEntry, _Digits), DoubleToString(p.entryPrice, _Digits), DoubleToString(slippagePips, 2),
+      DoubleToString(p.structuralSl, _Digits), DoubleToString(p.slPrice, _Digits), DoubleToString(slPadPips, 2), DoubleToString(p.tpPrice, _Digits),
+      DoubleToString(InpTakeProfitRMultiple, 2), DoubleToString(rRealized, 3), DoubleToString(slDistPips, 2), DoubleToString(tpDistPips, 2),
+      // market conditions at entry
+      DoubleToString(p.bidAtEntry, _Digits), DoubleToString(p.askAtEntry, _Digits),
+      DoubleToString(p.spreadPoints, 1), DoubleToString(spreadPips, 2), DoubleToString(p.atrH1AtEntry, _Digits),
+      DoubleToString(p.lots, 2), DoubleToString(InpRiskPercent, 2), DoubleToString(p.riskAmount, 2),
+      // outcome
+      DoubleToString(p.exitPrice, _Digits), CsvEscape(p.exitReason), exitType, DoubleToString(profitPips, 1),
       DoubleToString(p.grossProfit, 2), DoubleToString(p.commission, 2), DoubleToString(p.swap, 2), DoubleToString(netProfit, 2),
-      DoubleToString(rRealized, 3),
-      DoubleToString(mfeRInTrade, 3), DoubleToString(maeRInTrade, 3),
-      DoubleToString(mfeRExtended, 3), DoubleToString(maeRExtended, 3),
+      // excursions
+      DoubleToString(mfeRInTrade, 3), DoubleToString(maeRInTrade, 3), DoubleToString(mfeRExtended, 3), DoubleToString(maeRExtended, 3),
+      DoubleToString(mfePipsInTrade, 1), DoubleToString(maePipsInTrade, 1),
+      DoubleToString(floatProfitMoney, 2), DoubleToString(floatDrawdownMoney, 2),
       (string)InpExcursionTrackingHours, windowComplete ? "true" : "false",
-      DoubleToString(holdingMinutes, 1), DoubleToString(p.balanceBeforeEntry, 2), DoubleToString(balanceAfter, 2));
-   FileFlush(g_logHandle);
+      // calendar / session context
+      SessionNameUtc(utcEntry), (string)du.hour, nairobiDate, weekdayNames[dt.day_of_week], (string)dt.hour,
+      // account
+      DoubleToString(p.balanceBeforeEntry, 2), DoubleToString(balanceAfter, 2), (string)InpMagicNumber
+   };
+
+   if(g_logCols > 0 && ArraySize(v) != g_logCols)
+      PrintFormat("LUCC/LDCC EA: trade-log column mismatch (header=%d, row=%d) — check FinalizePendingLog.",
+                  g_logCols, ArraySize(v));
+
+   WriteCsvRow(v);
 }
 
 // Called every tick: extends MFE/MAE for every trade still in its tracking
@@ -1096,6 +1337,11 @@ int OnInit()
    g_trade.SetDeviationInPoints(InpSlippagePoints);
    g_trade.SetTypeFillingBySymbol(_Symbol);
 
+   // H1 ATR(14) handle — logged as volatility context on every entry.
+   g_atrHandle = iATR(_Symbol, PERIOD_H1, 14);
+   if(g_atrHandle == INVALID_HANDLE)
+      PrintFormat("LUCC/LDCC EA: could not create H1 ATR handle, error=%d (ATR will log as 0).", GetLastError());
+
    g_lastBarTime  = 0;
    g_lastResetDay = 0;
    g_prevMid      = 0.0;
@@ -1139,6 +1385,12 @@ void OnDeinit(const int reason)
    ArrayFree(g_pending);
 
    DestroyPanel();
+
+   if(g_atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_atrHandle);
+      g_atrHandle = INVALID_HANDLE;
+   }
 
    if(g_logHandle != INVALID_HANDLE)
    {
