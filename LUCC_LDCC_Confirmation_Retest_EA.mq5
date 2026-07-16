@@ -2,17 +2,28 @@
 //|                    LUCC_LDCC_Confirmation_Retest_EA.mq5          |
 //|                                                                    |
 //| Expert Advisor port of "LUCC / LDCC Confirmation & Retest         |
-//| Indicator" (Pine v6). The signal-detection logic below is a       |
-//| line-for-line mirror of the indicator: same LUCC/LDCC candidate   |
-//| search, same PROTECTED / NOT-CONTAINED filters, same Confirmation |
-//| Candle (CC) and Retest Candle (RC) rules, evaluated only on fully |
-//| closed H1 bars (never the forming bar) so it cannot repaint.      |
+//| Indicator" (Pine v6).                                              |
+//|                                                                    |
+//| LUCC/LDCC candidate search, the PROTECTED / NOT-CONTAINED filters, |
+//| and the Confirmation Candle (CC) rule are a line-for-line mirror   |
+//| of the indicator, evaluated only on fully closed H1 bars (never    |
+//| the forming bar) so that part cannot repaint.                     |
+//|                                                                    |
+//| The Retest Candle (RC) is intentionally NOT bar-close detection.  |
+//| Once the CC closes, the EA watches price tick-by-tick and treats  |
+//| the very first tick that touches the LUCC Low / LDCC High as the  |
+//| RC, executing the market order immediately on that tick — not on  |
+//| the candle after it. This is still non-repainting: the only       |
+//| closed-bar confirmation is the CC; the RC is a real-time price     |
+//| event that, once it happens, is a fixed historical fact and is    |
+//| never re-evaluated or undone.                                     |
 //|                                                                    |
 //| Offset convention: BarX(0) = the bar that JUST closed (equivalent |
 //| to offset 0 / "close[0]" at the instant barstate.isconfirmed was  |
 //| true in the indicator). BarX(i) = i bars before that. In MQL5     |
 //| shift terms this is always (i + 1), because shift 0 is the        |
-//| still-forming live bar, which this EA never reads.                |
+//| still-forming live bar, which the closed-bar part of this EA      |
+//| never reads.                                                       |
 //+------------------------------------------------------------------+
 #include <Trade/Trade.mqh>
 
@@ -68,6 +79,8 @@ SSignalState g_buy;    // BUY side,  driven by the Bearish LDCC
 CTrade   g_trade;
 datetime g_lastBarTime  = 0;
 datetime g_lastResetDay = 0;
+double   g_prevMid      = 0.0;   // previous tick's mid price, for level-crossing detection
+bool     g_havePrevMid  = false;
 
 //======================================================================
 // Candle helpers — off is the "just-closed bar" offset described above
@@ -148,10 +161,11 @@ int FindReferenceOffset(bool isSell)
 }
 
 //+------------------------------------------------------------------+
-//| Runs the full state machine for one direction on the just-closed |
-//| bar: (re)selection/invalidation of the reference candle, then    |
-//| the Confirmation Candle check, then the Retest Candle check —    |
-//| in that order, exactly as the indicator evaluates them.          |
+//| Runs the closed-bar part of the state machine for one direction: |
+//| (re)selection/invalidation of the reference candle, then the     |
+//| Confirmation Candle check. The Retest Candle is deliberately NOT |
+//| handled here — see MonitorRetest(), which watches for it tick by |
+//| tick once ccTime is set below.                                   |
 //+------------------------------------------------------------------+
 void UpdateDirection(bool isSell, SSignalState &st)
 {
@@ -191,17 +205,38 @@ void UpdateDirection(bool isSell, SSignalState &st)
          st.slLevel = extreme;
       }
    }
+}
 
-   // Retest Candle — strictly after the CC bar, identical touch formula
-   // for both sides (high >= level and low <= level).
-   if(st.ccTime != 0 && st.rcTime == 0 && BarTime(0) > st.ccTime)
+//+------------------------------------------------------------------+
+//| Tick-by-tick Retest Candle detection. Active only while a CC has |
+//| closed (st.ccTime != 0) and no RC has fired yet for this cycle    |
+//| (st.rcTime == 0) — i.e. exactly the "waiting for retest" state.   |
+//| Since UpdateDirection() only sets/clears ccTime on closed bars,   |
+//| this can never start before the CC bar has actually closed, and  |
+//| a reference-candle invalidation on a later closed bar (ccTime     |
+//| reset to 0) automatically cancels an in-progress wait.            |
+//|                                                                    |
+//| "Touch" = the level is reachable by the live market right now:    |
+//| either it sits inside the current Bid/Ask spread, or price        |
+//| jumped straight across it between two consecutive ticks (a        |
+//| plain Bid/Ask-vs-level check alone would miss that second case    |
+//| whenever ticks don't land exactly on the level, e.g. coarser      |
+//| tick generation during backtests). The instant either is true,    |
+//| the order is sent — same tick, no waiting for a candle close.     |
+//+------------------------------------------------------------------+
+void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double mid)
+{
+   if(st.ccTime == 0 || st.rcTime != 0)
+      return;
+
+   double level    = isSell ? st.refLow : st.refHigh;
+   bool   straddle = (bid <= level && ask >= level);
+   bool   crossed  = g_havePrevMid && ((g_prevMid - level) * (mid - level) < 0);
+
+   if(straddle || crossed)
    {
-      double level = isSell ? st.refLow : st.refHigh;
-      if(BarHigh(0) >= level && BarLow(0) <= level)
-      {
-         st.rcTime = BarTime(0);
-         TryOpen(isSell, st);
-      }
+      st.rcTime = iTime(_Symbol, PERIOD_H1, 0); // the currently-forming bar is the RC
+      TryOpen(isSell, st);
    }
 }
 
@@ -442,6 +477,8 @@ int OnInit()
 
    g_lastBarTime  = 0;
    g_lastResetDay = 0;
+   g_prevMid      = 0.0;
+   g_havePrevMid  = false;
    return(INIT_SUCCEEDED);
 }
 
@@ -453,12 +490,24 @@ void OnTick()
 {
    CheckDailyReset();
 
+   // Closed-bar part: reference-candle (re)selection and CC detection.
    datetime curBarTime = iTime(_Symbol, PERIOD_H1, 0);
    if(curBarTime != g_lastBarTime)
    {
       g_lastBarTime = curBarTime;
       ProcessNewBar();
    }
+
+   // Tick-by-tick part: RC detection and immediate execution.
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double mid = (bid + ask) / 2.0;
+
+   MonitorRetest(true,  g_sell, bid, ask, mid);
+   MonitorRetest(false, g_buy,  bid, ask, mid);
+
+   g_prevMid     = mid;
+   g_havePrevMid = true;
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
