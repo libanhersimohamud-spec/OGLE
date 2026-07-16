@@ -37,15 +37,17 @@ input long   InpMagicNumber          = 20260716; // Magic number
 input int    InpSlippagePoints       = 20;       // Max slippage (points)
 
 input group "Stop Loss & Take Profit"
-input double InpTakeProfitRMultiple  = 3.0;   // TP distance = this many x the PADDED SL distance
-                                               // (spec: fixed 1:3 R:R measured from the 5-pip-padded
-                                               // stop, so realized reward is a true 3x the money risked.
+input double InpTakeProfitRMultiple  = 3.0;   // TP distance = this many x the FINAL SL distance
+                                               // (spec: fixed 1:3 R:R measured from the buffered stop,
+                                               // so realized reward is a true 3x the money risked.
                                                // Left as an input so Strategy Tester's Optimizer can
                                                // still sweep it.)
-input double InpStopPadPips           = 5.0;  // Pips added BEYOND the structural SL before sizing
-                                               // (widens the stop; lots shrink so the $-risk is unchanged)
-input double InpPipSizePoints         = 0;    // Points per pip for the pad (0 = auto: 10 points on
-                                               // 3/5-digit symbols, 1 point on 2/4-digit)
+input double InpStopLossMultiplier    = 1.3;  // FINAL SL distance = original structural SL range x this.
+                                               // Proportional buffer that scales with the setup size
+                                               // (e.g. 10p->13p, 20p->26p, 30p->39p), replacing the old
+                                               // fixed +pip pad. Risk is held constant (lots shrink).
+input double InpPipSizePoints         = 0;    // Points per pip for the CSV pip conversions (0 = auto:
+                                               // 10 points on 3/5-digit symbols, 1 point on 2/4-digit)
 
 input group "Trading Session (Nairobi / EAT, UTC+3, no DST)"
 input double InpBrokerGmtOffsetHours = 2.0;   // Broker's STANDARD (winter) GMT offset, hours
@@ -1020,14 +1022,17 @@ bool TryOpen(bool isSell, SSignalState &st)
       return false;
    }
 
-   // 5-pip padding — widen the stop beyond the structural level. Risk stays
-   // constant (CalcLotSize sizes off this PADDED distance, so lots shrink),
-   // and the fixed-RR TP is measured from the PADDED stop — giving a true
-   // monetary 1:InpTakeProfitRMultiple on the stop the trade actually carries.
-   double pad = InpStopPadPips * PipSize();
-   double sl  = isSell ? structuralSl + pad : structuralSl - pad;
+   // Proportional SL buffer — the FINAL stop distance is the original
+   // structural SL range (entry -> structural stop) multiplied by
+   // InpStopLossMultiplier (e.g. x1.3), so the buffer scales with the setup
+   // size instead of a fixed pip pad. Risk stays constant (CalcLotSize sizes
+   // off this final distance, so lots shrink), and the fixed-RR TP is measured
+   // from the final stop — a true monetary 1:InpTakeProfitRMultiple.
+   double origRange  = MathAbs(entry - structuralSl);
+   double finalRange = origRange * InpStopLossMultiplier;
+   double sl  = isSell ? entry + finalRange : entry - finalRange;
 
-   double dist   = MathAbs(entry - sl);
+   double dist   = finalRange;
    double tpDist = dist * InpTakeProfitRMultiple;
    double tp     = isSell ? entry - tpDist : entry + tpDist;
 
@@ -1695,8 +1700,8 @@ void UpdatePanel()
             BuyBiasAllowed() ? "OK" : "blocked", buyWinLock ? "  [WK-WIN-LOCK]" : ""),
             buyWinLock ? clrGold : (BuyBiasAllowed() ? clrGainsboro : clrGray));
 
-   PanelSet(10, StringFormat("TP 1:%.1f  |  SL pad %.0f pip",
-            InpTakeProfitRMultiple, InpStopPadPips), clrGainsboro);
+   PanelSet(10, StringFormat("TP 1:%.1f  |  SL x%.2f (range buffer)",
+            InpTakeProfitRMultiple, InpStopLossMultiplier), clrGainsboro);
 
    PanelSet(11, StringFormat("Risk %.2f%% of %.2f = %.2f",
             InpRiskPercent, g_riskBalance, g_riskBalance * InpRiskPercent / 100.0), clrGainsboro);
