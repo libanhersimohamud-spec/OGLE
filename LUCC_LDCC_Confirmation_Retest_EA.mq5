@@ -63,8 +63,8 @@ input string InpTradeLogFileName     = "LUCC_LDCC_TradeLog.csv";      // File na
 input bool   InpEnableExcursionTracking = true;  // Keep watching price past the actual exit for true MFE/MAE
 input int    InpExcursionTrackingHours  = 120;   // Hours from ENTRY to keep tracking (uncapped by SL/TP)
 
-input group "1D Bias Filter"
-input bool   InpUseBiasFilter        = true;  // Gate entries on the Daily (1D) directional bias
+input group "1W Bias Filter"
+input bool   InpUseBiasFilter        = true;  // Gate entries on the Weekly (1W) directional bias
 
 input group "Info Panel"
 input bool   InpShowPanel            = true;         // Show the on-chart info panel
@@ -470,53 +470,53 @@ void CheckDailyReset()
 }
 
 //======================================================================
-// 1D BIAS ENGINE  (direct, CRT-free port of the reference bias patterns,
-// evaluated ONLY on the Daily timeframe — the exact mirror of the
-// indicator's Bias engine). Per the agreed design the Daily shift maps
+// 1W BIAS ENGINE  (direct, CRT-free port of the reference bias patterns,
+// evaluated ONLY on the Weekly timeframe — the exact mirror of the
+// indicator's Bias engine). Per the agreed design the Weekly shift maps
 // 1:1 onto the reference's Pine offset, so each pattern reads exactly the
 // candle it was written against:
-//   * BC / DC / BSB / SBS   -> shifts 1 & 2 (LAST-CLOSED daily candles),
+//   * BC / DC / BSB / SBS   -> shifts 1 & 2 (LAST-CLOSED weekly candles),
 //                              fixed the moment candle 1 closed.
-//   * 3DP / 3DP-DS / N-3DP  -> include shift 0 (the LIVE forming daily
-//     / N-DS                   candle), so an intraday sweep of the prior
-//                              candle's high/low confirms them the same day,
+//   * 3DP / 3DP-DS / N-3DP  -> include shift 0 (the LIVE forming weekly
+//     / N-DS                   candle), so an intraweek sweep of the prior
+//                              candle's high/low confirms them the same week,
 //                              exactly as in the reference's live read.
 //
 // The bias only GATES whether a Retest-Candle entry is actionable — it
 // never touches the LUCC/LDCC/CC/RC detection above.
 //======================================================================
-double DOpen(int s)  { return iOpen(_Symbol, PERIOD_D1, s); }
-double DHigh(int s)  { return iHigh(_Symbol, PERIOD_D1, s); }
-double DLow(int s)   { return iLow(_Symbol, PERIOD_D1, s); }
-double DClose(int s) { return iClose(_Symbol, PERIOD_D1, s); }
+double WOpen(int s)  { return iOpen(_Symbol, PERIOD_W1, s); }
+double WHigh(int s)  { return iHigh(_Symbol, PERIOD_W1, s); }
+double WLow(int s)   { return iLow(_Symbol, PERIOD_W1, s); }
+double WClose(int s) { return iClose(_Symbol, PERIOD_W1, s); }
 
 // --- Buy-side patterns ---
-bool Bias_BC_Buy()    { return DClose(1) > DHigh(2); }
-bool Bias_DC_Buy()    { return DLow(1) < DLow(2) && DHigh(1) > DHigh(2) && DClose(1) > DOpen(1); }
-bool Bias_BSB_Buy()   { return DClose(2) > DOpen(2) && DHigh(1) <= DHigh(2) && DLow(1) >= DLow(2); }
-bool Bias_3DP_Buy()   { return DClose(1) >= DLow(2) && DClose(1) <= DHigh(2) && DLow(0) < DLow(1) && DLow(0) < DLow(2); }
-bool Bias_DS_Buy()    { return DClose(1) < DLow(2) && DClose(1) < DLow(3) &&
-                               DClose(2) >= DLow(1) && DClose(2) >= DLow(2) && DClose(2) >= DLow(3) &&
-                               DLow(0) < DLow(1); }
-bool Bias_N3DP_Buy()  { return DHigh(1) <= DHigh(2) && DLow(1) >= DLow(2) && DLow(0) < DLow(1) && DLow(0) < DLow(2); }
-bool Bias_NDS_Buy()   { return DHigh(2) <= DHigh(3) && DLow(2) >= DLow(3) &&
-                               DClose(1) < DLow(2) && DClose(1) < DLow(3) &&
-                               DLow(0) < DLow(1) && DLow(0) < DLow(2) && DLow(0) < DLow(3) &&
-                               DHigh(1) <= DHigh(3) && DHigh(0) <= DHigh(3); }
+bool Bias_BC_Buy()    { return WClose(1) > WHigh(2); }
+bool Bias_DC_Buy()    { return WLow(1) < WLow(2) && WHigh(1) > WHigh(2) && WClose(1) > WOpen(1); }
+bool Bias_BSB_Buy()   { return WClose(2) > WOpen(2) && WHigh(1) <= WHigh(2) && WLow(1) >= WLow(2); }
+bool Bias_3DP_Buy()   { return WClose(1) >= WLow(2) && WClose(1) <= WHigh(2) && WLow(0) < WLow(1) && WLow(0) < WLow(2); }
+bool Bias_DS_Buy()    { return WClose(1) < WLow(2) && WClose(1) < WLow(3) &&
+                               WClose(2) >= WLow(1) && WClose(2) >= WLow(2) && WClose(2) >= WLow(3) &&
+                               WLow(0) < WLow(1); }
+bool Bias_N3DP_Buy()  { return WHigh(1) <= WHigh(2) && WLow(1) >= WLow(2) && WLow(0) < WLow(1) && WLow(0) < WLow(2); }
+bool Bias_NDS_Buy()   { return WHigh(2) <= WHigh(3) && WLow(2) >= WLow(3) &&
+                               WClose(1) < WLow(2) && WClose(1) < WLow(3) &&
+                               WLow(0) < WLow(1) && WLow(0) < WLow(2) && WLow(0) < WLow(3) &&
+                               WHigh(1) <= WHigh(3) && WHigh(0) <= WHigh(3); }
 
 // --- Sell-side patterns ---
-bool Bias_BC_Sell()   { return DClose(1) < DLow(2); }
-bool Bias_DC_Sell()   { return DHigh(1) > DHigh(2) && DLow(1) < DLow(2) && DClose(1) < DOpen(1); }
-bool Bias_SBS_Sell()  { return DClose(2) < DOpen(2) && DHigh(1) <= DHigh(2) && DLow(1) >= DLow(2); }
-bool Bias_3DP_Sell()  { return DClose(1) >= DLow(2) && DClose(1) <= DHigh(2) && DHigh(0) > DHigh(1) && DHigh(0) > DHigh(2); }
-bool Bias_DS_Sell()   { return DClose(1) > DHigh(2) && DClose(1) > DHigh(3) &&
-                               DClose(2) <= DHigh(1) && DClose(2) <= DHigh(2) && DClose(2) <= DHigh(3) &&
-                               DHigh(0) > DHigh(1); }
-bool Bias_N3DP_Sell() { return DHigh(1) <= DHigh(2) && DLow(1) >= DLow(2) && DHigh(0) > DHigh(1) && DHigh(0) > DHigh(2); }
-bool Bias_NDS_Sell()  { return DHigh(2) <= DHigh(3) && DLow(2) >= DLow(3) &&
-                               DClose(1) > DHigh(2) && DClose(1) > DHigh(3) &&
-                               DHigh(0) > DHigh(1) && DHigh(0) > DHigh(2) && DHigh(0) > DHigh(3) &&
-                               DLow(1) >= DLow(3) && DLow(0) >= DLow(3); }
+bool Bias_BC_Sell()   { return WClose(1) < WLow(2); }
+bool Bias_DC_Sell()   { return WHigh(1) > WHigh(2) && WLow(1) < WLow(2) && WClose(1) < WOpen(1); }
+bool Bias_SBS_Sell()  { return WClose(2) < WOpen(2) && WHigh(1) <= WHigh(2) && WLow(1) >= WLow(2); }
+bool Bias_3DP_Sell()  { return WClose(1) >= WLow(2) && WClose(1) <= WHigh(2) && WHigh(0) > WHigh(1) && WHigh(0) > WHigh(2); }
+bool Bias_DS_Sell()   { return WClose(1) > WHigh(2) && WClose(1) > WHigh(3) &&
+                               WClose(2) <= WHigh(1) && WClose(2) <= WHigh(2) && WClose(2) <= WHigh(3) &&
+                               WHigh(0) > WHigh(1); }
+bool Bias_N3DP_Sell() { return WHigh(1) <= WHigh(2) && WLow(1) >= WLow(2) && WHigh(0) > WHigh(1) && WHigh(0) > WHigh(2); }
+bool Bias_NDS_Sell()  { return WHigh(2) <= WHigh(3) && WLow(2) >= WLow(3) &&
+                               WClose(1) > WHigh(2) && WClose(1) > WHigh(3) &&
+                               WHigh(0) > WHigh(1) && WHigh(0) > WHigh(2) && WHigh(0) > WHigh(3) &&
+                               WLow(1) >= WLow(3) && WLow(0) >= WLow(3); }
 
 string Bias_BuyText()
 {
@@ -545,9 +545,9 @@ string Bias_SellText()
 
 struct SBiasState
 {
-   datetime c1Time;      // time of the last-CLOSED daily candle (D1 shift 1) — rollover marker
-   bool     buyInvalid;  // today's price has traded ABOVE candle-1 high  -> BUY bias dead for the day
-   bool     sellInvalid; // today's price has traded BELOW candle-1 low   -> SELL bias dead for the day
+   datetime c1Time;      // time of the last-CLOSED weekly candle (W1 shift 1) — rollover marker
+   bool     buyInvalid;  // this week's price has traded ABOVE candle-1 high -> BUY bias dead for the week
+   bool     sellInvalid; // this week's price has traded BELOW candle-1 low  -> SELL bias dead for the week
    string   dir;         // "BUY" / "SELL" / "BOTH" / "NONE"
    string   buyText;     // active buy patterns, or "-"
    string   sellText;    // active sell patterns, or "-"
@@ -556,15 +556,15 @@ struct SBiasState
 };
 SBiasState g_bias;
 
-// Recompute the Daily bias every tick: pattern presence/direction (read
+// Recompute the Weekly bias every tick: pattern presence/direction (read
 // LIVE, exactly like the reference), plus the price-based invalidation
 // latches. Must be called before the retest gate each tick.
 void ComputeBias(double bid, double ask)
 {
-   // A new daily candle clears both invalidation latches — an invalidation
-   // can never carry across days, exactly like the indicator resetting its
-   // bias1DInvalid once per new Daily candle.
-   datetime c1 = iTime(_Symbol, PERIOD_D1, 1);
+   // A new weekly candle clears both invalidation latches — an invalidation
+   // can never carry across weeks, exactly like the indicator resetting its
+   // bias invalidation once per new higher-timeframe candle.
+   datetime c1 = iTime(_Symbol, PERIOD_W1, 1);
    if(c1 != g_bias.c1Time)
    {
       g_bias.c1Time      = c1;
@@ -574,7 +574,7 @@ void ComputeBias(double bid, double ask)
 
    // The DS / N-DS patterns reach back to shift 3, so we need candles 0..3
    // before any bias can be evaluated; until then there is no bias.
-   if(iBars(_Symbol, PERIOD_D1) < 4)
+   if(iBars(_Symbol, PERIOD_W1) < 4)
    {
       g_bias.buyText     = "-"; g_bias.sellText    = "-";
       g_bias.buyPresent  = false; g_bias.sellPresent = false;
@@ -591,20 +591,20 @@ void ComputeBias(double bid, double ask)
        (g_bias.sellPresent && !g_bias.buyPresent) ? "SELL" :
        (g_bias.buyPresent &&  g_bias.sellPresent) ? "BOTH" : "NONE";
 
-   // Invalidation — price-based and latched for the rest of the Daily candle.
-   // Reference = candle 1 (last closed daily). BUY dies once today's price
+   // Invalidation — price-based and latched for the rest of the Weekly candle.
+   // Reference = candle 1 (last closed weekly). BUY dies once this week's price
    // trades above candle-1 high; SELL dies once it trades below candle-1 low.
    // The two latches are INDEPENDENT so that under BOTH, one side breaking
    // never silences the other (buy and sell run independently, per spec).
-   double c1High  = DHigh(1);
-   double c1Low   = DLow(1);
-   double dayHigh = MathMax(DHigh(0), ask); // running high so far today, incl. the live tick
-   double dayLow  = MathMin(DLow(0),  bid); // running low  so far today, incl. the live tick
-   if(dayHigh > c1High) g_bias.buyInvalid  = true;
-   if(dayLow  < c1Low)  g_bias.sellInvalid = true;
+   double c1High   = WHigh(1);
+   double c1Low    = WLow(1);
+   double weekHigh = MathMax(WHigh(0), ask); // running high so far this week, incl. the live tick
+   double weekLow  = MathMin(WLow(0),  bid); // running low  so far this week, incl. the live tick
+   if(weekHigh > c1High) g_bias.buyInvalid  = true;
+   if(weekLow  < c1Low)  g_bias.sellInvalid = true;
 }
 
-// A direction is tradeable only if a Daily pattern of that side is present
+// A direction is tradeable only if a Weekly pattern of that side is present
 // AND that side hasn't been invalidated. With the filter switched off the
 // gate is transparent (always allowed).
 bool BuyBiasAllowed()  { return !InpUseBiasFilter || (g_bias.buyPresent  && !g_bias.buyInvalid); }
@@ -679,8 +679,8 @@ void TryOpen(bool isSell, SSignalState &st)
    if(!IsWithinSession())
       return;
 
-   // 1D bias gate — a Retest Candle only becomes an actionable entry if the
-   // Daily bias currently supports this direction and hasn't been invalidated.
+   // 1W bias gate — a Retest Candle only becomes an actionable entry if the
+   // Weekly bias currently supports this direction and hasn't been invalidated.
    // Buy and sell are gated independently, so under a BOTH-bias day each side
    // can still trade on its own. This gates ONLY the entry; the LUCC/LDCC/
    // CC/RC detection above is untouched.
@@ -1038,7 +1038,7 @@ void UpdatePanel()
 
    PanelEnsureBackground();
 
-   PanelSet(0, "LUCC / LDCC  +  1D Bias EA", clrDeepSkyBlue);
+   PanelSet(0, "LUCC / LDCC  +  1W Bias EA", clrDeepSkyBlue);
 
    bool inSession = IsWithinSession();
    MqlDateTime nd; TimeToStruct(GetNairobiTime(TimeCurrent()), nd);
@@ -1049,7 +1049,7 @@ void UpdatePanel()
    color dirClr = g_bias.dir == "BUY"  ? clrLime :
                   g_bias.dir == "SELL" ? clrRed  :
                   g_bias.dir == "BOTH" ? clrOrange : clrSilver;
-   PanelSet(2, "1D Bias: " + g_bias.dir, dirClr);
+   PanelSet(2, "1W Bias: " + g_bias.dir, dirClr);
 
    string buyStat  = !g_bias.buyPresent  ? "-" : (g_bias.buyInvalid  ? "INVALIDATED" : "ACTIVE");
    color  buyClr   = !g_bias.buyPresent  ? clrSilver : (g_bias.buyInvalid  ? clrOrangeRed : clrLime);
@@ -1165,7 +1165,7 @@ void OnTick()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mid = (bid + ask) / 2.0;
 
-   // Refresh the Daily bias (direction + invalidation latches) before the
+   // Refresh the Weekly bias (direction + invalidation latches) before the
    // retest gate reads it this tick.
    ComputeBias(bid, ask);
 
