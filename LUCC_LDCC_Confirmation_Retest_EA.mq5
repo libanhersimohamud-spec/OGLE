@@ -195,7 +195,11 @@ int GetMaxBack()
 //| (isSell=false) candidate in the last LOOKBACK closed candles.    |
 //| Exact mirror of the indicator's scan: qualification (bullish/    |
 //| bearish + breakout), PROTECTED filter, then the shared NOT        |
-//| CONTAINED range-containment filter. Returns -1 if none found.    |
+//| CONTAINED range-containment filter — PLUS a session gate: a       |
+//| candidate whose own bar didn't open within the trading window     |
+//| is skipped outright, so it can never become a reference candle,   |
+//| never spawn a CC/RC cycle, and never waste a retest that would    |
+//| just get rejected later at entry anyway. Returns -1 if none found.|
 //+------------------------------------------------------------------+
 int FindReferenceOffset(bool isSell)
 {
@@ -209,6 +213,8 @@ int FindReferenceOffset(bool isSell)
          ? (IsBullish(i) && BarClose(i) > BarHigh(i + 1))
          : (IsBearish(i) && BarClose(i) < BarLow(i + 1));
       if(!qualifies)
+         continue;
+      if(!IsBarWithinSession(BarTime(i)))
          continue;
 
       bool valid = true;
@@ -397,12 +403,13 @@ datetime GetNairobiTime(datetime serverTime)
 }
 
 // Session window widens/shifts seasonally per spec: 04:00-18:00 Nairobi
-// during the summer months, 05:00-19:00 the rest of the year.
-bool IsWithinSession()
+// during the summer months, 05:00-19:00 the rest of the year. Shared core
+// so both "is it in-session right now" (entries) and "was this specific
+// bar in-session" (reference-candle selection) use identical rules.
+bool IsNairobiTimeWithinSession(datetime nairobiTime)
 {
-   datetime nairobiNow = GetNairobiTime(TimeCurrent());
    MqlDateTime dt;
-   TimeToStruct(nairobiNow, dt);
+   TimeToStruct(nairobiTime, dt);
 
    bool isSummer = (dt.mon >= InpSummerStartMonth && dt.mon <= InpSummerEndMonth);
    int  startMin  = (isSummer ? InpSummerStartHour : InpWinterStartHour) * 60;
@@ -410,6 +417,21 @@ bool IsWithinSession()
    int  nowMin    = dt.hour * 60 + dt.min;
 
    return (nowMin >= startMin && nowMin < endMin);
+}
+
+bool IsWithinSession()
+{
+   return IsNairobiTimeWithinSession(GetNairobiTime(TimeCurrent()));
+}
+
+// Was the H1 bar that opened at barServerTime within the session window?
+// Used to keep LUCC/LDCC candidates that formed outside your trading
+// hours from ever being selected as a reference candle in the first
+// place (see FindReferenceOffset), rather than only blocking the final
+// entry after a whole cycle has already played out on an off-hours setup.
+bool IsBarWithinSession(datetime barServerTime)
+{
+   return IsNairobiTimeWithinSession(GetNairobiTime(barServerTime));
 }
 
 // Resets both directions' daily trade counters at the start of each new
