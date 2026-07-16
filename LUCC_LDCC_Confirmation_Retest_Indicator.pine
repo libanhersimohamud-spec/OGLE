@@ -402,64 +402,67 @@ f_biasPack() =>
 [buyTxt1D, sellTxt1D, c1High1D, c1Low1D, c1Time1D] =
      request.security(syminfo.tickerid, "D", f_biasPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-// The timeframe's raw direction for THIS candle: BUY if only a buy pattern
-// matched, SELL if only a sell pattern matched. If somehow both matched on
-// the same Candle 1 (or neither did), there's no single clean directional
-// read, so it resolves to NONE rather than guessing.
-f_resolveDir(buyTxt, sellTxt) =>
-    buyFound = buyTxt != "-"
-    sellFound = sellTxt != "-"
-    buyFound and not sellFound ? "BUY" : sellFound and not buyFound ? "SELL" : "NONE"
-
-rawDir1D = f_resolveDir(buyTxt1D, sellTxt1D)
-
 // -----------------------------------------------------------------------------
-// Persistent Bias state (1D only).
+// Direction resolution — the CRT-free reduction of the reference's bias logic.
+// In the reference, a timeframe is BUY-capable whenever its buy pattern text is
+// present (buyBiasOK = buyText != "-") and SELL-capable whenever its sell
+// pattern text is present, the two evaluated FULLY INDEPENDENTLY; the reference
+// then resolves BUY / SELL / BOTH / WAIT. Applied to the single 1D read here it
+// yields BUY / SELL / BOTH / NONE with exactly that independence — a pattern is
+// never suppressed just because the opposite side also produced one.
 // -----------------------------------------------------------------------------
-var string bias1DDir     = "NONE"
-var string bias1DPattern = "-"   // which pattern(s) produced the active Bias, e.g. "BC ", "DC BSB "
-var string bias1DTF      = "-"   // the timeframe that produced the active Bias (always the 1D engine here)
-var float  bias1DHigh    = na
-var float  bias1DLow     = na
-var bool   bias1DInvalid = false
-var int    lastC1Time1D  = na
+buyPresent1D  = buyTxt1D  != "-"
+sellPresent1D = sellTxt1D != "-"
 
-// The bias engine evaluates exactly one timeframe (Daily). This is the human-
-// readable label shown in the "Bias Timeframe" table row so it is always
-// unambiguous which timeframe produced the pattern shown alongside it.
+rawDir1D =
+     buyPresent1D and not sellPresent1D ? "BUY"  :
+     sellPresent1D and not buyPresent1D ? "SELL" :
+     buyPresent1D and sellPresent1D     ? "BOTH" :
+     "NONE"
+
+// The pattern text is read LIVE from the Daily security call — it is exactly
+// the reference's f_buyPatternText()/f_sellPatternText() output for the Daily
+// candle, with NOTHING frozen at candle-open. This is the fix: the sweep
+// patterns (3DP / 3DP-DS / N-3DP / N-DS) only become true once the Daily candle
+// takes out the prior candle's high/low DURING the session, so freezing at the
+// open dropped them entirely. Reading live makes them appear here identically
+// to the reference, on the same candle.
+biasPattern1D =
+     rawDir1D == "BUY"  ? buyTxt1D :
+     rawDir1D == "SELL" ? sellTxt1D :
+     rawDir1D == "BOTH" ? buyTxt1D + "| " + sellTxt1D :
+     "-"
+
+// The bias engine evaluates exactly one timeframe (Daily). This label is shown
+// in the "Bias Timeframe" table row so it is always unambiguous which timeframe
+// produced the pattern shown alongside it.
 BIAS_TF_LABEL = "1D (Daily)"
 
-// (Re)selection — only when the Daily Candle 1 reference itself changes to
-// a genuinely new bar (confirmed bars only, non-repainting, matching the
-// LUCC/LDCC block's own selection style). A new Bias candle always clears
-// any prior invalidation and re-freezes the High/Low that governs
-// invalidation for this cycle, per "wait for a completely new Bias candle
-// before starting a new setup."
-if barstate.isconfirmed
-    if nz(c1Time1D, -1) != nz(lastC1Time1D, -1)
-        lastC1Time1D := c1Time1D
-        bias1DInvalid := false
-        bias1DDir     := rawDir1D
-        bias1DPattern := rawDir1D == "BUY" ? buyTxt1D : rawDir1D == "SELL" ? sellTxt1D : "-"
-        // Bind the reported timeframe to the SAME (re)selection that sets the
-        // pattern above, so the "Bias Timeframe" and "Bias Pattern" rows can
-        // never disagree — the pattern shown is always the one this timeframe
-        // produced on this Bias candle.
-        bias1DTF      := rawDir1D != "NONE" ? BIAS_TF_LABEL : "-"
-        bias1DHigh    := rawDir1D != "NONE" ? c1High1D : na
-        bias1DLow     := rawDir1D != "NONE" ? c1Low1D  : na
+// -----------------------------------------------------------------------------
+// Invalidation state — latched per Daily candle. Direction and pattern are read
+// live (above) to match the reference; only the invalidation window is anchored
+// to the Daily Candle 1 High/Low and reset once per new Daily candle, so an
+// invalidation can't be silently wiped intrabar.
+// -----------------------------------------------------------------------------
+var bool bias1DInvalid = false
+var int  lastC1Time1D  = na
 
-// Invalidation — checked on EVERY tick (not just confirmed bars), since the
-// rule is "if price breaks above/below ... IMMEDIATELY invalidate".
-if bias1DDir == "BUY" and not bias1DInvalid and not na(bias1DHigh) and high > bias1DHigh
+if barstate.isconfirmed and nz(c1Time1D, -1) != nz(lastC1Time1D, -1)
+    lastC1Time1D  := c1Time1D
+    bias1DInvalid := false
+
+// Checked on EVERY tick — "if price breaks the Candle-1 level, IMMEDIATELY
+// invalidate." A BUY read fails if price trades above the Candle-1 High; a SELL
+// read fails if price trades below the Candle-1 Low (BOTH is held to both).
+if (rawDir1D == "BUY" or rawDir1D == "BOTH") and not bias1DInvalid and not na(c1High1D) and high > c1High1D
     bias1DInvalid := true
-if bias1DDir == "SELL" and not bias1DInvalid and not na(bias1DLow) and low < bias1DLow
+if (rawDir1D == "SELL" or rawDir1D == "BOTH") and not bias1DInvalid and not na(c1Low1D) and low < c1Low1D
     bias1DInvalid := true
 
 // A direction is tradeable if the 1D bias currently supports it and hasn't
 // been invalidated.
-buyBiasAllowed  = bias1DDir == "BUY"  and not bias1DInvalid
-sellBiasAllowed = bias1DDir == "SELL" and not bias1DInvalid
+buyBiasAllowed  = (rawDir1D == "BUY"  or rawDir1D == "BOTH") and not bias1DInvalid
+sellBiasAllowed = (rawDir1D == "SELL" or rawDir1D == "BOTH") and not bias1DInvalid
 
 // -----------------------------------------------------------------------------
 // Final confirmed signal — the unchanged RC signal, gated by Bias. This is
@@ -488,7 +491,7 @@ f_biasCell(_r, _label, _value, _bg) =>
     table.cell(biasTable, 1, _r, _value, bgcolor = _bg, text_color = color.white, text_size = size.small)
 
 if showBiasTable and barstate.islast
-    color bias1DColor = bias1DDir == "BUY" ? color.green : bias1DDir == "SELL" ? color.red : color.new(color.black, 10)
+    color bias1DColor = rawDir1D == "BUY" ? color.green : rawDir1D == "SELL" ? color.red : rawDir1D == "BOTH" ? color.orange : color.new(color.black, 10)
     neutralBg = color.new(color.black, 10)
 
     // Entry Confirmation Time — the actual CC candle time (not the current
@@ -504,12 +507,13 @@ if showBiasTable and barstate.islast
 
     // Rows 0-3 are the self-contained Bias summary: Direction, the exact
     // Timeframe that produced it, the Pattern that timeframe generated, and
-    // whether it is still ACTIVE. Timeframe and Pattern are frozen together at
-    // (re)selection, so the pattern always belongs to the timeframe shown.
-    f_biasCell(0, "Bias Direction", bias1DDir, bias1DColor)
-    f_biasCell(1, "Bias Timeframe", bias1DDir == "NONE" ? "-" : bias1DTF, bias1DColor)
-    f_biasCell(2, "Bias Pattern",   bias1DPattern, bias1DColor)
-    f_biasCell(3, "Bias Status",    bias1DDir == "NONE" ? "-" : bias1DInvalid ? "INVALIDATED" : "ACTIVE", bias1DColor)
+    // whether it is still ACTIVE. Direction and Pattern come from the SAME live
+    // 1D read, so the pattern shown always belongs to the timeframe/direction
+    // above it and matches the reference's Daily output exactly.
+    f_biasCell(0, "Bias Direction", rawDir1D, bias1DColor)
+    f_biasCell(1, "Bias Timeframe", rawDir1D == "NONE" ? "-" : BIAS_TF_LABEL, bias1DColor)
+    f_biasCell(2, "Bias Pattern",   biasPattern1D, bias1DColor)
+    f_biasCell(3, "Bias Status",    rawDir1D == "NONE" ? "-" : bias1DInvalid ? "INVALIDATED" : "ACTIVE", bias1DColor)
     f_biasCell(4, "Sell CC Time",   sellCcTimeStr, not na(ccBarSell) ? color.red : neutralBg)
     f_biasCell(5, "Sell Target",    sellTargetStr, not na(ccBarSell) ? color.red : neutralBg)
     f_biasCell(6, "Buy CC Time",    buyCcTimeStr, not na(ccBarBuy) ? color.green : neutralBg)
