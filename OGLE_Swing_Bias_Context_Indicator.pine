@@ -192,20 +192,28 @@ sellL2Raw = sellL2ARaw != "-" ? sellL2ARaw : sellL2BRaw
 // Previous completed CL1 candle high/low (Candle 1 = last fully closed candle
 // on that timeframe, never Candle 0 / the currently forming one). Used for
 // the initial structural target below.
+//
+// IMPORTANT — exact-candle read: the `[1]` historical offset is paired with
+// `barmerge.lookahead_on`. This specific combination (offset + lookahead_on)
+// is the canonical NON-REPAINTING idiom that returns the value of the last
+// FULLY CLOSED higher-timeframe candle, correctly aligned on both historical
+// and realtime bars. The `[1]` offset removes any future leak, so there is no
+// lookahead bias. Using `lookahead_off` here would misalign the read on
+// historical bars and yield a value that does not match the actual Candle 1.
 [prevCL1AHigh, prevCL1ALow] =
-     request.security(modelSymbol, layer1TFA, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
+     request.security(modelSymbol, layer1TFA, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_on)
 
 [prevCL1BHigh, prevCL1BLow] =
-     request.security(modelSymbol, layer1TFB, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
+     request.security(modelSymbol, layer1TFB, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_on)
 
-// Previous completed CL2 candle high/low (Candle 1, same rule as above).
-// Used both as the promoted target level and as the Layer-2 invalidation
-// trigger level.
+// Previous completed CL2 candle high/low (Candle 1, same rule and same
+// exact-candle read as above). Used both as the promoted target level and as
+// the Layer-2 invalidation trigger level.
 [prevCL2AHigh, prevCL2ALow] =
-     request.security(modelSymbol, layer2TFA, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
+     request.security(modelSymbol, layer2TFA, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_on)
 
 [prevCL2BHigh, prevCL2BLow] =
-     request.security(modelSymbol, layer2TFB, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
+     request.security(modelSymbol, layer2TFB, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_on)
 
 // =====================
 // CONFIRMATION LOGIC
@@ -327,129 +335,151 @@ contextColor =
      neutralColor
 
 // =====================
-// DYNAMIC MULTI-LEVEL TARGET + LAYER-2 INVALIDATION
+// HYBRID MULTI-LEVEL TARGET + LAYER-2 INVALIDATION
 // -----------------------------------------------------------------------
-// Each accepted setup is a persistent state (not just a per-bar recompute):
-//   - Initial target = the CL1 candle-1 high/low (1W or 2W, whichever
-//     generated the setup).
-//   - If price breaks that initial target, the target is PROMOTED ONCE to
-//     the active CL2 candle-1 high/low (1D if the path used CL2-A,
-//     2D if it used CL2-B).
-//   - Independently of promotion, the setup is INVALIDATED the moment price
-//     breaks the active CL2 candle-1 high/low. Once invalidated, no new
-//     setup is allowed until a brand-new confirmation candle forms on that
-//     SAME CL2 leg (the lockout is direction- and timeframe-specific). Only
-//     the active CL2 leg can ever invalidate — the inactive one is ignored.
+// Each accepted setup is a persistent state machine. The target has TWO
+// phases and every level it ever uses is Candle 1 (the last FULLY CLOSED
+// candle) of the relevant timeframe — never Candle 0 (the live candle,
+// reserved for entry), never Candle 2+.
 //
-// PRICE ANCHORING (the important part for the Target VISUAL):
-//   Every target price is captured ONCE, from Candle 1 (the last fully
-//   closed candle on that timeframe), at the exact moment it becomes
-//   relevant — either setup creation (initial CL1 level) or promotion
-//   (frozen CL2 level). It is then held in a fixed `var` and NEVER
-//   re-derived from the live request.security value again. This is what
-//   keeps the drawn line anchored to its true historical price level.
+//   PHASE 1 — CL1 initial target (FROZEN):
+//     Initial target = the CL1 Candle-1 high/low (1W or 2W, whichever
+//     generated the setup), captured ONCE at setup creation and held fixed.
 //
-//   Per confirmed bar we only advance the line's RIGHT edge (x2) and the
-//   label's x — the y (price) coordinate is set at object creation and left
-//   untouched. Because the line is drawn with a real price y-coordinate on
-//   xloc.bar_index, it is inherently immune to zoom, scroll and chart-
-//   timeframe changes; freezing the price here is what additionally stops
-//   it from sliding forward as new HTF candles close.
+//   PHASE 2 — CL2 promoted target (LIVE):
+//     When price breaks the frozen CL1 initial target, the target is PROMOTED
+//     to the active CL2 timeframe (1D if the path used CL2-A, 2D if CL2-B).
+//     From then on the target is the LATEST COMPLETED CL2 Candle-1 high/low,
+//     so it STEPS to the new level each time a new CL2 candle closes.
+//
+//   INVALIDATION (both phases):
+//     The setup expires the moment price breaks the LIVE active CL2 Candle-1
+//     high/low. On expiry the target stops updating and a lockout holds until
+//     a brand-new confirmation candle forms on that SAME CL2 leg (lockout is
+//     direction- and timeframe-specific; only the active CL2 leg invalidates).
+//
+// DRAWING / ANCHORING:
+//   Lines are drawn on real price coordinates (xloc.bar_index + a price y),
+//   so they are inherently immune to zoom, scroll and chart-timeframe change.
+//   A segment's price (y) is NEVER rewritten after creation. When the level
+//   changes (promotion, or a new CL2 candle closing) we close the current
+//   segment and open a NEW one at the new price — producing a clean stepped
+//   history instead of smearing today's level back over old bars. Only the
+//   right edge (x2) grows each bar. A single "Target" label rides the right
+//   end of the active segment (x moves every bar; y only on a level step).
 // =====================
 buyNewSetupEdge = buyModelOK and not buyModelOK[1]
 sellNewSetupEdge = sellModelOK and not sellModelOK[1]
+
+// How many past target segments to retain per side before dropping the
+// oldest (keeps the drawing bounded well under max_lines_count).
+maxTargetSegments = 50
 
 var bool buySetupActive = false
 var bool buyLockedOut = false
 var string buyLockoutCL2 = na
 var string buyActiveCL1 = na
 var string buyActiveCL2 = na
-var float buyActiveTargetLevel = na   // frozen displayed/target price
-var float buyActiveCL2Level = na      // frozen CL2 invalidation / promotion price
+var float buyInitialLevel = na        // FROZEN CL1 initial target (set once at creation)
+var float buyActiveTargetLevel = na   // current target shown in table (frozen CL1, or live CL2 once promoted)
+var float buyDrawnLevel = na          // price the current line segment is drawn at (step detector)
 var bool buyTargetPromoted = false
 var line buyActiveLine = na
 var label buyActiveLabel = na
 var array<line> buyTargetLines = array.new<line>()
-var array<label> buyTargetLabels = array.new<label>()
 
 var bool sellSetupActive = false
 var bool sellLockedOut = false
 var string sellLockoutCL2 = na
 var string sellActiveCL1 = na
 var string sellActiveCL2 = na
-var float sellActiveTargetLevel = na   // frozen displayed/target price
-var float sellActiveCL2Level = na      // frozen CL2 invalidation / promotion price
+var float sellInitialLevel = na       // FROZEN CL1 initial target (set once at creation)
+var float sellActiveTargetLevel = na  // current target shown in table (frozen CL1, or live CL2 once promoted)
+var float sellDrawnLevel = na         // price the current line segment is drawn at (step detector)
 var bool sellTargetPromoted = false
 var line sellActiveLine = na
 var label sellActiveLabel = na
 var array<line> sellTargetLines = array.new<line>()
-var array<label> sellTargetLabels = array.new<label>()
 
-// Create a fresh target line at a FIXED price coordinate (yloc.price). The
-// price passed here is frozen at the call site — this function never reads a
-// live level itself.
-f_pushTarget(_lines, _labels, _price, _col) =>
-    if array.size(_lines) >= 2
+// Open a new horizontal target segment at a FIXED price coordinate. Its price
+// (y) is set here and never rewritten afterwards — stepping is done by opening
+// a fresh segment, so history is never smeared.
+f_newSegment(_lines, _price, _col) =>
+    if array.size(_lines) >= maxTargetSegments
         line.delete(array.shift(_lines))
-        label.delete(array.shift(_labels))
-    newLine = line.new(bar_index, _price, bar_index + 1, _price, xloc=xloc.bar_index, color=_col, width=1, style=line.style_solid, extend=extend.none)
-    newLabel = label.new(bar_index, _price, text="Target", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(_col, 20), textcolor=color.white, size=size.small)
-    array.push(_lines, newLine)
-    array.push(_labels, newLabel)
-    [newLine, newLabel]
+    nl = line.new(bar_index, _price, bar_index + 1, _price, xloc=xloc.bar_index, color=_col, width=1, style=line.style_solid, extend=extend.none)
+    array.push(_lines, nl)
+    nl
+
+// Create the single "Target" label that rides the right end of the active
+// segment.
+f_newTargetLabel(_price, _col) =>
+    label.new(bar_index, _price, text="Target", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(_col, 20), textcolor=color.white, size=size.small)
 
 if barstate.isconfirmed
     // ---------------- BUY SIDE ----------------
+    // Lift a prior Layer-2 lockout only when a brand-new CL2 confirmation
+    // candle forms on the SAME leg that invalidated the previous setup.
     if buyLockedOut and ((buyLockoutCL2 == "1D" and cl2ABuyFoundNew) or (buyLockoutCL2 == "2D" and cl2BBuyFoundNew))
         buyLockedOut := false
         buyLockoutCL2 := na
 
     if buySetupActive
-        // Price is FROZEN (buyActiveTargetLevel / buyActiveCL2Level were set
-        // once at creation / promotion). Per bar we only grow the line's
-        // right edge and slide the label — the y (price) coordinate is never
-        // rewritten, so the line stays anchored to its original level.
-        if not na(buyActiveLine)
-            line.set_x2(buyActiveLine, bar_index)
-        if not na(buyActiveLabel)
-            label.set_x(buyActiveLabel, bar_index)
+        // LIVE active CL2 Candle-1 high = the latest fully closed candle of the
+        // active CL2 timeframe (Daily or 2-Day). Drives invalidation, and once
+        // promoted it IS the target, so the target steps as new CL2 candles close.
+        buyLiveCL2High = buyActiveCL2 == "1D" ? prevCL2AHigh : prevCL2BHigh
 
-        if high > buyActiveCL2Level
+        if high > buyLiveCL2High
+            // Active CL2 level broken -> setup expires; target stops updating.
+            // Drawn segments are left frozen in history; lockout begins.
             buySetupActive := false
             buyLockedOut := true
             buyLockoutCL2 := buyActiveCL2
             buyActiveLine := na
             buyActiveLabel := na
             buyActiveTargetLevel := na
-            buyActiveCL2Level := na
+            buyInitialLevel := na
+            buyDrawnLevel := na
             buyTargetPromoted := false
             buyActiveCL1 := na
             buyActiveCL2 := na
-        else if not buyTargetPromoted and high > buyActiveTargetLevel
-            // Promote ONCE to the frozen CL2 level (a new line drawn at that
-            // fixed price — the old one keeps its own frozen price/level).
+        else
+            // Promote once, when price breaks the FROZEN CL1 initial target.
+            if not buyTargetPromoted and high > buyInitialLevel
+                buyTargetPromoted := true
+            // Frozen CL1 level before promotion; live CL2 Candle-1 high after.
+            buyActiveTargetLevel := buyTargetPromoted ? buyLiveCL2High : buyInitialLevel
             if showTargetLines
-                [nl, nlab] = f_pushTarget(buyTargetLines, buyTargetLabels, buyActiveCL2Level, buyColor)
-                buyActiveLine := nl
-                buyActiveLabel := nlab
-            buyActiveTargetLevel := buyActiveCL2Level
-            buyTargetPromoted := true
+                // Level changed (promotion or a new CL2 candle) -> close the
+                // current segment here and open a fresh one at the new price.
+                if na(buyActiveLine) or buyDrawnLevel != buyActiveTargetLevel
+                    if not na(buyActiveLine)
+                        line.set_x2(buyActiveLine, bar_index)
+                    buyActiveLine := f_newSegment(buyTargetLines, buyActiveTargetLevel, buyColor)
+                    buyDrawnLevel := buyActiveTargetLevel
+                    if na(buyActiveLabel)
+                        buyActiveLabel := f_newTargetLabel(buyActiveTargetLevel, buyColor)
+                    else
+                        label.set_y(buyActiveLabel, buyActiveTargetLevel)
+                // Grow the active segment / label to the current bar.
+                line.set_x2(buyActiveLine, bar_index)
+                if not na(buyActiveLabel)
+                    label.set_x(buyActiveLabel, bar_index)
 
     if not buyLockedOut and not buySetupActive and buyNewSetupEdge
-        buyInitialLevel = generatingCL1Buy == "1W" ? prevCL1AHigh : generatingCL1Buy == "2W" ? prevCL1BHigh : na
-        if not na(buyInitialLevel)
+        buyInitLvl = generatingCL1Buy == "1W" ? prevCL1AHigh : generatingCL1Buy == "2W" ? prevCL1BHigh : na
+        if not na(buyInitLvl)
             buyActiveCL1 := generatingCL1Buy
             buyActiveCL2 := activeCL2Buy
-            // Freeze the CL2 candle-1 level NOW (once) for both invalidation
-            // and future promotion — never re-read from the live security.
-            buyActiveCL2Level := activeCL2Buy == "1D" ? prevCL2AHigh : prevCL2BHigh
-            buyActiveTargetLevel := buyInitialLevel
+            buyInitialLevel := buyInitLvl          // FROZEN CL1 initial target
+            buyActiveTargetLevel := buyInitLvl
             buyTargetPromoted := false
             buySetupActive := true
             if showTargetLines
-                [nl2, nlab2] = f_pushTarget(buyTargetLines, buyTargetLabels, buyInitialLevel, buyColor)
-                buyActiveLine := nl2
-                buyActiveLabel := nlab2
+                buyActiveLine := f_newSegment(buyTargetLines, buyInitLvl, buyColor)
+                buyDrawnLevel := buyInitLvl
+                buyActiveLabel := f_newTargetLabel(buyInitLvl, buyColor)
 
     // ---------------- SELL SIDE (mirror) ----------------
     if sellLockedOut and ((sellLockoutCL2 == "1D" and cl2ASellFoundNew) or (sellLockoutCL2 == "2D" and cl2BSellFoundNew))
@@ -457,43 +487,51 @@ if barstate.isconfirmed
         sellLockoutCL2 := na
 
     if sellSetupActive
-        if not na(sellActiveLine)
-            line.set_x2(sellActiveLine, bar_index)
-        if not na(sellActiveLabel)
-            label.set_x(sellActiveLabel, bar_index)
+        sellLiveCL2Low = sellActiveCL2 == "1D" ? prevCL2ALow : prevCL2BLow
 
-        if low < sellActiveCL2Level
+        if low < sellLiveCL2Low
             sellSetupActive := false
             sellLockedOut := true
             sellLockoutCL2 := sellActiveCL2
             sellActiveLine := na
             sellActiveLabel := na
             sellActiveTargetLevel := na
-            sellActiveCL2Level := na
+            sellInitialLevel := na
+            sellDrawnLevel := na
             sellTargetPromoted := false
             sellActiveCL1 := na
             sellActiveCL2 := na
-        else if not sellTargetPromoted and low < sellActiveTargetLevel
+        else
+            if not sellTargetPromoted and low < sellInitialLevel
+                sellTargetPromoted := true
+            sellActiveTargetLevel := sellTargetPromoted ? sellLiveCL2Low : sellInitialLevel
             if showTargetLines
-                [nl3, nlab3] = f_pushTarget(sellTargetLines, sellTargetLabels, sellActiveCL2Level, sellColor)
-                sellActiveLine := nl3
-                sellActiveLabel := nlab3
-            sellActiveTargetLevel := sellActiveCL2Level
-            sellTargetPromoted := true
+                if na(sellActiveLine) or sellDrawnLevel != sellActiveTargetLevel
+                    if not na(sellActiveLine)
+                        line.set_x2(sellActiveLine, bar_index)
+                    sellActiveLine := f_newSegment(sellTargetLines, sellActiveTargetLevel, sellColor)
+                    sellDrawnLevel := sellActiveTargetLevel
+                    if na(sellActiveLabel)
+                        sellActiveLabel := f_newTargetLabel(sellActiveTargetLevel, sellColor)
+                    else
+                        label.set_y(sellActiveLabel, sellActiveTargetLevel)
+                line.set_x2(sellActiveLine, bar_index)
+                if not na(sellActiveLabel)
+                    label.set_x(sellActiveLabel, bar_index)
 
     if not sellLockedOut and not sellSetupActive and sellNewSetupEdge
-        sellInitialLevel = generatingCL1Sell == "1W" ? prevCL1ALow : generatingCL1Sell == "2W" ? prevCL1BLow : na
-        if not na(sellInitialLevel)
+        sellInitLvl = generatingCL1Sell == "1W" ? prevCL1ALow : generatingCL1Sell == "2W" ? prevCL1BLow : na
+        if not na(sellInitLvl)
             sellActiveCL1 := generatingCL1Sell
             sellActiveCL2 := activeCL2Sell
-            sellActiveCL2Level := activeCL2Sell == "1D" ? prevCL2ALow : prevCL2BLow
-            sellActiveTargetLevel := sellInitialLevel
+            sellInitialLevel := sellInitLvl          // FROZEN CL1 initial target
+            sellActiveTargetLevel := sellInitLvl
             sellTargetPromoted := false
             sellSetupActive := true
             if showTargetLines
-                [nl4, nlab4] = f_pushTarget(sellTargetLines, sellTargetLabels, sellInitialLevel, sellColor)
-                sellActiveLine := nl4
-                sellActiveLabel := nlab4
+                sellActiveLine := f_newSegment(sellTargetLines, sellInitLvl, sellColor)
+                sellDrawnLevel := sellInitLvl
+                sellActiveLabel := f_newTargetLabel(sellInitLvl, sellColor)
 
 // =====================
 // CLEAN INFO TEXT
