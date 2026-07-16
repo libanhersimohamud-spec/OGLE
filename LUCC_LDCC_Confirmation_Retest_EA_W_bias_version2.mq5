@@ -148,6 +148,7 @@ struct SOpenTrade
    string   biasDir; string biasBuyText; string biasSellText; string sideBiasText;
    datetime biasCandleTime;
    double   weekO, weekH, weekL, weekC;
+   double   dayO, dayH, dayL, dayC;
    double   mfePrice; double maePrice;   // in-trade excursion, updated live each tick
 };
 SOpenTrade g_openTrades[];
@@ -249,6 +250,7 @@ struct SPendingLog
    datetime biasCandleTime;
    double   equityBefore;
    double   weekO, weekH, weekL, weekC;
+   double   dayO,  dayH,  dayL,  dayC;
    bool     firstWinOfBias;   // this trade was the FIRST winning trade of its weekly-bias episode
 };
 
@@ -1058,6 +1060,8 @@ bool TryOpen(bool isSell, SSignalState &st)
       ot.sideBiasText    = isSell ? g_bias.sellText : g_bias.buyText;
       ot.biasCandleTime  = g_bias.c1Time;
       ot.weekO = WOpen(1); ot.weekH = WHigh(1); ot.weekL = WLow(1); ot.weekC = WClose(1);
+      ot.dayO  = iOpen(_Symbol, PERIOD_D1, 1); ot.dayH = iHigh(_Symbol, PERIOD_D1, 1);
+      ot.dayL  = iLow(_Symbol, PERIOD_D1, 1);  ot.dayC = iClose(_Symbol, PERIOD_D1, 1);
       ot.mfePrice = ot.entryPrice; ot.maePrice = ot.entryPrice;
 
       int oi = ArraySize(g_openTrades);
@@ -1174,6 +1178,7 @@ void WriteTradeLogHeader()
       "BarsRefToCC", "BarsCCtoRC", "BarsRCtoEntry", "TriggerTiming", "EntryCandleTime",
       "EquityBefore",
       "WeeklyC1_Open", "WeeklyC1_High", "WeeklyC1_Low", "WeeklyC1_Close",
+      "DailyPrev_Open", "DailyPrev_High", "DailyPrev_Low", "DailyPrev_Close",
       "EntryServerTime", "EntryUTCTime",
       "FirstWinOfBias", "StopAfterWinRule"
    };
@@ -1236,6 +1241,8 @@ void QueuePendingLog(const SOpenTrade &t,
    g_pending[n].equityBefore       = t.equityBefore;
    g_pending[n].weekO = t.weekO; g_pending[n].weekH = t.weekH;
    g_pending[n].weekL = t.weekL; g_pending[n].weekC = t.weekC;
+   g_pending[n].dayO  = t.dayO;  g_pending[n].dayH  = t.dayH;
+   g_pending[n].dayL  = t.dayL;  g_pending[n].dayC  = t.dayC;
    g_pending[n].firstWinOfBias = firstWinOfBias;
 
    datetime windowEnd = t.entryTime + InpExcursionTrackingHours * 3600;
@@ -1451,6 +1458,7 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
       (string)barsRefToCC, (string)barsCcToRc, (string)barsRcToEntry, triggerTiming, FmtTime(entryCandle),
       DoubleToString(p.equityBefore, 2),
       DoubleToString(p.weekO, _Digits), DoubleToString(p.weekH, _Digits), DoubleToString(p.weekL, _Digits), DoubleToString(p.weekC, _Digits),
+      DoubleToString(p.dayO, _Digits),  DoubleToString(p.dayH, _Digits),  DoubleToString(p.dayL, _Digits),  DoubleToString(p.dayC, _Digits),
       FmtTime(p.entryTime), FmtTime(utcEntry),
       p.firstWinOfBias ? "true" : "false", InpStopAfterFirstWin ? "ON" : "OFF"
    };
