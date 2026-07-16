@@ -49,7 +49,8 @@ tableTextSize =
 buyColor = input.color(color.green, "Buy Color", group=groupVisuals)
 sellColor = input.color(color.red, "Sell Color", group=groupVisuals)
 neutralColor = input.color(color.new(color.black, 10), "Neutral Color", group=groupVisuals)
-showTargetLines = input.bool(true, "Show Target (TP) Lines", group=groupVisuals)
+showTargetLines = input.bool(true, "Show Target Lines", group=groupVisuals)
+targetLineColor = input.color(color.green, "Target Line Color", group=groupVisuals)
 
 // =====================
 // PATTERNS
@@ -297,12 +298,23 @@ sellL2Raw = sellL2ARaw != "-" ? sellL2ARaw : sellL2BRaw
          barmerge.lookahead_off
      )
 
-// Previous completed CL1 candle high/low (used for the structural targets below)
+// Previous completed CL1 candle high/low (Candle 1 = last fully closed candle
+// on that timeframe, never Candle 0 / the currently forming one). Used for
+// the initial structural target below.
 [prevCL1AHigh, prevCL1ALow] =
      request.security(modelSymbol, layer1TFA, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
 
 [prevCL1BHigh, prevCL1BLow] =
      request.security(modelSymbol, layer1TFB, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
+
+// Previous completed CL2 candle high/low (Candle 1, same rule as above).
+// Used both as the promoted target level and as the Layer-2 invalidation
+// trigger level.
+[prevCL2AHigh, prevCL2ALow] =
+     request.security(modelSymbol, layer2TFA, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
+
+[prevCL2BHigh, prevCL2BLow] =
+     request.security(modelSymbol, layer2TFB, [high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
 
 // =====================
 // CONFIRMATION LOGIC
@@ -469,6 +481,26 @@ generatingCL1Sell =
      sellPath2 ? "2W" :
      "-"
 
+// Which CL2 timeframe is active for a freshly-detected path. Path 1 uses
+// CL2-A (1D); Path 2 and Path 3 both use CL2-B (2D). This is the timeframe
+// that controls target progression and setup invalidation (see below).
+activeCL2Buy =
+     buyPath1 ? "1D" :
+     (buyPath2 or buyPath3) ? "2D" :
+     "-"
+
+activeCL2Sell =
+     sellPath1 ? "1D" :
+     (sellPath2 or sellPath3) ? "2D" :
+     "-"
+
+// Fresh (bar-close) edges on each CL2 leg — used to detect "the next valid
+// Daily / 2-Day confirmation candle" that lifts a Layer-2 invalidation lockout.
+cl2ABuyFoundNew = cl2ABuyFound and not cl2ABuyFound[1]
+cl2ASellFoundNew = cl2ASellFound and not cl2ASellFound[1]
+cl2BBuyFoundNew = cl2BBuyFound and not cl2BBuyFound[1]
+cl2BSellFoundNew = cl2BSellFound and not cl2BSellFound[1]
+
 // =====================
 // FINAL MODEL
 // -----------------------------------------------------------------------
@@ -493,61 +525,150 @@ contextColor =
      neutralColor
 
 // =====================
-// STRUCTURAL TARGET (TP)
+// DYNAMIC MULTI-LEVEL TARGET + LAYER-2 INVALIDATION
 // -----------------------------------------------------------------------
-// The target depends only on which CL1 timeframe generated the accepted
-// setup: 1W -> Previous Week High/Low, 2W -> Previous 2-Week High/Low.
-// It is only recalculated on a brand-new valid setup and stays fixed until
-// the next one replaces it.
+// Each accepted setup is now a persistent state (not just a per-bar
+// recompute):
+//   - Initial target = the CL1 candle-1 high/low (1W or 2W, whichever
+//     generated the setup).
+//   - If price breaks that initial target, the target is PROMOTED ONCE to
+//     the active CL2 candle-1 high/low (1D if the path used CL2-A,
+//     2D if it used CL2-B).
+//   - Independently of promotion, the setup is INVALIDATED the moment price
+//     breaks the active CL2 candle-1 high/low. Once invalidated, no new
+//     setup is allowed until a brand-new confirmation candle forms on that
+//     SAME CL2 leg (the lockout is direction- and timeframe-specific).
+// All target levels reference Candle 1 (the last fully closed candle on
+// that timeframe) — never Candle 0, the currently forming one.
 // =====================
-newBuySetup = buyModelOK and not buyModelOK[1]
-newSellSetup = sellModelOK and not sellModelOK[1]
+buyNewSetupEdge = buyModelOK and not buyModelOK[1]
+sellNewSetupEdge = sellModelOK and not sellModelOK[1]
 
-buyTargetRaw =
-     generatingCL1Buy == "1W" ? prevCL1AHigh :
-     generatingCL1Buy == "2W" ? prevCL1BHigh :
-     na
+var bool buySetupActive = false
+var bool buyLockedOut = false
+var string buyLockoutCL2 = na
+var string buyActiveCL1 = na
+var string buyActiveCL2 = na
+var float buyActiveTargetLevel = na
+var bool buyTargetPromoted = false
+var line buyActiveLine = na
+var label buyActiveLabel = na
+var array<line> buyTargetLines = array.new<line>()
+var array<label> buyTargetLabels = array.new<label>()
 
-sellTargetRaw =
-     generatingCL1Sell == "1W" ? prevCL1ALow :
-     generatingCL1Sell == "2W" ? prevCL1BLow :
-     na
+var bool sellSetupActive = false
+var bool sellLockedOut = false
+var string sellLockoutCL2 = na
+var string sellActiveCL1 = na
+var string sellActiveCL2 = na
+var float sellActiveTargetLevel = na
+var bool sellTargetPromoted = false
+var line sellActiveLine = na
+var label sellActiveLabel = na
+var array<line> sellTargetLines = array.new<line>()
+var array<label> sellTargetLabels = array.new<label>()
 
-var float buyTargetLevel = na
-var string buyTargetSourceTF = na
-var float sellTargetLevel = na
-var string sellTargetSourceTF = na
+f_freezeLine(_ln) =>
+    if not na(_ln)
+        line.set_extend(_ln, extend.none)
+        line.set_x2(_ln, bar_index)
 
-var line buyTPLine = na
-var label buyTPLabel = na
-var line sellTPLine = na
-var label sellTPLabel = na
+f_pushTarget(_lines, _labels, _price) =>
+    if array.size(_lines) >= 2
+        line.delete(array.shift(_lines))
+        label.delete(array.shift(_labels))
+    newLine = line.new(bar_index, _price, bar_index + 1, _price, xloc=xloc.bar_index, color=targetLineColor, width=1, style=line.style_solid, extend=extend.right)
+    newLabel = label.new(bar_index, _price, text="Target", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(targetLineColor, 20), textcolor=color.white, size=size.small)
+    array.push(_lines, newLine)
+    array.push(_labels, newLabel)
+    [newLine, newLabel]
 
-if barstate.isconfirmed and newBuySetup and not na(buyTargetRaw)
-    buyTargetLevel := buyTargetRaw
-    buyTargetSourceTF := generatingCL1Buy
+if barstate.isconfirmed
+    // ---------------- BUY SIDE ----------------
+    if buyLockedOut and ((buyLockoutCL2 == "1D" and cl2ABuyFoundNew) or (buyLockoutCL2 == "2D" and cl2BBuyFoundNew))
+        buyLockedOut := false
+        buyLockoutCL2 := na
 
-    if not na(buyTPLine)
-        line.delete(buyTPLine)
-    if not na(buyTPLabel)
-        label.delete(buyTPLabel)
+    if buySetupActive
+        buyActiveCL2Level = buyActiveCL2 == "1D" ? prevCL2AHigh : prevCL2BHigh
+        if high > buyActiveCL2Level
+            buySetupActive := false
+            buyLockedOut := true
+            buyLockoutCL2 := buyActiveCL2
+            f_freezeLine(buyActiveLine)
+            buyActiveLine := na
+            buyActiveLabel := na
+            buyActiveTargetLevel := na
+            buyTargetPromoted := false
+            buyActiveCL1 := na
+            buyActiveCL2 := na
+        else if not buyTargetPromoted and high > buyActiveTargetLevel
+            f_freezeLine(buyActiveLine)
+            if showTargetLines
+                [nl, nlab] = f_pushTarget(buyTargetLines, buyTargetLabels, buyActiveCL2Level)
+                buyActiveLine := nl
+                buyActiveLabel := nlab
+            buyActiveTargetLevel := buyActiveCL2Level
+            buyTargetPromoted := true
 
-    if showTargetLines
-        buyTPLine := line.new(bar_index, buyTargetLevel, bar_index, buyTargetLevel, xloc=xloc.bar_index, color=buyColor, width=1, extend=extend.right)
-        buyTPLabel := label.new(bar_index, buyTargetLevel, text="TP", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(buyColor, 20), textcolor=color.white, size=size.small)
+    if not buyLockedOut and not buySetupActive and buyNewSetupEdge
+        buyInitialLevel = generatingCL1Buy == "1W" ? prevCL1AHigh : generatingCL1Buy == "2W" ? prevCL1BHigh : na
+        if not na(buyInitialLevel)
+            buyActiveCL1 := generatingCL1Buy
+            buyActiveCL2 := activeCL2Buy
+            buyActiveTargetLevel := buyInitialLevel
+            buyTargetPromoted := false
+            buySetupActive := true
+            if showTargetLines
+                [nl2, nlab2] = f_pushTarget(buyTargetLines, buyTargetLabels, buyInitialLevel)
+                buyActiveLine := nl2
+                buyActiveLabel := nlab2
 
-if barstate.isconfirmed and newSellSetup and not na(sellTargetRaw)
-    sellTargetLevel := sellTargetRaw
-    sellTargetSourceTF := generatingCL1Sell
+    if buySetupActive and not na(buyActiveLabel)
+        label.set_x(buyActiveLabel, bar_index)
 
-    if not na(sellTPLine)
-        line.delete(sellTPLine)
-    if not na(sellTPLabel)
-        label.delete(sellTPLabel)
+    // ---------------- SELL SIDE (mirror) ----------------
+    if sellLockedOut and ((sellLockoutCL2 == "1D" and cl2ASellFoundNew) or (sellLockoutCL2 == "2D" and cl2BSellFoundNew))
+        sellLockedOut := false
+        sellLockoutCL2 := na
 
-    if showTargetLines
-        sellTPLine := line.new(bar_index, sellTargetLevel, bar_index, sellTargetLevel, xloc=xloc.bar_index, color=sellColor, width=1, extend=extend.right)
-        sellTPLabel := label.new(bar_index, sellTargetLevel, text="TP", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(sellColor, 20), textcolor=color.white, size=size.small)
+    if sellSetupActive
+        sellActiveCL2Level = sellActiveCL2 == "1D" ? prevCL2ALow : prevCL2BLow
+        if low < sellActiveCL2Level
+            sellSetupActive := false
+            sellLockedOut := true
+            sellLockoutCL2 := sellActiveCL2
+            f_freezeLine(sellActiveLine)
+            sellActiveLine := na
+            sellActiveLabel := na
+            sellActiveTargetLevel := na
+            sellTargetPromoted := false
+            sellActiveCL1 := na
+            sellActiveCL2 := na
+        else if not sellTargetPromoted and low < sellActiveTargetLevel
+            f_freezeLine(sellActiveLine)
+            if showTargetLines
+                [nl3, nlab3] = f_pushTarget(sellTargetLines, sellTargetLabels, sellActiveCL2Level)
+                sellActiveLine := nl3
+                sellActiveLabel := nlab3
+            sellActiveTargetLevel := sellActiveCL2Level
+            sellTargetPromoted := true
+
+    if not sellLockedOut and not sellSetupActive and sellNewSetupEdge
+        sellInitialLevel = generatingCL1Sell == "1W" ? prevCL1ALow : generatingCL1Sell == "2W" ? prevCL1BLow : na
+        if not na(sellInitialLevel)
+            sellActiveCL1 := generatingCL1Sell
+            sellActiveCL2 := activeCL2Sell
+            sellActiveTargetLevel := sellInitialLevel
+            sellTargetPromoted := false
+            sellSetupActive := true
+            if showTargetLines
+                [nl4, nlab4] = f_pushTarget(sellTargetLines, sellTargetLabels, sellInitialLevel)
+                sellActiveLine := nl4
+                sellActiveLabel := nlab4
+
+    if sellSetupActive and not na(sellActiveLabel)
+        label.set_x(sellActiveLabel, bar_index)
 
 // =====================
 // CLEAN INFO TEXT
@@ -598,8 +719,15 @@ sellCL2Info =
 
 sellCL2Info := sellCL2Info == "" ? "-" : sellCL2Info
 
-buyTargetInfo = na(buyTargetLevel) ? "-" : buyTargetSourceTF + " High: " + str.tostring(buyTargetLevel, format.mintick)
-sellTargetInfo = na(sellTargetLevel) ? "-" : sellTargetSourceTF + " Low: " + str.tostring(sellTargetLevel, format.mintick)
+buyTargetInfo =
+     buyLockedOut ? "LOCKED (" + buyLockoutCL2 + ")" :
+     not buySetupActive ? "-" :
+     (buyTargetPromoted ? buyActiveCL2 : buyActiveCL1) + " High: " + str.tostring(buyActiveTargetLevel, format.mintick)
+
+sellTargetInfo =
+     sellLockedOut ? "LOCKED (" + sellLockoutCL2 + ")" :
+     not sellSetupActive ? "-" :
+     (sellTargetPromoted ? sellActiveCL2 : sellActiveCL1) + " Low: " + str.tostring(sellActiveTargetLevel, format.mintick)
 
 // =====================
 // TABLE
@@ -627,8 +755,8 @@ if showTable and barstate.islast
     f_cell(2, 3, sellCL2Info, sellLayer2OK or dailyCrossWeekSellCRT or (layer1CRTRouteSell and dailyC0TookC1High) ? sellColor : neutralColor, color.white)
 
     f_cell(0, 4, "Target", color.black, color.white)
-    f_cell(1, 4, buyTargetInfo, not na(buyTargetLevel) ? buyColor : neutralColor, color.white)
-    f_cell(2, 4, sellTargetInfo, not na(sellTargetLevel) ? sellColor : neutralColor, color.white)
+    f_cell(1, 4, buyTargetInfo, buyLockedOut ? color.gray : buySetupActive ? targetLineColor : neutralColor, color.white)
+    f_cell(2, 4, sellTargetInfo, sellLockedOut ? color.gray : sellSetupActive ? targetLineColor : neutralColor, color.white)
 
     f_cell(0, 5, "Context", color.black, color.white)
     f_cell(1, 5, finalDirection == "BUY" or finalDirection == "BOTH" ? finalDirection : "-", finalDirection == "BUY" or finalDirection == "BOTH" ? buyColor : neutralColor, color.white)
