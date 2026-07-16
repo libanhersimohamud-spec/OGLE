@@ -66,6 +66,14 @@ input int    InpExcursionTrackingHours  = 120;   // Hours from ENTRY to keep tra
 input group "1W Bias Filter"
 input bool   InpUseBiasFilter        = true;  // Gate entries on the Weekly (1W) directional bias
 
+input group "Filters (isolation / debugging)"
+input bool   InpUseSessionFilter     = true;  // Require setups AND entries inside the Nairobi session
+                                               // (turn OFF to test the raw entry engine with no time gate)
+input bool   InpUseBarCloseRetest    = true;  // Detect the retest on bar close too (range brackets the
+                                               // level), not only tick-by-tick — REQUIRED for entries in
+                                               // the tester's "Open prices"/"1 min OHLC" modes
+input bool   InpDebugLog             = true;  // Print a detailed accept/reject trace to the Experts log
+
 input group "Info Panel"
 input bool   InpShowPanel            = true;         // Show the on-chart info panel
 input int    InpPanelX               = 12;           // Panel left offset (px)
@@ -91,7 +99,9 @@ struct SSignalState
    double   refHigh;
    double   refLow;
    datetime ccTime;     // bar time of the Confirmation Candle (0 = none yet)
-   datetime rcTime;      // bar time of the Retest Candle (0 = none yet)
+   datetime rcTime;      // bar time of the Retest Candle that actually OPENED a trade (0 = none)
+   datetime lastAttemptBar; // H1 bar time of the last entry ATTEMPT — throttles retries to 1/bar so a
+                            // rejected touch neither spams nor permanently kills the setup
    double   slLevel;    // the indicator's "Stop Loss Level" for this cycle
 
    // --- trade-management state ---
@@ -206,6 +216,32 @@ double   g_riskBalance  = 0.0;   // frozen once in OnInit; every trade's risk% i
                                   // the live/current balance, so wins/losses never change position size
 
 //======================================================================
+// Diagnostic counters — a running tally of how far each side gets through
+// the funnel, printed at shutdown so "no trades" always has an explanation
+// (e.g. "500 refs, 60 CCs, 40 retest touches, 40 blocked by bias").
+//======================================================================
+long g_cntRef        = 0;   // reference candles selected (LUCC + LDCC)
+long g_cntCc         = 0;   // confirmation candles formed
+long g_cntTouch      = 0;   // retest touches seen (tick or bar-close)
+long g_cntEntries    = 0;   // orders actually sent OK
+long g_rejPosOpen    = 0;
+long g_rejDoneToday  = 0;
+long g_rejMaxTrades  = 0;
+long g_rejSession    = 0;
+long g_rejBias       = 0;
+long g_rejSlInvalid  = 0;
+long g_rejMinStop    = 0;
+long g_rejLots       = 0;
+long g_rejOrderFail  = 0;
+
+// Detailed accept/reject trace to the Experts log, gated by InpDebugLog.
+void Dbg(const string msg)
+{
+   if(InpDebugLog)
+      Print("[DBG ", TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES | TIME_SECONDS), "] ", msg);
+}
+
+//======================================================================
 // Candle helpers — off is the "just-closed bar" offset described above
 //======================================================================
 double BarOpen(int off)  { return iOpen(_Symbol, PERIOD_H1, off + 1); }
@@ -313,6 +349,14 @@ void UpdateDirection(bool isSell, SSignalState &st)
       st.ccTime  = 0;
       st.rcTime  = 0;
       st.slLevel = 0;
+      st.lastAttemptBar = 0;
+      if(st.refTime != 0)
+      {
+         g_cntRef++;
+         Dbg(StringFormat("%s reference selected @ %s  high=%.5f low=%.5f",
+                          isSell ? "LUCC(SELL)" : "LDCC(BUY)",
+                          TimeToString(st.refTime, TIME_DATE | TIME_MINUTES), st.refHigh, st.refLow));
+      }
    }
 
    // Confirmation Candle
@@ -332,6 +376,33 @@ void UpdateDirection(bool isSell, SSignalState &st)
          for(int j = 0; j <= refOffsetNow; j++)
             extreme = isSell ? MathMax(extreme, BarHigh(j)) : MathMin(extreme, BarLow(j));
          st.slLevel = extreme;
+
+         g_cntCc++;
+         Dbg(StringFormat("%s CC formed @ %s  SL level=%.5f (now awaiting retest of %.5f)",
+                          isSell ? "SELL" : "BUY", TimeToString(st.ccTime, TIME_DATE | TIME_MINUTES),
+                          st.slLevel, isSell ? st.refLow : st.refHigh));
+      }
+   }
+
+   // Closed-bar RETEST fallback (indicator-faithful): the first bar AFTER the
+   // CC whose range brackets the level is a retest. This is what lets entries
+   // fire in the tester's "Open prices"/"1 min OHLC" modes, where the tick
+   // path in MonitorRetest never samples the intrabar touch. The tick path
+   // still runs for live/every-tick precision; whichever sees the touch first
+   // wins, and positionOpen/rcTime keep them from double-firing.
+   if(InpUseBarCloseRetest && st.refTime != 0 && st.ccTime != 0 && st.rcTime == 0
+      && !st.positionOpen && BarTime(0) > st.ccTime && st.lastAttemptBar != BarTime(0))
+   {
+      double level    = isSell ? st.refLow : st.refHigh;
+      bool   brackets = (BarLow(0) <= level && BarHigh(0) >= level);
+      if(brackets)
+      {
+         st.lastAttemptBar = BarTime(0);
+         g_cntTouch++;
+         Dbg(StringFormat("%s RETEST touch (bar close) @ %s level %.5f",
+                          isSell ? "SELL" : "BUY", TimeToString(BarTime(0), TIME_DATE | TIME_MINUTES), level));
+         if(TryOpen(isSell, st))
+            st.rcTime = BarTime(0);
       }
    }
 }
@@ -355,18 +426,30 @@ void UpdateDirection(bool isSell, SSignalState &st)
 //+------------------------------------------------------------------+
 void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double mid)
 {
-   if(st.ccTime == 0 || st.rcTime != 0)
+   // Active only while a CC has closed, no position is open, and no trade has
+   // been taken for this cycle yet (rcTime == 0). rcTime now latches ONLY when
+   // an entry actually opens (see below), so a touch that gets rejected does
+   // NOT permanently kill the setup — a later, valid touch can still fire.
+   if(st.ccTime == 0 || st.rcTime != 0 || st.positionOpen)
       return;
 
    double level    = isSell ? st.refLow : st.refHigh;
    bool   straddle = (bid <= level && ask >= level);
    bool   crossed  = g_havePrevMid && ((g_prevMid - level) * (mid - level) < 0);
+   if(!(straddle || crossed))
+      return;
 
-   if(straddle || crossed)
-   {
-      st.rcTime = iTime(_Symbol, PERIOD_H1, 0); // the currently-forming bar is the RC
-      TryOpen(isSell, st);
-   }
+   // Throttle to one entry attempt per H1 bar per side, so a sustained
+   // straddle doesn't spam TryOpen (and the Experts log) every tick.
+   datetime curBar = iTime(_Symbol, PERIOD_H1, 0);
+   if(st.lastAttemptBar == curBar)
+      return;
+   st.lastAttemptBar = curBar;
+
+   g_cntTouch++;
+   Dbg(StringFormat("%s RETEST touch (tick) @ level %.5f", isSell ? "SELL" : "BUY", level));
+   if(TryOpen(isSell, st))
+      st.rcTime = curBar; // the currently-forming bar is the RC that opened the trade
 }
 
 //+------------------------------------------------------------------+
@@ -493,6 +576,8 @@ bool IsNairobiTimeWithinSession(datetime nairobiTime)
 
 bool IsWithinSession()
 {
+   if(!InpUseSessionFilter)
+      return true;
    return IsNairobiTimeWithinSession(GetNairobiTime(TimeCurrent()));
 }
 
@@ -503,6 +588,8 @@ bool IsWithinSession()
 // entry after a whole cycle has already played out on an off-hours setup.
 bool IsBarWithinSession(datetime barServerTime)
 {
+   if(!InpUseSessionFilter)
+      return true;
    return IsNairobiTimeWithinSession(GetNairobiTime(barServerTime));
 }
 
@@ -767,27 +854,41 @@ double CurrentAtrH1()
 //| all live here — none of it touches the signal-detection state     |
 //| machine above.                                                    |
 //+------------------------------------------------------------------+
-void TryOpen(bool isSell, SSignalState &st)
+bool TryOpen(bool isSell, SSignalState &st)
 {
+   string side = isSell ? "SELL" : "BUY";
+
    // One open position per direction at a time (mirrors "one position
    // per signal" and lets the daily win/loss rules track a single
    // outcome before deciding whether a second same-day trade is allowed).
    if(st.positionOpen)
-      return;
+   { g_rejPosOpen++; Dbg(side + " retest REJECT: a position is already open this side"); return false; }
    if(st.doneToday)
-      return;
+   { g_rejDoneToday++; Dbg(side + " retest REJECT: this side already booked a win today (doneToday)"); return false; }
    if(st.tradesToday >= 2)
-      return;
+   { g_rejMaxTrades++; Dbg(side + " retest REJECT: daily 2-trade limit reached"); return false; }
    if(!IsWithinSession())
-      return;
+   {
+      g_rejSession++;
+      MqlDateTime nd; TimeToStruct(GetNairobiTime(TimeCurrent()), nd);
+      Dbg(StringFormat("%s retest REJECT: out of session (Nairobi %02d:%02d)", side, nd.hour, nd.min));
+      return false;
+   }
 
    // 1W bias gate — a Retest Candle only becomes an actionable entry if the
    // Weekly bias currently supports this direction and hasn't been invalidated.
    // Buy and sell are gated independently, so under a BOTH-bias day each side
    // can still trade on its own. This gates ONLY the entry; the LUCC/LDCC/
    // CC/RC detection above is untouched.
-   if(isSell) { if(!SellBiasAllowed()) return; }
-   else       { if(!BuyBiasAllowed())  return; }
+   bool biasOk = isSell ? SellBiasAllowed() : BuyBiasAllowed();
+   if(!biasOk)
+   {
+      g_rejBias++;
+      Dbg(StringFormat("%s retest REJECT: bias gate (dir=%s buy=[%s]%s sell=[%s]%s)", side, g_bias.dir,
+                       g_bias.buyText,  g_bias.buyInvalid  ? " INVALID" : "",
+                       g_bias.sellText, g_bias.sellInvalid ? " INVALID" : ""));
+      return false;
+   }
 
    double entry = isSell ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                           : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -796,8 +897,12 @@ void TryOpen(bool isSell, SSignalState &st)
    // Sanity guard: the indicator's SL level is a high (sell) / low (buy)
    // spanning the reference-to-CC range, so it must sit on the correct
    // side of the current market price for a valid stop.
-   if(isSell && structuralSl <= entry) return;
-   if(!isSell && structuralSl >= entry) return;
+   if((isSell && structuralSl <= entry) || (!isSell && structuralSl >= entry))
+   {
+      g_rejSlInvalid++;
+      Dbg(StringFormat("%s retest REJECT: structural SL %.5f on wrong side of entry %.5f", side, structuralSl, entry));
+      return false;
+   }
 
    // 5-pip padding — widen the stop beyond the structural level. Risk stays
    // constant (CalcLotSize sizes off this PADDED distance, so lots shrink),
@@ -820,16 +925,21 @@ void TryOpen(bool isSell, SSignalState &st)
    double minDist        = minStopPoints * point;
    if(minDist > 0 && (MathAbs(entry - sl) < minDist || MathAbs(entry - tp) < minDist))
    {
-      PrintFormat("LUCC/LDCC EA: skipped %s entry, SL/TP closer than broker's minimum stop distance.",
-                  isSell ? "sell" : "buy");
-      return;
+      g_rejMinStop++;
+      Dbg(StringFormat("%s retest REJECT: SL/TP inside broker min stop distance (%.0f pts). entry=%.5f sl=%.5f tp=%.5f",
+                       side, minStopPoints, entry, sl, tp));
+      return false;
    }
 
    double balance    = AccountInfoDouble(ACCOUNT_BALANCE);   // for the journal only — not used for sizing
    double riskAmount = g_riskBalance * InpRiskPercent / 100.0; // fixed reference balance — no compounding
    double lots = CalcLotSize(dist, riskAmount);
    if(lots <= 0)
-      return;
+   {
+      g_rejLots++;
+      Dbg(StringFormat("%s retest REJECT: computed lots <= 0 (riskAmount=%.2f slDist=%.5f)", side, riskAmount, dist));
+      return false;
+   }
 
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpSlippagePoints);
@@ -889,12 +999,17 @@ void TryOpen(bool isSell, SSignalState &st)
       st.journalBiasSellText   = g_bias.sellText;
       st.journalSideBiasText   = isSell ? g_bias.sellText : g_bias.buyText;
       st.journalBiasCandleTime = g_bias.c1Time;
+
+      g_cntEntries++;
+      Dbg(StringFormat("%s ENTRY OK: fill=%.5f sl=%.5f tp=%.5f lots=%.2f risk=%.2f  bias[%s]",
+                       side, st.entryPrice, sl, tp, lots, riskAmount, st.journalSideBiasText));
+      return true;
    }
-   else
-   {
-      PrintFormat("LUCC/LDCC EA: %s order failed, retcode=%d",
-                  isSell ? "sell" : "buy", g_trade.ResultRetcode());
-   }
+
+   g_rejOrderFail++;
+   PrintFormat("LUCC/LDCC EA: %s order failed, retcode=%d (%s)",
+               side, g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -1369,11 +1484,32 @@ int OnInit()
       else
          WriteTradeLogHeader();
    }
+
+   // One-shot config snapshot so the current filter setup is always visible at
+   // the top of the Experts log — the first thing to check when diagnosing.
+   MqlDateTime nd; TimeToStruct(GetNairobiTime(TimeCurrent()), nd);
+   Dbg(StringFormat("INIT %s digits=%d point=%.5f pip=%.5f | serverNow=%s NairobiNow=%02d:%02d inSession=%s",
+                    _Symbol, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS),
+                    SymbolInfoDouble(_Symbol, SYMBOL_POINT), PipSize(),
+                    TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES), nd.hour, nd.min,
+                    IsWithinSession() ? "yes" : "no"));
+   Dbg(StringFormat("INIT filters: SessionFilter=%s  BiasFilter=%s  BarCloseRetest=%s  | H1bars=%d W1bars=%d riskBal=%.2f",
+                    InpUseSessionFilter ? "ON" : "OFF", InpUseBiasFilter ? "ON" : "OFF",
+                    InpUseBarCloseRetest ? "ON" : "OFF",
+                    iBars(_Symbol, PERIOD_H1), iBars(_Symbol, PERIOD_W1), g_riskBalance));
    return(INIT_SUCCEEDED);
 }
 
 void OnDeinit(const int reason)
 {
+   // Funnel summary — the definitive "why no trades" readout. If refs>0 but
+   // entries==0, the reject tally below shows exactly which gate stopped them.
+   PrintFormat("LUCC/LDCC EA FUNNEL: refs=%d CCs=%d retestTouches=%d ENTRIES=%d",
+               g_cntRef, g_cntCc, g_cntTouch, g_cntEntries);
+   PrintFormat("LUCC/LDCC EA REJECTS: posOpen=%d doneToday=%d maxTrades=%d session=%d bias=%d slInvalid=%d minStop=%d lots=%d orderFail=%d",
+               g_rejPosOpen, g_rejDoneToday, g_rejMaxTrades, g_rejSession, g_rejBias,
+               g_rejSlInvalid, g_rejMinStop, g_rejLots, g_rejOrderFail);
+
    // Flush whatever excursion data was gathered for trades whose tracking
    // window hadn't finished yet (e.g. the backtest/EA ended first) rather
    // than silently dropping those rows.
