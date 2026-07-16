@@ -35,6 +35,13 @@ input double InpRiskPercent          = 1.0;     // Risk per trade (% of account 
 input long   InpMagicNumber          = 20260716; // Magic number
 input int    InpSlippagePoints       = 20;       // Max slippage (points)
 
+input group "Take Profit"
+input double InpTakeProfitRMultiple  = 1.0;   // TP distance = this many multiples of the SL distance
+                                               // (1.0 = original fixed 1:1 R:R; raise it and run Strategy
+                                               // Tester's Optimizer over this input to find the target
+                                               // that actually maximizes net profit, rather than guessing
+                                               // from MFE_R in the trade log)
+
 input group "Trading Session (Nairobi / EAT, UTC+3, no DST)"
 input double InpBrokerGmtOffsetHours = 2.0;   // Broker's STANDARD (winter) GMT offset, hours
 input bool   InpBrokerUsesDst        = true;  // Broker shifts its clock for EU-style DST
@@ -89,6 +96,21 @@ struct SSignalState
    double   balanceBeforeEntry;
    double   mfePrice;        // best price reached while the position was open
    double   maePrice;        // worst price reached while the position was open
+
+   // Frozen copy of refTime/refHigh/refLow/ccTime/rcTime AT THE MOMENT this
+   // trade was opened. Needed because the live fields above keep changing
+   // after entry — UpdateDirection() carries on searching for the NEXT
+   // LUCC/LDCC cycle every closed bar regardless of whether a position from
+   // the PREVIOUS cycle is still open, and can reset/overwrite them (e.g.
+   // to na if no candidate currently qualifies) long before this trade
+   // closes. QueuePendingLog() must read these frozen copies, not the live
+   // ones, or the journal ends up logging the wrong (or blank) origin for
+   // a trade that's still open.
+   datetime journalRefTime;
+   double   journalRefHigh;
+   double   journalRefLow;
+   datetime journalCcTime;
+   datetime journalRcTime;
 };
 
 SSignalState g_sell;   // SELL side, driven by the Bullish LUCC
@@ -469,8 +491,9 @@ void TryOpen(bool isSell, SSignalState &st)
    if(isSell && sl <= entry) return;
    if(!isSell && sl >= entry) return;
 
-   double dist = MathAbs(entry - sl);
-   double tp   = isSell ? entry - dist : entry + dist; // fixed 1:1 R:R
+   double dist   = MathAbs(entry - sl);
+   double tpDist = dist * InpTakeProfitRMultiple;
+   double tp     = isSell ? entry - tpDist : entry + tpDist;
 
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    entry = NormalizeDouble(entry, digits);
@@ -521,6 +544,15 @@ void TryOpen(bool isSell, SSignalState &st)
       st.balanceBeforeEntry   = balance;
       st.mfePrice             = st.entryPrice;
       st.maePrice             = st.entryPrice;
+
+      // Freeze the origin of this cycle for the journal — see the field
+      // comments on journalRefTime etc. for why this can't just be read
+      // live off st.refTime/ccTime/rcTime at close time.
+      st.journalRefTime = st.refTime;
+      st.journalRefHigh = st.refHigh;
+      st.journalRefLow  = st.refLow;
+      st.journalCcTime  = st.ccTime;
+      st.journalRcTime  = st.rcTime;
    }
    else
    {
@@ -545,16 +577,21 @@ void ProcessNewBar()
 //+------------------------------------------------------------------+
 //| Trade journal — one CSV row per closed trade.                     |
 //|                                                                    |
-//| R_Realized is what the trade actually made under the current      |
-//| fixed 1:1 TP, so by construction it will basically always read    |
-//| ~+1 or ~-1 — it does NOT tell you whether a bigger target would   |
-//| have worked. MFE_R / MAE_R exist for that: they are NOT capped at |
-//| the actual exit. Once a trade closes it moves to a "pending"      |
-//| queue (see SPendingLog) where UpdatePendingExcursions() keeps     |
-//| extending mfePrice/maePrice for InpExcursionTrackingHours from    |
-//| ENTRY, same as if the trade had no stop or target at all, before  |
-//| the row is finally written. That's the number to look at when     |
-//| deciding what R:R target the next version should use.             |
+//| R_Realized is what the trade actually made at whatever TP         |
+//| InpTakeProfitRMultiple currently sets, so by construction it will |
+//| basically always read ~+InpTakeProfitRMultiple or ~-1 — it does   |
+//| NOT tell you whether a DIFFERENT target would have worked better. |
+//| MFE_R / MAE_R exist for that: they are NOT capped at the actual   |
+//| exit. Once a trade closes it moves to a "pending" queue (see      |
+//| SPendingLog) where UpdatePendingExcursions() keeps extending      |
+//| mfePrice/maePrice for InpExcursionTrackingHours from ENTRY, same  |
+//| as if the trade had no stop or target at all, before the row is   |
+//| finally written. Treat MFE_R as directional evidence only — it    |
+//| doesn't know whether the ORIGINAL SL would have been hit before a |
+//| wider target. For a rigorous answer, sweep InpTakeProfitRMultiple |
+//| itself through Strategy Tester's Optimizer and compare net profit |
+//| directly; that replays the real price path against both the real |
+//| SL and each candidate TP, which MFE_R alone cannot do.            |
 //+------------------------------------------------------------------+
 string CsvEscape(string s)
 {
@@ -591,11 +628,11 @@ void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
 
    g_pending[n].isSell             = isSell;
    g_pending[n].posId              = posId;
-   g_pending[n].refTime            = st.refTime;
-   g_pending[n].refHigh            = st.refHigh;
-   g_pending[n].refLow             = st.refLow;
-   g_pending[n].ccTime             = st.ccTime;
-   g_pending[n].rcTime             = st.rcTime;
+   g_pending[n].refTime            = st.journalRefTime;
+   g_pending[n].refHigh            = st.journalRefHigh;
+   g_pending[n].refLow             = st.journalRefLow;
+   g_pending[n].ccTime             = st.journalCcTime;
+   g_pending[n].rcTime             = st.journalRcTime;
    g_pending[n].entryTime          = st.entryTime;
    g_pending[n].entryPrice         = st.entryPrice;
    g_pending[n].slPrice            = st.slPrice;
