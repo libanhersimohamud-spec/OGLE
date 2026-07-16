@@ -1,0 +1,280 @@
+//@version=6
+
+// =============================================================================
+// LUCC / LDCC Confirmation & Retest Indicator
+//
+// SELL side: tracks the most recent Bullish "Last Up Close Candle" (LUCC) —
+//            a bullish breakout candle whose High stays protected — then
+//            waits for a Confirmation Candle (CC) that closes below its Low,
+//            then a Retest Candle (RC) that touches that Low again, and
+//            marks both the CC and the RC (Sell setup).
+//
+// BUY side:  mirror image using a Bearish "Last Down Close Candle" (LDCC),
+//            breakout below the previous Low, protected Low, confirmation
+//            above its High, retest of that High, CC and RC marked (Buy setup).
+//
+// Both sides only ever look at the most recent 24 CLOSED candles, run fully
+// independently of each other, and never repaint (all state is updated only
+// once a bar is confirmed / closed).
+// =============================================================================
+indicator("LUCC / LDCC Confirmation & Retest Indicator", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+// Confirmation Candle (CC) and Retest Candle (RC) marker styles. These are two
+// distinct candles and each gets its own independent marker — both stay visible
+// (and stack) even if the CC and RC land on the same candle. Because
+// plotshape's `style` must be a compile-time constant, each style is a separate
+// gated plot at the bottom of the script; these inputs select which is shown.
+// Sell markers sit ABOVE the candle, Buy markers BELOW it.
+ccMarkerStyle = input.string("Arrow", title = "CC Marker Style", options = ["Arrow", "Flag", "Triangle", "Circle", "Diamond", "Cross"])
+rcMarkerStyle = input.string("Flag",  title = "RC Marker Style", options = ["Arrow", "Flag", "Triangle", "Circle", "Diamond", "Cross"])
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+LOOKBACK = 24   // rolling window: only the latest 24 completed candles are ever searched
+
+// -----------------------------------------------------------------------------
+// Candle helpers (idx = bars back from the current, just-closed candle)
+// -----------------------------------------------------------------------------
+isBullish(idx) => close[idx] > open[idx]
+isBearish(idx) => close[idx] < open[idx]
+bodyHigh(idx)  => math.max(open[idx], close[idx])
+bodyLow(idx)   => math.min(open[idx], close[idx])
+
+// -----------------------------------------------------------------------------
+// Persistent state — SELL side (LUCC)
+// -----------------------------------------------------------------------------
+var int   luccBarIndex = na   // absolute bar_index of the active LUCC
+var float luccHigh      = na
+var float luccLow       = na
+var label luccLabel      = na
+var line  sellLine       = na
+var line  sellSLLine     = na   // "Stop Loss Level" line (highest high LUCC -> CC)
+var label sellSLLabel    = na
+var int   ccBarSell      = na   // absolute bar_index of the Confirmation Candle
+var int   rcBarSell      = na   // absolute bar_index of the Retest Candle
+
+// -----------------------------------------------------------------------------
+// Persistent state — BUY side (LDCC)
+// -----------------------------------------------------------------------------
+var int   ldccBarIndex = na   // absolute bar_index of the active LDCC
+var float ldccHigh      = na
+var float ldccLow       = na
+var label ldccLabel      = na
+var line  buyLine        = na
+var line  buySLLine      = na   // "Stop Loss Level" line (lowest low LDCC -> CC)
+var label buySLLabel     = na
+var int   ccBarBuy       = na
+var int   rcBarBuy       = na
+
+bool ccSellSignal = false   // true on the bar the SELL Confirmation Candle forms
+bool ccBuySignal  = false   // true on the bar the BUY  Confirmation Candle forms
+bool sellSignal   = false   // true on the SELL Retest Candle
+bool buySignal    = false   // true on the BUY  Retest Candle
+
+if barstate.isconfirmed
+    maxBack = math.min(LOOKBACK - 1, bar_index)
+
+    // =========================================================================
+    // SELL SIDE — 1) Search the most recent Bullish LUCC in the last 24 candles
+    // A candidate at offset i qualifies if:
+    //   a) it is bullish (close > open),
+    //   b) BREAKOUT — its body close breaks above the immediately previous
+    //      candle's High (close > high[i + 1]),
+    //   c) PROTECTED — no more-recent candle (offset k < i) has a body close
+    //      above the candidate's High (bodyHigh(k) <= high[i] for all k < i), and
+    //   d) NOT CONTAINED — see the Range Containment Filter below.
+    // Scanning from the newest candle (i = 0) outward automatically yields the
+    // MOST RECENT qualifying candle first, and re-running this scan every bar
+    // naturally re-invalidates a LUCC the moment a later candle closes above it.
+    // =========================================================================
+    int foundLuccOffset = na
+    for i = 0 to maxBack
+        if na(foundLuccOffset) and isBullish(i) and close[i] > high[i + 1]
+            bool valid = true
+            if i > 0
+                for k = 0 to i - 1
+                    if bodyHigh(k) > high[i]
+                        valid := false
+            // d) RANGE CONTAINMENT FILTER — reject the candidate if its full
+            //    High-Low range is completely enclosed by ANY earlier candle
+            //    (larger offset = formed before it) within the 24-candle window.
+            if valid and i < maxBack
+                for m = i + 1 to maxBack
+                    if high[i] <= high[m] and low[i] >= low[m]
+                        valid := false
+                        break
+            if valid
+                foundLuccOffset := i
+
+    int   newLuccBarIndex = na(foundLuccOffset) ? na : bar_index - foundLuccOffset
+    float newLuccHigh      = na(foundLuccOffset) ? na : high[foundLuccOffset]
+    float newLuccLow       = na(foundLuccOffset) ? na : low[foundLuccOffset]
+
+    // 2 & 3) (Re)selection / invalidation — reset confirmation & retest state,
+    // clear old drawings, and draw the new B-LUCC label.
+    // NOTE: compare via nz(..., -1) because a direct `!=` against a na state
+    // variable returns na (falsy) and would freeze the state machine on bar 0.
+    if nz(newLuccBarIndex, -1) != nz(luccBarIndex, -1)
+        if not na(luccLabel)
+            label.delete(luccLabel)
+            luccLabel := na
+        if not na(sellLine)
+            line.delete(sellLine)
+            sellLine := na
+        if not na(sellSLLine)
+            line.delete(sellSLLine)
+            sellSLLine := na
+        if not na(sellSLLabel)
+            label.delete(sellSLLabel)
+            sellSLLabel := na
+        ccBarSell := na
+        rcBarSell := na
+        luccBarIndex := newLuccBarIndex
+        luccHigh := newLuccHigh
+        luccLow := newLuccLow
+        if not na(luccBarIndex)
+            luccLabel := label.new(luccBarIndex, luccHigh, text = "B-LUCC", xloc = xloc.bar_index, yloc = yloc.abovebar, style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+
+    // 4) Confirmation Candle — first candle whose body closes below LUCC Low
+    if not na(luccBarIndex) and na(ccBarSell)
+        if bodyLow(0) < luccLow
+            ccBarSell := bar_index
+            ccSellSignal := true   // mark the CC (see plots at the bottom)
+            // 5) Draw the confirmation line from the LUCC to the Confirmation Candle
+            sellLine := line.new(luccBarIndex, luccLow, ccBarSell, luccLow, xloc = xloc.bar_index, color = color.red, width = 1)
+            // Stop Loss Level — highest HIGH reached from the LUCC through the CC
+            // (inclusive). Draw it from the LUCC to the CC and label it.
+            float slHighest = high
+            for j = 0 to bar_index - luccBarIndex
+                slHighest := math.max(slHighest, high[j])
+            sellSLLine := line.new(luccBarIndex, slHighest, ccBarSell, slHighest, xloc = xloc.bar_index, color = color.orange, width = 1, style = line.style_dashed)
+            sellSLLabel := label.new(ccBarSell, slHighest, text = "Stop Loss Level", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.new(color.orange, 20), textcolor = color.white, size = size.small)
+
+    // 6) Retest Candle — first candle AFTER the CC whose range touches the LUCC
+    // Low. The `bar_index > ccBarSell` guard is essential: without it the retest
+    // would fire on the Confirmation Candle itself, whose range straddles the
+    // level (body below LUCC Low, high still above it).
+    if not na(ccBarSell) and na(rcBarSell) and bar_index > ccBarSell
+        if high >= luccLow and low <= luccLow
+            rcBarSell := bar_index
+            // 7) Sell RC — mark it once (see plots at the bottom)
+            sellSignal := true
+
+    // =========================================================================
+    // BUY SIDE — mirror image of the SELL side using the Bearish LDCC
+    // A candidate at offset i qualifies if:
+    //   a) it is bearish (close < open),
+    //   b) BREAKOUT — its body close breaks below the immediately previous
+    //      candle's Low (close < low[i + 1]),
+    //   c) PROTECTED — no more-recent candle (offset k < i) has a body close
+    //      below the candidate's Low (bodyLow(k) >= low[i] for all k < i), and
+    //   d) NOT CONTAINED — Range Containment Filter (identical to the sell side).
+    // =========================================================================
+    int foundLdccOffset = na
+    for i = 0 to maxBack
+        if na(foundLdccOffset) and isBearish(i) and close[i] < low[i + 1]
+            bool valid = true
+            if i > 0
+                for k = 0 to i - 1
+                    if bodyLow(k) < low[i]
+                        valid := false
+            // d) RANGE CONTAINMENT FILTER — reject the candidate if its full
+            //    High-Low range is completely enclosed by ANY earlier candle
+            //    (larger offset = formed before it) within the 24-candle window.
+            if valid and i < maxBack
+                for m = i + 1 to maxBack
+                    if high[i] <= high[m] and low[i] >= low[m]
+                        valid := false
+                        break
+            if valid
+                foundLdccOffset := i
+
+    int   newLdccBarIndex = na(foundLdccOffset) ? na : bar_index - foundLdccOffset
+    float newLdccHigh      = na(foundLdccOffset) ? na : high[foundLdccOffset]
+    float newLdccLow       = na(foundLdccOffset) ? na : low[foundLdccOffset]
+
+    if nz(newLdccBarIndex, -1) != nz(ldccBarIndex, -1)
+        if not na(ldccLabel)
+            label.delete(ldccLabel)
+            ldccLabel := na
+        if not na(buyLine)
+            line.delete(buyLine)
+            buyLine := na
+        if not na(buySLLine)
+            line.delete(buySLLine)
+            buySLLine := na
+        if not na(buySLLabel)
+            label.delete(buySLLabel)
+            buySLLabel := na
+        ccBarBuy := na
+        rcBarBuy := na
+        ldccBarIndex := newLdccBarIndex
+        ldccHigh := newLdccHigh
+        ldccLow := newLdccLow
+        if not na(ldccBarIndex)
+            ldccLabel := label.new(ldccBarIndex, ldccLow, text = "S-LDCC", xloc = xloc.bar_index, yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+
+    // Confirmation Candle — first candle whose body closes above LDCC High
+    if not na(ldccBarIndex) and na(ccBarBuy)
+        if bodyHigh(0) > ldccHigh
+            ccBarBuy := bar_index
+            ccBuySignal := true   // mark the CC (see plots at the bottom)
+            buyLine := line.new(ldccBarIndex, ldccHigh, ccBarBuy, ldccHigh, xloc = xloc.bar_index, color = color.green, width = 1)
+            // Stop Loss Level — lowest LOW reached from the LDCC through the CC
+            // (inclusive). Draw it from the LDCC to the CC and label it.
+            float slLowest = low
+            for j = 0 to bar_index - ldccBarIndex
+                slLowest := math.min(slLowest, low[j])
+            buySLLine := line.new(ldccBarIndex, slLowest, ccBarBuy, slLowest, xloc = xloc.bar_index, color = color.orange, width = 1, style = line.style_dashed)
+            buySLLabel := label.new(ccBarBuy, slLowest, text = "Stop Loss Level", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.new(color.orange, 20), textcolor = color.white, size = size.small)
+
+    // Retest Candle — first candle AFTER the CC whose range touches the LDCC
+    // High (bar_index > ccBarBuy prevents it from firing on the CC itself).
+    if not na(ccBarBuy) and na(rcBarBuy) and bar_index > ccBarBuy
+        if high >= ldccHigh and low <= ldccHigh
+            rcBarBuy := bar_index
+            buySignal := true
+
+// -----------------------------------------------------------------------------
+// Confirmation Candle (CC) markers (top-level, persistent). Fires once on the
+// CC; the selected ccMarkerStyle chooses which gated plot is drawn. Sell = red
+// above the CC, Buy = green below the CC. Independent of the RC markers below,
+// so both remain visible even if the CC and RC are the same candle.
+// -----------------------------------------------------------------------------
+plotshape(ccSellSignal and ccMarkerStyle == "Arrow",    title = "Sell CC (Arrow)",    style = shape.arrowdown,    location = location.abovebar, color = color.red,   size = size.small)
+plotshape(ccSellSignal and ccMarkerStyle == "Flag",     title = "Sell CC (Flag)",     style = shape.flag,         location = location.abovebar, color = color.red,   size = size.small)
+plotshape(ccSellSignal and ccMarkerStyle == "Triangle", title = "Sell CC (Triangle)", style = shape.triangledown, location = location.abovebar, color = color.red,   size = size.small)
+plotshape(ccSellSignal and ccMarkerStyle == "Circle",   title = "Sell CC (Circle)",   style = shape.circle,       location = location.abovebar, color = color.red,   size = size.small)
+plotshape(ccSellSignal and ccMarkerStyle == "Diamond",  title = "Sell CC (Diamond)",  style = shape.diamond,      location = location.abovebar, color = color.red,   size = size.small)
+plotshape(ccSellSignal and ccMarkerStyle == "Cross",    title = "Sell CC (Cross)",    style = shape.cross,        location = location.abovebar, color = color.red,   size = size.small)
+
+plotshape(ccBuySignal and ccMarkerStyle == "Arrow",    title = "Buy CC (Arrow)",    style = shape.arrowup,     location = location.belowbar, color = color.green, size = size.small)
+plotshape(ccBuySignal and ccMarkerStyle == "Flag",     title = "Buy CC (Flag)",     style = shape.flag,        location = location.belowbar, color = color.green, size = size.small)
+plotshape(ccBuySignal and ccMarkerStyle == "Triangle", title = "Buy CC (Triangle)", style = shape.triangleup,  location = location.belowbar, color = color.green, size = size.small)
+plotshape(ccBuySignal and ccMarkerStyle == "Circle",   title = "Buy CC (Circle)",   style = shape.circle,      location = location.belowbar, color = color.green, size = size.small)
+plotshape(ccBuySignal and ccMarkerStyle == "Diamond",  title = "Buy CC (Diamond)",  style = shape.diamond,     location = location.belowbar, color = color.green, size = size.small)
+plotshape(ccBuySignal and ccMarkerStyle == "Cross",    title = "Buy CC (Cross)",    style = shape.cross,       location = location.belowbar, color = color.green, size = size.small)
+
+// -----------------------------------------------------------------------------
+// Retest Candle (RC) markers (top-level so they land on exactly the RC bar and
+// persist on the chart). The marker fires once on the RC; the selected
+// rcMarkerStyle chooses which gated plot is drawn. Sell = red above the RC,
+// Buy = green below the RC.
+// -----------------------------------------------------------------------------
+plotshape(sellSignal and rcMarkerStyle == "Arrow",    title = "Sell RC (Arrow)",    style = shape.arrowdown,    location = location.abovebar, color = color.red,   size = size.small)
+plotshape(sellSignal and rcMarkerStyle == "Flag",     title = "Sell RC (Flag)",     style = shape.flag,         location = location.abovebar, color = color.red,   size = size.small)
+plotshape(sellSignal and rcMarkerStyle == "Triangle", title = "Sell RC (Triangle)", style = shape.triangledown, location = location.abovebar, color = color.red,   size = size.small)
+plotshape(sellSignal and rcMarkerStyle == "Circle",   title = "Sell RC (Circle)",   style = shape.circle,       location = location.abovebar, color = color.red,   size = size.small)
+plotshape(sellSignal and rcMarkerStyle == "Diamond",  title = "Sell RC (Diamond)",  style = shape.diamond,      location = location.abovebar, color = color.red,   size = size.small)
+plotshape(sellSignal and rcMarkerStyle == "Cross",    title = "Sell RC (Cross)",    style = shape.cross,        location = location.abovebar, color = color.red,   size = size.small)
+
+plotshape(buySignal and rcMarkerStyle == "Arrow",    title = "Buy RC (Arrow)",    style = shape.arrowup,     location = location.belowbar, color = color.green, size = size.small)
+plotshape(buySignal and rcMarkerStyle == "Flag",     title = "Buy RC (Flag)",     style = shape.flag,        location = location.belowbar, color = color.green, size = size.small)
+plotshape(buySignal and rcMarkerStyle == "Triangle", title = "Buy RC (Triangle)", style = shape.triangleup,  location = location.belowbar, color = color.green, size = size.small)
+plotshape(buySignal and rcMarkerStyle == "Circle",   title = "Buy RC (Circle)",   style = shape.circle,      location = location.belowbar, color = color.green, size = size.small)
+plotshape(buySignal and rcMarkerStyle == "Diamond",  title = "Buy RC (Diamond)",  style = shape.diamond,     location = location.belowbar, color = color.green, size = size.small)
+plotshape(buySignal and rcMarkerStyle == "Cross",    title = "Buy RC (Cross)",    style = shape.cross,       location = location.belowbar, color = color.green, size = size.small)
