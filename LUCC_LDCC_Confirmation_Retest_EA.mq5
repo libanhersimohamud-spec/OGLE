@@ -79,6 +79,13 @@ input bool   InpStopAfterFirstWin    = true;  // ON  = after a WIN in the curren
                                                // Flip this to produce the two datasets to compare.
                                                // (Losses never stop the direction; only a win does.)
 
+input group "Pending Retest Expiration"
+input bool   InpExpirePendingDaily   = true;  // At the start of each new (Nairobi) day, discard any armed
+                                               // but UN-triggered retest setup (CC formed, retest not yet
+                                               // hit). The old setup is NOT reused — the EA waits for a
+                                               // completely new valid setup. Open trades are unaffected.
+                                               // (The 120-candle lookback & setup detection are unchanged.)
+
 input group "Filters (isolation / debugging)"
 // NOTE: the trading-session gate has been REMOVED in this version — every valid
 // setup is taken regardless of session (data-collection mode). Session/UTC are
@@ -118,6 +125,8 @@ struct SSignalState
    datetime lastAttemptBar; // H1 bar time of the last entry ATTEMPT — throttles retries to 1/bar so a
                             // rejected touch neither spams nor permanently kills the setup
    double   slLevel;    // the indicator's "Stop Loss Level" for this cycle
+   datetime expiredRefTime; // a reference whose armed retest was EXPIRED at a day boundary: it stays
+                            // dormant (no CC/entry) until a genuinely NEW reference appears. 0 = none.
    int      tradesToday;
    bool     doneToday;   // true once a trade in this direction has won today
 };
@@ -285,6 +294,7 @@ long g_rejMinStop    = 0;
 long g_rejLots       = 0;
 long g_rejOrderFail  = 0;
 long g_skippedAfterWin = 0;   // setups skipped by the stop-after-first-win-per-weekly-bias rule
+long g_expiredPending  = 0;   // armed retest setups discarded at a day boundary (pending-expiration rule)
 
 bool g_lastSessionOpen  = false;  // for logging session OPEN/closed transitions
 bool g_haveSessionState = false;
@@ -420,6 +430,11 @@ void UpdateDirection(bool isSell, SSignalState &st)
       st.rcTime  = 0;
       st.slLevel = 0;
       st.lastAttemptBar = 0;
+      // A genuinely NEW (non-zero) reference clears any pending-expiration lock,
+      // so the fresh setup can arm normally. A reference that becomes na (0) or
+      // that returns to the previously expired one keeps the lock in place.
+      if(st.refTime != 0 && st.refTime != st.expiredRefTime)
+         st.expiredRefTime = 0;
       if(st.refTime != 0)
       {
          g_cntRef++;
@@ -429,8 +444,9 @@ void UpdateDirection(bool isSell, SSignalState &st)
       }
    }
 
-   // Confirmation Candle
-   if(st.refTime != 0 && st.ccTime == 0)
+   // Confirmation Candle — never re-arms a reference whose pending retest was
+   // expired at a day boundary (it stays dormant until a new reference forms).
+   if(st.refTime != 0 && st.ccTime == 0 && st.refTime != st.expiredRefTime)
    {
       bool ccTriggered = isSell ? (BodyLow(0) < st.refLow) : (BodyHigh(0) > st.refHigh);
       if(ccTriggered)
@@ -651,6 +667,27 @@ bool IsWithinSession()
    return IsNairobiTimeWithinSession(GetNairobiTime(TimeCurrent()));
 }
 
+// Pending-retest expiration: if a side has an ARMED but UN-triggered setup
+// (CC formed, retest not yet hit, so no trade was taken), discard it at the
+// day boundary. expiredRefTime is stamped so the SAME reference can't re-arm
+// — the EA must wait for a genuinely new reference. Open trades and the
+// 120-candle setup search are untouched.
+void ExpirePendingIfArmed(bool isSell, SSignalState &st)
+{
+   if(!InpExpirePendingDaily)
+      return;
+   bool armedUntriggered = (st.refTime != 0 && st.ccTime != 0 && st.rcTime == 0);
+   if(!armedUntriggered)
+      return;
+   st.expiredRefTime = st.refTime;
+   st.ccTime         = 0;
+   st.slLevel        = 0;
+   st.lastAttemptBar = 0;
+   g_expiredPending++;
+   Dbg(StringFormat("%s PENDING EXPIRED at new day: untriggered retest on ref @ %s discarded; awaiting a new setup",
+                    isSell ? "SELL" : "BUY", TimeToString(st.expiredRefTime, TIME_DATE | TIME_MINUTES)));
+}
+
 // Resets both directions' daily trade counters at the start of each new
 // Nairobi calendar day (the whole session model is Nairobi-based, so the
 // "trading day" boundary follows the same clock).
@@ -672,6 +709,10 @@ void CheckDailyReset()
                           dt.year, dt.mon, dt.day, g_cntRef, g_cntCc, g_cntTouch, g_cntEntries, g_bias.dir,
                           g_bias.buyText,  g_bias.buyInvalid  ? " INVALID" : "",
                           g_bias.sellText, g_bias.sellInvalid ? " INVALID" : ""));
+
+      // Expire any armed-but-untriggered pending retest — a clean slate each day.
+      ExpirePendingIfArmed(true,  g_sell);
+      ExpirePendingIfArmed(false, g_buy);
 
       g_lastResetDay = today;
       g_sell.tradesToday = 0; g_sell.doneToday = false;
@@ -1602,6 +1643,7 @@ string SideStateText(bool isSell, const SSignalState &st)
    int openN = OpenTradeCount(isSell);
    string openTag = (openN > 0) ? StringFormat(" [%d open]", openN) : "";
    if(st.refTime == 0) return "scanning - no " + tag + openTag;
+   if(st.refTime == st.expiredRefTime) return "pending EXPIRED - awaiting a new " + tag + openTag;
    if(st.ccTime  == 0) return tag + " @ " + TimeToString(st.refTime, TIME_DATE|TIME_MINUTES) + " (awaiting CC)" + openTag;
    double lvl = isSell ? st.refLow : st.refHigh;
    return "CC set - awaiting retest @ " + DoubleToString(lvl, _Digits) + openTag;
@@ -1734,9 +1776,9 @@ void OnDeinit(const int reason)
 {
    // Funnel summary — the definitive "why no trades" readout. If refs>0 but
    // entries==0, the reject tally below shows exactly which gate stopped them.
-   PrintFormat("LUCC/LDCC EA FUNNEL: refs=%d CCs=%d retestTouches=%d ENTRIES=%d skippedAfterWin=%d (StopAfterWinRule=%s)",
-               g_cntRef, g_cntCc, g_cntTouch, g_cntEntries, g_skippedAfterWin,
-               InpStopAfterFirstWin ? "ON" : "OFF");
+   PrintFormat("LUCC/LDCC EA FUNNEL: refs=%d CCs=%d retestTouches=%d ENTRIES=%d skippedAfterWin=%d pendingExpired=%d (StopAfterWinRule=%s, ExpirePendingDaily=%s)",
+               g_cntRef, g_cntCc, g_cntTouch, g_cntEntries, g_skippedAfterWin, g_expiredPending,
+               InpStopAfterFirstWin ? "ON" : "OFF", InpExpirePendingDaily ? "ON" : "OFF");
    PrintFormat("LUCC/LDCC EA REJECTS: posOpen=%d doneToday=%d maxTrades=%d bias=%d slInvalid=%d minStop=%d lots=%d orderFail=%d",
                g_rejPosOpen, g_rejDoneToday, g_rejMaxTrades, g_rejBias,
                g_rejSlInvalid, g_rejMinStop, g_rejLots, g_rejOrderFail);
