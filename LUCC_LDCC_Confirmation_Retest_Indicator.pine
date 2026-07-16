@@ -53,6 +53,13 @@ showBiasTable = input.bool(true, "Show Bias Table", group = "Bias Engine (1D)")
 // -----------------------------------------------------------------------------
 LOOKBACK = 24   // rolling window: only the latest 24 completed candles are ever searched
 
+// A Confirmation Candle can form arbitrarily long after its LUCC/LDCC (there's
+// no time limit on that wait), so the Bias table's variable-offset lookup of
+// the CC's own timestamp (time[bar_index - ccBarSell], added below) needs a
+// lookback allowance well beyond Pine's default auto-detected depth, or it
+// can silently fail to resolve for older setups.
+max_bars_back(time, 5000)
+
 // -----------------------------------------------------------------------------
 // Candle helpers (idx = bars back from the current, just-closed candle)
 // -----------------------------------------------------------------------------
@@ -410,6 +417,7 @@ rawDir1D = f_resolveDir(buyTxt1D, sellTxt1D)
 // Persistent Bias state (1D only).
 // -----------------------------------------------------------------------------
 var string bias1DDir     = "NONE"
+var string bias1DPattern = "-"   // which pattern(s) produced the active Bias, e.g. "BC ", "DC BSB "
 var float  bias1DHigh    = na
 var float  bias1DLow     = na
 var bool   bias1DInvalid = false
@@ -425,9 +433,10 @@ if barstate.isconfirmed
     if nz(c1Time1D, -1) != nz(lastC1Time1D, -1)
         lastC1Time1D := c1Time1D
         bias1DInvalid := false
-        bias1DDir  := rawDir1D
-        bias1DHigh := rawDir1D != "NONE" ? c1High1D : na
-        bias1DLow  := rawDir1D != "NONE" ? c1Low1D  : na
+        bias1DDir     := rawDir1D
+        bias1DPattern := rawDir1D == "BUY" ? buyTxt1D : rawDir1D == "SELL" ? sellTxt1D : "-"
+        bias1DHigh    := rawDir1D != "NONE" ? c1High1D : na
+        bias1DLow     := rawDir1D != "NONE" ? c1Low1D  : na
 
 // Invalidation — checked on EVERY tick (not just confirmed bars), since the
 // rule is "if price breaks above/below ... IMMEDIATELY invalidate".
@@ -453,19 +462,39 @@ plotshape(sellTradeConfirmed, title = "Sell CONFIRMED (Bias-aligned)", style = s
 plotshape(buyTradeConfirmed,  title = "Buy CONFIRMED (Bias-aligned)",  style = shape.labelup,   location = location.belowbar, color = color.new(color.green, 0), textcolor = color.white, text = "BUY",  size = size.normal)
 
 // -----------------------------------------------------------------------------
-// Bias table — quick visual read of the 1D state.
+// Bias / setup table — Field/Value layout so it can carry the Bias state
+// (direction, which pattern produced it, invalidation status) alongside
+// each side's confirmation path (whether a CC is currently pending an RC,
+// when that CC formed, and the price it's waiting for RC to retest) without
+// forcing everything into a rigid per-timeframe grid. Sell (LUCC) and Buy
+// (LDCC) are shown as separate rows since both run independently and can
+// be active — or not — at the same time.
 // -----------------------------------------------------------------------------
-var table biasTable = table.new(position.top_right, 3, 2, border_width = 1)
+var table biasTable = table.new(position.top_right, 2, 7, border_width = 1)
 
-f_biasCell(_c, _r, _txt, _bg) =>
-    table.cell(biasTable, _c, _r, _txt, bgcolor = _bg, text_color = color.white, text_size = size.small)
+f_biasCell(_r, _label, _value, _bg) =>
+    table.cell(biasTable, 0, _r, _label, bgcolor = color.black, text_color = color.white, text_size = size.small)
+    table.cell(biasTable, 1, _r, _value, bgcolor = _bg, text_color = color.white, text_size = size.small)
 
 if showBiasTable and barstate.islast
-    f_biasCell(0, 0, "TF", color.black)
-    f_biasCell(1, 0, "Dir", color.black)
-    f_biasCell(2, 0, "Status", color.black)
-
     color bias1DColor = bias1DDir == "BUY" ? color.green : bias1DDir == "SELL" ? color.red : color.new(color.black, 10)
-    f_biasCell(0, 1, "1D", color.black)
-    f_biasCell(1, 1, bias1DDir, bias1DColor)
-    f_biasCell(2, 1, bias1DDir == "NONE" ? "-" : bias1DInvalid ? "INVALIDATED" : "ACTIVE", bias1DColor)
+    neutralBg = color.new(color.black, 10)
+
+    // Entry Confirmation Time — the actual CC candle time (not the current
+    // bar time), read via a variable history offset off the existing
+    // ccBarSell/ccBarBuy bar_index (same offset technique the untouched
+    // LUCC/LDCC block already uses for its Stop-Loss-Level loops), so
+    // nothing in that block needs to change to expose this.
+    sellCcTimeStr = not na(ccBarSell) ? str.format_time(time[bar_index - ccBarSell], "yyyy-MM-dd HH:mm", syminfo.timezone) : "-"
+    buyCcTimeStr  = not na(ccBarBuy)  ? str.format_time(time[bar_index - ccBarBuy],  "yyyy-MM-dd HH:mm", syminfo.timezone) : "-"
+
+    sellTargetStr = not na(luccLow)  ? str.tostring(luccLow, format.mintick)  : "-"
+    buyTargetStr  = not na(ldccHigh) ? str.tostring(ldccHigh, format.mintick) : "-"
+
+    f_biasCell(0, "Bias Direction", bias1DDir, bias1DColor)
+    f_biasCell(1, "Bias Pattern",   bias1DPattern, bias1DColor)
+    f_biasCell(2, "Bias Status",    bias1DDir == "NONE" ? "-" : bias1DInvalid ? "INVALIDATED" : "ACTIVE", bias1DColor)
+    f_biasCell(3, "Sell CC Time",   sellCcTimeStr, not na(ccBarSell) ? color.red : neutralBg)
+    f_biasCell(4, "Sell Target",    sellTargetStr, not na(ccBarSell) ? color.red : neutralBg)
+    f_biasCell(5, "Buy CC Time",    buyCcTimeStr, not na(ccBarBuy) ? color.green : neutralBg)
+    f_biasCell(6, "Buy Target",     buyTargetStr, not na(ccBarBuy) ? color.green : neutralBg)
