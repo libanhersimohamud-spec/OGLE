@@ -1,0 +1,530 @@
+//@version=6
+indicator("OGLE Swing Bias Context - HTF Direction", overlay=true, max_labels_count=500)
+
+// =====================
+// INPUTS
+// =====================
+groupSymbol = "1. Symbol"
+groupTF = "2. Timeframes"
+groupTable = "3. Table"
+groupVisuals = "4. Visuals"
+
+useChartSymbol = input.bool(true, "Use Chart Symbol", group=groupSymbol)
+selectedSymbol = input.symbol("FX:EURUSD", "Selected Pair", group=groupSymbol)
+modelSymbol = useChartSymbol ? syminfo.tickerid : selectedSymbol
+
+biasTF1 = input.timeframe("12M", "Bias TF 1", group=groupTF)
+biasTF2 = input.timeframe("6M", "Bias TF 2", group=groupTF)
+biasTF3 = input.timeframe("4M", "Bias TF 3", group=groupTF)
+biasTF4 = input.timeframe("3M", "Bias TF 4", group=groupTF)
+biasTF5 = input.timeframe("2M", "Bias TF 5", group=groupTF)
+biasTF6 = input.timeframe("M", "Bias TF 6", group=groupTF)
+
+layer1TF1 = input.timeframe("2W", "Confirmation L1 TF 1", group=groupTF)
+layer1TF2 = input.timeframe("W", "Confirmation L1 TF 2", group=groupTF)
+layer1TF3 = input.timeframe("10D", "Confirmation L1 TF 3", group=groupTF)
+layer1TF4 = input.timeframe("5D", "Confirmation L1 TF 4", group=groupTF)
+
+layer2TF1 = input.timeframe("2D", "Confirmation L2 TF 1", group=groupTF)
+layer2TF2 = input.timeframe("D", "Confirmation L2 TF 2", group=groupTF)
+
+// Primary structural references (used by candle sweep / cross-week CRT logic)
+layer1TF = layer1TF2
+layer2TF = layer2TF2
+
+showTable = input.bool(true, "Show Context Table", group=groupTable)
+
+tableTextSizeInput = input.string(
+     "Tiny",
+     "Table Text Size",
+     options=["Tiny", "Small", "Normal"],
+     group=groupTable
+)
+
+tableTextSize =
+     tableTextSizeInput == "Tiny" ? size.tiny :
+     tableTextSizeInput == "Small" ? size.small :
+     size.normal
+
+buyColor = input.color(color.green, "Buy Color", group=groupVisuals)
+sellColor = input.color(color.red, "Sell Color", group=groupVisuals)
+neutralColor = input.color(color.new(color.black, 10), "Neutral Color", group=groupVisuals)
+
+// =====================
+// PATTERNS
+// =====================
+f_bodyCloseBuy() =>
+    close[1] > high[2]
+
+f_bodyCloseSell() =>
+    close[1] < low[2]
+
+f_decisiveBuy() =>
+    low[1] < low[2] and high[1] > high[2] and close[1] > open[1]
+
+f_decisiveSell() =>
+    high[1] > high[2] and low[1] < low[2] and close[1] < open[1]
+
+f_bsbBuy() =>
+    close[2] > open[2] and high[1] <= high[2] and low[1] >= low[2]
+
+f_sbsSell() =>
+    close[2] < open[2] and high[1] <= high[2] and low[1] >= low[2]
+
+f_crtBuyBase() =>
+    c1Mid = low[1] + ((high[1] - low[1]) / 2)
+    c1Sweep = low[1] < low[2]
+    c1CloseMid = close[1] > c1Mid
+    c1Decisive = low[1] < low[2] and high[1] > high[2]
+    c1CloseNotBelowC2Low = close[1] >= low[2]
+
+    c1Buy = close[1] > open[1]
+    c1Sell = close[1] < open[1]
+    c1Body = math.abs(close[1] - open[1])
+
+    c1UpperWick =
+         c1Buy ? high[1] - close[1] :
+         c1Sell ? high[1] - open[1] :
+         high[1] - close[1]
+
+    c1LowerWick =
+         c1Buy ? open[1] - low[1] :
+         c1Sell ? close[1] - low[1] :
+         open[1] - low[1]
+
+    c1OpenCloseAboveMid = open[1] > c1Mid and close[1] > c1Mid
+    c1BodyBiggerOneWick = c1Body > c1UpperWick or c1Body > c1LowerWick
+    c1BodyQuality = c1OpenCloseAboveMid or c1BodyBiggerOneWick
+
+    c1Sweep and c1CloseMid and not c1Decisive and c1CloseNotBelowC2Low and c1BodyQuality
+
+f_crtSellBase() =>
+    c1Mid = low[1] + ((high[1] - low[1]) / 2)
+    c1Sweep = high[1] > high[2]
+    c1CloseMid = close[1] < c1Mid
+    c1Decisive = high[1] > high[2] and low[1] < low[2]
+    c1CloseNotAboveC2High = close[1] <= high[2]
+
+    c1Buy = close[1] > open[1]
+    c1Sell = close[1] < open[1]
+    c1Body = math.abs(close[1] - open[1])
+
+    c1UpperWick =
+         c1Buy ? high[1] - close[1] :
+         c1Sell ? high[1] - open[1] :
+         high[1] - close[1]
+
+    c1LowerWick =
+         c1Buy ? open[1] - low[1] :
+         c1Sell ? close[1] - low[1] :
+         open[1] - low[1]
+
+    c1OpenCloseBelowMid = open[1] < c1Mid and close[1] < c1Mid
+    c1BodyBiggerOneWick = c1Body > c1UpperWick or c1Body > c1LowerWick
+    c1BodyQuality = c1OpenCloseBelowMid or c1BodyBiggerOneWick
+
+    c1Sweep and c1CloseMid and not c1Decisive and c1CloseNotAboveC2High and c1BodyQuality
+
+f_crtBuy() =>
+    f_crtBuyBase() and high < high[2]
+
+f_crtSell() =>
+    f_crtSellBase() and low > low[2]
+
+f_threeDPBuy() =>
+    close[1] >= low[2] and close[1] <= high[2] and low < low[1] and low < low[2]
+
+f_threeDPSell() =>
+    close[1] >= low[2] and close[1] <= high[2] and high > high[1] and high > high[2]
+
+f_dsBuy() =>
+    close[1] < low[2] and close[1] < low[3] and
+     close[2] >= low[1] and close[2] >= low[2] and close[2] >= low[3] and
+     low < low[1]
+
+f_dsSell() =>
+    close[1] > high[2] and close[1] > high[3] and
+     close[2] <= high[1] and close[2] <= high[2] and close[2] <= high[3] and
+     high > high[1]
+
+f_near3DPBuy() =>
+    high[1] <= high[2] and low[1] >= low[2] and low < low[1] and low < low[2]
+
+f_near3DPSell() =>
+    high[1] <= high[2] and low[1] >= low[2] and high > high[1] and high > high[2]
+
+f_nearDSBuy() =>
+    high[2] <= high[3] and low[2] >= low[3] and
+     close[1] < low[2] and close[1] < low[3] and
+     low < low[1] and low < low[2] and low < low[3] and
+     high[2] <= high[3] and high[1] <= high[3] and high <= high[3]
+
+f_nearDSSell() =>
+    high[2] <= high[3] and low[2] >= low[3] and
+     close[1] > high[2] and close[1] > high[3] and
+     high > high[1] and high > high[2] and high > high[3] and
+     low[2] >= low[3] and low[1] >= low[3] and low >= low[3]
+
+f_buyPatternText() =>
+    string txt = ""
+    txt := f_bodyCloseBuy() ? txt + "BC " : txt
+    txt := f_decisiveBuy() ? txt + "DC " : txt
+    txt := f_bsbBuy() ? txt + "BSB " : txt
+    txt := f_crtBuy() ? txt + "CRT " : txt
+    txt := f_threeDPBuy() ? txt + "3DP " : txt
+    txt := f_dsBuy() ? txt + "3DP-DS " : txt
+    txt := f_near3DPBuy() ? txt + "N-3DP " : txt
+    txt := f_nearDSBuy() ? txt + "N-DS " : txt
+    txt == "" ? "-" : txt
+
+f_sellPatternText() =>
+    string txt = ""
+    txt := f_bodyCloseSell() ? txt + "BC " : txt
+    txt := f_decisiveSell() ? txt + "DC " : txt
+    txt := f_sbsSell() ? txt + "SBS " : txt
+    txt := f_crtSell() ? txt + "CRT " : txt
+    txt := f_threeDPSell() ? txt + "3DP " : txt
+    txt := f_dsSell() ? txt + "3DP-DS " : txt
+    txt := f_near3DPSell() ? txt + "N-3DP " : txt
+    txt := f_nearDSSell() ? txt + "N-DS " : txt
+    txt == "" ? "-" : txt
+
+f_c2Mid() =>
+    low[2] + ((high[2] - low[2]) / 2)
+
+f_currentCRT() =>
+    buyEvent = f_crtBuy()
+    sellEvent = f_crtSell()
+    mid = buyEvent ? f_c2Mid() : sellEvent ? f_c2Mid() : na
+
+    dir =
+         not na(mid) ?
+         close > mid ? "SELL" :
+         close < mid ? "BUY" :
+         "MID" :
+         "-"
+
+    typ = buyEvent ? "CRT BUY" : sellEvent ? "CRT SELL" : "-"
+
+    [dir, mid, typ]
+
+f_patternPack() =>
+    [crtDir, crtMid, crtType] = f_currentCRT()
+    [f_buyPatternText(), f_sellPatternText(), crtDir, crtMid, crtType]
+
+// =====================
+// HTF SCANS
+// =====================
+[buyB1, sellB1, bias1Dir, bias1Mid, bias1Type] =
+     request.security(modelSymbol, biasTF1, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyB2, sellB2, bias2Dir, bias2Mid, bias2Type] =
+     request.security(modelSymbol, biasTF2, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyB3, sellB3, bias3Dir, bias3Mid, bias3Type] =
+     request.security(modelSymbol, biasTF3, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyB4, sellB4, bias4Dir, bias4Mid, bias4Type] =
+     request.security(modelSymbol, biasTF4, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyB5, sellB5, bias5Dir, bias5Mid, bias5Type] =
+     request.security(modelSymbol, biasTF5, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyB6, sellB6, bias6Dir, bias6Mid, bias6Type] =
+     request.security(modelSymbol, biasTF6, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyL1a, sellL1a, l1aDir, l1aMid, l1aType] =
+     request.security(modelSymbol, layer1TF1, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyL1b, sellL1b, l1bDir, l1bMid, l1bType] =
+     request.security(modelSymbol, layer1TF2, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyL1c, sellL1c, l1cDir, l1cMid, l1cType] =
+     request.security(modelSymbol, layer1TF3, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyL1d, sellL1d, l1dDir, l1dMid, l1dType] =
+     request.security(modelSymbol, layer1TF4, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyL2aRaw, sellL2aRaw, l2aDirIgnore, l2aMidIgnore, l2aTypeIgnore] =
+     request.security(modelSymbol, layer2TF1, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+[buyL2bRaw, sellL2bRaw, l2bDirIgnore, l2bMidIgnore, l2bTypeIgnore] =
+     request.security(modelSymbol, layer2TF2, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// Collapse multi-TF layers into single vars used by downstream logic
+buyL1 =
+     buyL1a != "-" ? buyL1a :
+     buyL1b != "-" ? buyL1b :
+     buyL1c != "-" ? buyL1c :
+     buyL1d != "-" ? buyL1d :
+     "-"
+
+sellL1 =
+     sellL1a != "-" ? sellL1a :
+     sellL1b != "-" ? sellL1b :
+     sellL1c != "-" ? sellL1c :
+     sellL1d != "-" ? sellL1d :
+     "-"
+
+l1aValid = l1aDir == "BUY" or l1aDir == "SELL"
+l1bValid = l1bDir == "BUY" or l1bDir == "SELL"
+l1cValid = l1cDir == "BUY" or l1cDir == "SELL"
+l1dValid = l1dDir == "BUY" or l1dDir == "SELL"
+
+layer1CRTDir =
+     l1aValid ? l1aDir :
+     l1bValid ? l1bDir :
+     l1cValid ? l1cDir :
+     l1dValid ? l1dDir :
+     "-"
+
+layer1CRTMid =
+     l1aValid ? l1aMid :
+     l1bValid ? l1bMid :
+     l1cValid ? l1cMid :
+     l1dValid ? l1dMid :
+     na
+
+layer1CRTType =
+     l1aValid ? l1aType :
+     l1bValid ? l1bType :
+     l1cValid ? l1cType :
+     l1dValid ? l1dType :
+     "-"
+
+buyL2Raw = buyL2aRaw != "-" ? buyL2aRaw : buyL2bRaw
+sellL2Raw = sellL2aRaw != "-" ? sellL2aRaw : sellL2bRaw
+
+[weeklyC0High, weeklyC0Low, weeklyC1High, weeklyC1Low] =
+     request.security(modelSymbol, layer1TF, [high, low, high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
+
+[dailyC0High, dailyC0Low, dailyC0Close, dailyC1High, dailyC1Low, dailyC1Open, dailyC1Close, dailyC2High, dailyC2Low] =
+     request.security(modelSymbol, layer2TF, [high, low, close, high[1], low[1], open[1], close[1], high[2], low[2]], barmerge.gaps_off, barmerge.lookahead_off)
+
+[dailyBuyCRTNow, dailySellCRTNow, dailyNewWeeklyCandle, dailyC1C2PreviousSameWeek] =
+     request.security(
+         modelSymbol,
+         layer2TF,
+         [f_crtBuy(), f_crtSell(), time(layer1TF) != time(layer1TF)[1], time(layer1TF)[1] == time(layer1TF)[2]],
+         barmerge.gaps_off,
+         barmerge.lookahead_off
+     )
+
+// =====================
+// CONFIRMATION LOGIC
+// =====================
+dailyCrossWeekBuyCRT = dailyBuyCRTNow and dailyNewWeeklyCandle and dailyC1C2PreviousSameWeek
+dailyCrossWeekSellCRT = dailySellCRTNow and dailyNewWeeklyCandle and dailyC1C2PreviousSameWeek
+
+weeklyC0TookC1High = weeklyC0High > weeklyC1High
+weeklyC0TookC1Low = weeklyC0Low < weeklyC1Low
+
+dailyC0TookC1High = dailyC0High > dailyC1High
+dailyC0TookC1Low = dailyC0Low < dailyC1Low
+
+dailySellOpposingC1 = dailyC1Close > dailyC2High
+dailyBuyOpposingC1 = dailyC1Close < dailyC2Low
+
+dailySellOpposingCleared = dailyC0TookC1High
+dailyBuyOpposingCleared = dailyC0TookC1Low
+
+buyL2 =
+     buyL2Raw != "-" ? buyL2Raw :
+     dailyCrossWeekBuyCRT ? "CRT X-WEEK " :
+     "-"
+
+sellL2 =
+     sellL2Raw != "-" ? sellL2Raw :
+     dailyCrossWeekSellCRT ? "CRT X-WEEK " :
+     "-"
+
+buyLayer2OKRaw = buyL2 != "-"
+sellLayer2OKRaw = sellL2 != "-"
+
+buyLayer2OK =
+     buyLayer2OKRaw and
+     (not dailyBuyOpposingC1 or dailyBuyOpposingCleared or dailyCrossWeekBuyCRT)
+
+sellLayer2OK =
+     sellLayer2OKRaw and
+     (not dailySellOpposingC1 or dailySellOpposingCleared or dailyCrossWeekSellCRT)
+
+buyBiasOK = buyB1 != "-" or buyB2 != "-" or buyB3 != "-" or buyB4 != "-" or buyB5 != "-" or buyB6 != "-"
+sellBiasOK = sellB1 != "-" or sellB2 != "-" or sellB3 != "-" or sellB4 != "-" or sellB5 != "-" or sellB6 != "-"
+
+bias1ValidDir = bias1Dir == "BUY" or bias1Dir == "SELL"
+bias2ValidDir = bias2Dir == "BUY" or bias2Dir == "SELL"
+bias3ValidDir = bias3Dir == "BUY" or bias3Dir == "SELL"
+bias4ValidDir = bias4Dir == "BUY" or bias4Dir == "SELL"
+bias5ValidDir = bias5Dir == "BUY" or bias5Dir == "SELL"
+bias6ValidDir = bias6Dir == "BUY" or bias6Dir == "SELL"
+
+biasCRTDirection =
+     bias1ValidDir ? bias1Dir :
+     bias2ValidDir ? bias2Dir :
+     bias3ValidDir ? bias3Dir :
+     bias4ValidDir ? bias4Dir :
+     bias5ValidDir ? bias5Dir :
+     bias6ValidDir ? bias6Dir :
+     "-"
+
+biasCRTMidpoint =
+     bias1ValidDir ? bias1Mid :
+     bias2ValidDir ? bias2Mid :
+     bias3ValidDir ? bias3Mid :
+     bias4ValidDir ? bias4Mid :
+     bias5ValidDir ? bias5Mid :
+     bias6ValidDir ? bias6Mid :
+     na
+
+biasCRTFound = biasCRTDirection == "BUY" or biasCRTDirection == "SELL"
+
+priceOnBiasCRTSide =
+     biasCRTDirection == "SELL" ? close > biasCRTMidpoint :
+     biasCRTDirection == "BUY" ? close < biasCRTMidpoint :
+     false
+
+buyLayer1OK = buyL1 != "-"
+sellLayer1OK = sellL1 != "-"
+
+layer1CRTFound = layer1CRTDir == "BUY" or layer1CRTDir == "SELL"
+
+priceOnLayer1CRTSide =
+     layer1CRTDir == "SELL" ? close > layer1CRTMid :
+     layer1CRTDir == "BUY" ? close < layer1CRTMid :
+     false
+
+// =====================
+// ROUTES
+// =====================
+buyHTFOK = buyBiasOK and buyLayer1OK and buyLayer2OK
+sellHTFOK = sellBiasOK and sellLayer1OK and sellLayer2OK
+
+biasCRTWeeklyBuyOK = buyLayer1OK or weeklyC0TookC1Low
+biasCRTWeeklySellOK = sellLayer1OK or weeklyC0TookC1High
+
+biasCRTRouteBuy =
+     biasCRTFound and
+     biasCRTDirection == "BUY" and
+     priceOnBiasCRTSide and
+     biasCRTWeeklyBuyOK and
+     buyLayer2OK
+
+biasCRTRouteSell =
+     biasCRTFound and
+     biasCRTDirection == "SELL" and
+     priceOnBiasCRTSide and
+     biasCRTWeeklySellOK and
+     sellLayer2OK
+
+layer1CRTDailyBuyOK = buyLayer2OK or dailyC0TookC1Low or dailyCrossWeekBuyCRT
+layer1CRTDailySellOK = sellLayer2OK or dailyC0TookC1High or dailyCrossWeekSellCRT
+
+layer1CRTRouteBuy =
+     layer1CRTFound and
+     layer1CRTDir == "BUY" and
+     priceOnLayer1CRTSide and
+     layer1CRTDailyBuyOK
+
+layer1CRTRouteSell =
+     layer1CRTFound and
+     layer1CRTDir == "SELL" and
+     priceOnLayer1CRTSide and
+     layer1CRTDailySellOK
+
+buyModelOK = buyHTFOK or biasCRTRouteBuy or layer1CRTRouteBuy
+sellModelOK = sellHTFOK or biasCRTRouteSell or layer1CRTRouteSell
+
+finalDirection =
+     buyModelOK and not sellModelOK ? "BUY" :
+     sellModelOK and not buyModelOK ? "SELL" :
+     buyModelOK and sellModelOK ? "BOTH" :
+     "WAIT"
+
+contextColor =
+     finalDirection == "BUY" ? buyColor :
+     finalDirection == "SELL" ? sellColor :
+     finalDirection == "BOTH" ? color.orange :
+     neutralColor
+
+// =====================
+// CLEAN INFO TEXT
+// =====================
+buyBiasInfo =
+     (buyB1 != "-" ? biasTF1 + ": " + buyB1 + " " : "") +
+     (buyB2 != "-" ? biasTF2 + ": " + buyB2 + " " : "") +
+     (buyB3 != "-" ? biasTF3 + ": " + buyB3 + " " : "") +
+     (buyB4 != "-" ? biasTF4 + ": " + buyB4 + " " : "") +
+     (buyB5 != "-" ? biasTF5 + ": " + buyB5 + " " : "") +
+     (buyB6 != "-" ? biasTF6 + ": " + buyB6 : "")
+
+buyBiasInfo := buyBiasInfo == "" ? "-" : buyBiasInfo
+
+sellBiasInfo =
+     (sellB1 != "-" ? biasTF1 + ": " + sellB1 + " " : "") +
+     (sellB2 != "-" ? biasTF2 + ": " + sellB2 + " " : "") +
+     (sellB3 != "-" ? biasTF3 + ": " + sellB3 + " " : "") +
+     (sellB4 != "-" ? biasTF4 + ": " + sellB4 + " " : "") +
+     (sellB5 != "-" ? biasTF5 + ": " + sellB5 + " " : "") +
+     (sellB6 != "-" ? biasTF6 + ": " + sellB6 : "")
+
+sellBiasInfo := sellBiasInfo == "" ? "-" : sellBiasInfo
+
+buyWeeklyInfo =
+     (buyL1a != "-" ? layer1TF1 + ": " + buyL1a + " " : "") +
+     (buyL1b != "-" ? layer1TF2 + ": " + buyL1b + " " : "") +
+     (buyL1c != "-" ? layer1TF3 + ": " + buyL1c + " " : "") +
+     (buyL1d != "-" ? layer1TF4 + ": " + buyL1d : "")
+
+buyWeeklyInfo := buyWeeklyInfo == "" ? "-" : buyWeeklyInfo
+
+sellWeeklyInfo =
+     (sellL1a != "-" ? layer1TF1 + ": " + sellL1a + " " : "") +
+     (sellL1b != "-" ? layer1TF2 + ": " + sellL1b + " " : "") +
+     (sellL1c != "-" ? layer1TF3 + ": " + sellL1c + " " : "") +
+     (sellL1d != "-" ? layer1TF4 + ": " + sellL1d : "")
+
+sellWeeklyInfo := sellWeeklyInfo == "" ? "-" : sellWeeklyInfo
+
+buyDailyInfo =
+     (buyL2aRaw != "-" ? layer2TF1 + ": " + buyL2aRaw + " " : "") +
+     (buyL2bRaw != "-" ? layer2TF2 + ": " + buyL2bRaw + " " : "") +
+     (dailyCrossWeekBuyCRT ? "CRT X-WEEK" : "")
+
+buyDailyInfo := buyDailyInfo == "" ? "-" : buyDailyInfo
+
+sellDailyInfo =
+     (sellL2aRaw != "-" ? layer2TF1 + ": " + sellL2aRaw + " " : "") +
+     (sellL2bRaw != "-" ? layer2TF2 + ": " + sellL2bRaw + " " : "") +
+     (dailyCrossWeekSellCRT ? "CRT X-WEEK" : "")
+
+sellDailyInfo := sellDailyInfo == "" ? "-" : sellDailyInfo
+
+// =====================
+// TABLE
+// =====================
+var table t = table.new(position.bottom_right, 3, 5, border_width=1)
+
+f_cell(_c, _r, _txt, _bg, _tc) =>
+    table.cell(t, _c, _r, _txt, bgcolor=_bg, text_color=_tc, text_size=tableTextSize)
+
+if showTable and barstate.islast
+    f_cell(0, 0, "Layer", color.black, color.white)
+    f_cell(1, 0, "BUY", buyColor, color.white)
+    f_cell(2, 0, "SELL", sellColor, color.white)
+
+    f_cell(0, 1, "Bias", color.black, color.white)
+    f_cell(1, 1, buyBiasInfo, buyBiasOK ? buyColor : neutralColor, color.white)
+    f_cell(2, 1, sellBiasInfo, sellBiasOK ? sellColor : neutralColor, color.white)
+
+    f_cell(0, 2, "Weekly", color.black, color.white)
+    f_cell(1, 2, buyWeeklyInfo, buyLayer1OK or biasCRTRouteBuy or layer1CRTRouteBuy ? buyColor : neutralColor, color.white)
+    f_cell(2, 2, sellWeeklyInfo, sellLayer1OK or biasCRTRouteSell or layer1CRTRouteSell ? sellColor : neutralColor, color.white)
+
+    f_cell(0, 3, "Daily", color.black, color.white)
+    f_cell(1, 3, buyDailyInfo, buyLayer2OK or dailyCrossWeekBuyCRT or (layer1CRTRouteBuy and dailyC0TookC1Low) ? buyColor : neutralColor, color.white)
+    f_cell(2, 3, sellDailyInfo, sellLayer2OK or dailyCrossWeekSellCRT or (layer1CRTRouteSell and dailyC0TookC1High) ? sellColor : neutralColor, color.white)
+
+    f_cell(0, 4, "Context", color.black, color.white)
+    f_cell(1, 4, finalDirection == "BUY" or finalDirection == "BOTH" ? finalDirection : "-", finalDirection == "BUY" or finalDirection == "BOTH" ? buyColor : neutralColor, color.white)
+    f_cell(2, 4, finalDirection == "SELL" or finalDirection == "BOTH" ? finalDirection : "-", finalDirection == "SELL" or finalDirection == "BOTH" ? sellColor : neutralColor, color.white)
