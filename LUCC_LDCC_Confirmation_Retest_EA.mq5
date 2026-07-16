@@ -49,8 +49,14 @@ input double InpStopLossMultiplier    = 1.3;  // FINAL SL distance = original st
 input double InpPipSizePoints         = 0;    // Points per pip for the CSV pip conversions (0 = auto:
                                                // 10 points on 3/5-digit symbols, 1 point on 2/4-digit)
 
-input group "Trading Session (Nairobi / EAT, UTC+3, no DST)"
-input double InpBrokerGmtOffsetHours = 2.0;   // Broker's STANDARD (winter) GMT offset, hours
+input group "Timezone (all logged times = Africa/Nairobi, UTC+3, no DST)"
+input bool   InpAutoDetectBrokerOffset = true; // Auto-detect the broker's UTC offset (TimeCurrent-TimeGMT)
+                                               // so logged times always land on Africa/Nairobi and match
+                                               // TradingView. If your broker/tester reports GMT oddly and
+                                               // times look wrong, turn this OFF and set the manual offset
+                                               // below. The detected offset is printed to the Experts log.
+input double InpBrokerGmtOffsetHours = 2.0;   // MANUAL broker STANDARD (winter) UTC offset (used only when
+                                               // auto-detect is OFF, or as the pre-detect fallback)
 input bool   InpBrokerUsesDst        = true;  // Broker shifts its clock for EU-style DST
 input int    InpSummerStartMonth     = 4;     // First month of the wider session (inclusive)
 input int    InpSummerEndMonth       = 10;    // Last month of the wider session (inclusive)
@@ -298,6 +304,9 @@ long g_rejOrderFail  = 0;
 long g_skippedAfterWin = 0;   // setups skipped by the stop-after-first-win-per-weekly-bias rule
 long g_expiredPending  = 0;   // armed retest setups discarded at a day boundary (pending-expiration rule)
 
+double g_brokerStdOffsetHours   = 2.0;   // broker's resolved STANDARD (winter) UTC offset (hours)
+bool   g_brokerOffsetResolved   = false; // set once TimeCurrent/TimeGMT are valid (or manual mode)
+
 bool g_lastSessionOpen  = false;  // for logging session OPEN/closed transitions
 bool g_haveSessionState = false;
 
@@ -305,7 +314,7 @@ bool g_haveSessionState = false;
 void Dbg(const string msg)
 {
    if(InpDebugLog)
-      Print("[DBG ", TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES | TIME_SECONDS), "] ", msg);
+      Print("[DBG ", TimeToString(GetNairobiTime(TimeCurrent()), TIME_DATE | TIME_MINUTES | TIME_SECONDS), "] ", msg);
 }
 
 // FileOpen flags for the CSVs — adds FILE_COMMON when writing to the shared
@@ -442,7 +451,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
          g_cntRef++;
          Dbg(StringFormat("%s reference selected @ %s  high=%.5f low=%.5f",
                           isSell ? "LUCC(SELL)" : "LDCC(BUY)",
-                          TimeToString(st.refTime, TIME_DATE | TIME_MINUTES), st.refHigh, st.refLow));
+                          TimeToString(GetNairobiTime(st.refTime), TIME_DATE | TIME_MINUTES), st.refHigh, st.refLow));
       }
    }
 
@@ -467,7 +476,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
 
          g_cntCc++;
          Dbg(StringFormat("%s CC formed @ %s  SL level=%.5f (now awaiting retest of %.5f)",
-                          isSell ? "SELL" : "BUY", TimeToString(st.ccTime, TIME_DATE | TIME_MINUTES),
+                          isSell ? "SELL" : "BUY", TimeToString(GetNairobiTime(st.ccTime), TIME_DATE | TIME_MINUTES),
                           st.slLevel, isSell ? st.refLow : st.refHigh));
       }
    }
@@ -488,7 +497,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
          st.lastAttemptBar = BarTime(0);
          g_cntTouch++;
          Dbg(StringFormat("%s RETEST touch (bar close) @ %s level %.5f",
-                          isSell ? "SELL" : "BUY", TimeToString(BarTime(0), TIME_DATE | TIME_MINUTES), level));
+                          isSell ? "SELL" : "BUY", TimeToString(GetNairobiTime(BarTime(0)), TIME_DATE | TIME_MINUTES), level));
          if(TryOpen(isSell, st))
             st.rcTime = BarTime(0);
       }
@@ -586,30 +595,58 @@ datetime LastSundayOfMonth(int year, int month)
    return lastDayOfMonth - dtLast.day_of_week * 86400; // day_of_week: 0 = Sunday
 }
 
-// Whether the broker is currently observing EU-style DST (last Sunday of
-// March 01:00 UTC to last Sunday of October 01:00 UTC), evaluated against
-// an approximate UTC time derived from the broker's standard offset.
+// Is a given UTC instant inside the EU-style DST window (last Sunday of March
+// 01:00 UTC to last Sunday of October 01:00 UTC)?
+bool IsEuDstUtc(datetime utc)
+{
+   MqlDateTime dt;
+   TimeToStruct(utc, dt);
+   datetime dstStart = LastSundayOfMonth(dt.year, 3)  + 3600;
+   datetime dstEnd   = LastSundayOfMonth(dt.year, 10) + 3600;
+   return (utc >= dstStart && utc < dstEnd);
+}
+
+// Resolve the broker's STANDARD (winter) UTC offset ONCE. Auto mode derives it
+// from TimeCurrent()-TimeGMT() (which auto-includes the broker's current DST),
+// backing out the current DST to get the standard offset. Falls back to the
+// manual input if auto-detect isn't available yet or is switched off.
+void ResolveBrokerOffset()
+{
+   if(g_brokerOffsetResolved)
+      return;
+   if(!InpAutoDetectBrokerOffset)
+   {
+      g_brokerStdOffsetHours = InpBrokerGmtOffsetHours;
+      g_brokerOffsetResolved = true;
+      return;
+   }
+   datetime srv = TimeCurrent();
+   datetime gmt = TimeGMT();
+   if(srv <= 0 || gmt <= 0)
+      return; // times not ready yet — retry on a later tick (manual value used meanwhile)
+   double curOffH = MathRound((double)((long)srv - (long)gmt) / 3600.0);
+   bool   dstNow  = InpBrokerUsesDst && IsEuDstUtc(gmt);
+   g_brokerStdOffsetHours = curOffH - (dstNow ? 1.0 : 0.0);
+   g_brokerOffsetResolved = true;
+}
+
+// Whether the broker is observing EU-style DST at serverTime, using the
+// resolved standard offset to back out an approximate UTC.
 bool IsBrokerDstActive(datetime serverTime)
 {
    if(!InpBrokerUsesDst)
       return false;
-
-   datetime approxUtc = serverTime - (long)(InpBrokerGmtOffsetHours * 3600);
-   MqlDateTime dt;
-   TimeToStruct(approxUtc, dt);
-
-   datetime dstStart = LastSundayOfMonth(dt.year, 3)  + 3600;
-   datetime dstEnd    = LastSundayOfMonth(dt.year, 10) + 3600;
-   return (approxUtc >= dstStart && approxUtc < dstEnd);
+   datetime approxUtc = serverTime - (long)(g_brokerStdOffsetHours * 3600);
+   return IsEuDstUtc(approxUtc);
 }
 
-// Converts broker server time to true Nairobi time (EAT, fixed UTC+3),
-// automatically compensating for whatever GMT offset / DST the broker's
-// own server clock uses, so the trading session always lands on the
-// intended real-world Nairobi hours regardless of broker timezone.
+// Converts broker server time to true Nairobi time (EAT, fixed UTC+3, no DST),
+// compensating for the broker's resolved GMT offset + DST. Every timestamp
+// written to the logs goes through this so it matches Africa/Nairobi on
+// TradingView regardless of the broker's server timezone.
 datetime GetNairobiTime(datetime serverTime)
 {
-   double offsetHours = InpBrokerGmtOffsetHours;
+   double offsetHours = g_brokerStdOffsetHours;
    if(IsBrokerDstActive(serverTime))
       offsetHours += 1.0;
 
@@ -687,7 +724,7 @@ void ExpirePendingIfArmed(bool isSell, SSignalState &st)
    st.lastAttemptBar = 0;
    g_expiredPending++;
    Dbg(StringFormat("%s PENDING EXPIRED at new day: untriggered retest on ref @ %s discarded; awaiting a new setup",
-                    isSell ? "SELL" : "BUY", TimeToString(st.expiredRefTime, TIME_DATE | TIME_MINUTES)));
+                    isSell ? "SELL" : "BUY", TimeToString(GetNairobiTime(st.expiredRefTime), TIME_DATE | TIME_MINUTES)));
 }
 
 // Resets both directions' daily trade counters at the start of each new
@@ -1117,7 +1154,7 @@ bool TryOpen(bool isSell, SSignalState &st)
       g_cntEntries++;
       Dbg(StringFormat("%s ENTRY OK: fill=%.5f sl=%.5f tp=%.5f lots=%.2f risk=%.2f episode=%s bias[%s] (openTrades=%d)",
                        side, ot.entryPrice, sl, tp, lots, riskAmount,
-                       TimeToString(ot.episode, TIME_DATE), ot.sideBiasText, ArraySize(g_openTrades)));
+                       TimeToString(GetNairobiTime(ot.episode), TIME_DATE), ot.sideBiasText, ArraySize(g_openTrades)));
       return true;
    }
 
@@ -1170,6 +1207,13 @@ string CsvEscape(string s)
 string FmtTime(datetime t)
 {
    return (t == 0) ? "-" : TimeToString(t, TIME_DATE | TIME_MINUTES | TIME_SECONDS);
+}
+
+// Same, but converts a broker SERVER time to Africa/Nairobi first. Used for
+// every event timestamp in the log so they match TradingView (Nairobi).
+string FmtNairobi(datetime serverTime)
+{
+   return (serverTime == 0) ? "-" : TimeToString(GetNairobiTime(serverTime), TIME_DATE | TIME_MINUTES | TIME_SECONDS);
 }
 
 // Joins one row of fields with commas and writes it as a single line. Using
@@ -1382,7 +1426,7 @@ void WriteWeeklyStats()
       double winRate = (g_weeks[i].trades > 0) ? 100.0 * g_weeks[i].wins / g_weeks[i].trades : 0.0;
       double avgR    = (g_weeks[i].trades > 0) ? g_weeks[i].totalR / g_weeks[i].trades : 0.0;
       FileWrite(h, StringFormat("%s,%d,%d,%d,%d,%.1f,%.3f,%.3f,%d,%d,%d,%s",
-                TimeToString(g_weeks[i].weekStart, TIME_DATE),
+                TimeToString(GetNairobiTime(g_weeks[i].weekStart), TIME_DATE),
                 g_weeks[i].trades, g_weeks[i].wins, g_weeks[i].losses, g_weeks[i].breakeven,
                 winRate, g_weeks[i].totalR, avgR, g_weeks[i].maxWin, g_weeks[i].maxLoss,
                 g_weeks[i].setupsSkipped, InpStopAfterFirstWin ? "ON" : "OFF"));
@@ -1473,9 +1517,9 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
       p.biasDir, CsvEscape(p.biasBuyText), CsvEscape(p.biasSellText),
       CsvEscape(p.sideBiasText), (string)biasCount, sideCombo,
       patternSeq, (string)biasCount, filtersPassed,
-      // timestamps
-      FmtTime(p.biasCandleTime), FmtTime(p.refTime), FmtTime(p.ccTime), FmtTime(p.rcTime),
-      FmtTime(p.entryTime), FmtTime(p.exitTime),
+      // timestamps — all in Africa/Nairobi so they match TradingView
+      FmtNairobi(p.biasCandleTime), FmtNairobi(p.refTime), FmtNairobi(p.ccTime), FmtNairobi(p.rcTime),
+      FmtNairobi(p.entryTime), FmtNairobi(p.exitTime),
       DoubleToString(holdingMinutes, 1), DoubleToString(ccToEntryMin, 1), DoubleToString(rcToEntryMin, 1),
       // prices / levels / risk geometry
       DoubleToString(p.refHigh, _Digits), DoubleToString(p.refLow, _Digits), DoubleToString(refRange, _Digits),
@@ -1501,7 +1545,7 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
       // --- v2 research additions ---
       result, DoubleToString(holdingHours, 2),
       DoubleToString(mfeRInTrade, 3), DoubleToString(rRealized, 3),
-      (string)barsRefToCC, (string)barsCcToRc, (string)barsRcToEntry, triggerTiming, FmtTime(entryCandle),
+      (string)barsRefToCC, (string)barsCcToRc, (string)barsRcToEntry, triggerTiming, FmtNairobi(entryCandle),
       DoubleToString(p.equityBefore, 2),
       DoubleToString(p.weekO, _Digits), DoubleToString(p.weekH, _Digits), DoubleToString(p.weekL, _Digits), DoubleToString(p.weekC, _Digits),
       DoubleToString(p.dayO, _Digits),  DoubleToString(p.dayH, _Digits),  DoubleToString(p.dayL, _Digits),  DoubleToString(p.dayC, _Digits),
@@ -1579,7 +1623,7 @@ void HandleClose(long closedPosId, datetime exitTime, double exitPrice, string e
    Dbg(StringFormat("%s CLOSE posId=%d net=%.2f %s%s episode=%s (openTrades left=%d)",
                     t.isSell ? "SELL" : "BUY", closedPosId, netProfit,
                     netProfit > 0 ? "WIN" : (netProfit < 0 ? "LOSS" : "BE"),
-                    firstWin ? " [FIRST-WIN]" : "", TimeToString(t.episode, TIME_DATE),
+                    firstWin ? " [FIRST-WIN]" : "", TimeToString(GetNairobiTime(t.episode), TIME_DATE),
                     ArraySize(g_openTrades) - 1));
 
    if(InpEnableTradeLog)
@@ -1649,7 +1693,7 @@ string SideStateText(bool isSell, const SSignalState &st)
    string openTag = (openN > 0) ? StringFormat(" [%d open]", openN) : "";
    if(st.refTime == 0) return "scanning - no " + tag + openTag;
    if(st.refTime == st.expiredRefTime) return "pending EXPIRED - awaiting a new " + tag + openTag;
-   if(st.ccTime  == 0) return tag + " @ " + TimeToString(st.refTime, TIME_DATE|TIME_MINUTES) + " (awaiting CC)" + openTag;
+   if(st.ccTime  == 0) return tag + " @ " + TimeToString(GetNairobiTime(st.refTime), TIME_DATE|TIME_MINUTES) + " (awaiting CC)" + openTag;
    double lvl = isSell ? st.refLow : st.refHigh;
    return "CC set - awaiting retest @ " + DoubleToString(lvl, _Digits) + openTag;
 }
@@ -1726,6 +1770,13 @@ int OnInit()
    g_trade.SetDeviationInPoints(InpSlippagePoints);
    g_trade.SetTypeFillingBySymbol(_Symbol);
 
+   // Resolve the broker->Nairobi offset FIRST so every logged timestamp is in
+   // Africa/Nairobi. (Auto-detect may defer until the first tick if TimeGMT()
+   // isn't ready yet; the manual input is used as the fallback until then.)
+   g_brokerStdOffsetHours = InpBrokerGmtOffsetHours;
+   g_brokerOffsetResolved = false;
+   ResolveBrokerOffset();
+
    // H1 ATR(14) handle — logged as volatility context on every entry.
    g_atrHandle = iATR(_Symbol, PERIOD_H1, 14);
    if(g_atrHandle == INVALID_HANDLE)
@@ -1774,6 +1825,11 @@ int OnInit()
    Dbg(StringFormat("INIT filters: SessionGate=REMOVED  BiasFilter=%s  BarCloseRetest=%s  Lookback=%d | H1bars=%d W1bars=%d riskBal=%.2f",
                     InpUseBiasFilter ? "ON" : "OFF", InpUseBarCloseRetest ? "ON" : "OFF", LOOKBACK,
                     iBars(_Symbol, PERIOD_H1), iBars(_Symbol, PERIOD_W1), g_riskBalance));
+   PrintFormat("LUCC/LDCC EA: TIMEZONE %s | broker std offset=UTC%+.0f (DST=%s) | server %s = Nairobi %s  (all logged times = Africa/Nairobi)",
+               InpAutoDetectBrokerOffset ? "auto-detected" : "MANUAL", g_brokerStdOffsetHours,
+               InpBrokerUsesDst ? "EU" : "none",
+               TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES),
+               TimeToString(GetNairobiTime(TimeCurrent()), TIME_DATE | TIME_MINUTES));
    return(INIT_SUCCEEDED);
 }
 
@@ -1823,6 +1879,7 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
+   ResolveBrokerOffset();   // finalizes the broker->Nairobi offset once TimeGMT() is available
    CheckDailyReset();
 
    // Log every session OPEN/closed flip once, so the Experts log proves the
