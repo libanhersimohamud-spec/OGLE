@@ -91,6 +91,14 @@ input bool   InpExpirePendingDaily   = true;  // At the start of each new (Nairo
                                                // completely new valid setup. Open trades are unaffected.
                                                // (The 120-candle lookback & setup detection are unchanged.)
 
+input group "Setup Invalidation (Daily used ONLY here — not for bias/entry)"
+input bool   InpUseDailySetupInvalidation = true; // Before the entry triggers, invalidate the current 1H
+                                               // setup if the DAILY candle trades beyond Daily Candle-1:
+                                               // BUY setup dies if Daily > Daily-C1 High; SELL setup dies
+                                               // if Daily < Daily-C1 Low (touch, no close needed). The
+                                               // setup is discarded and never reused; the Weekly Bias and
+                                               // the 120-candle lookback are NOT affected.
+
 input group "Filters (isolation / debugging)"
 // NOTE: the trading-session gate has been REMOVED in this version — every valid
 // setup is taken regardless of session (data-collection mode). Session/UTC are
@@ -300,6 +308,8 @@ long g_rejLots       = 0;
 long g_rejOrderFail  = 0;
 long g_skippedAfterWin = 0;   // setups skipped by the stop-after-first-win-per-weekly-bias rule
 long g_expiredPending  = 0;   // armed retest setups discarded at a day boundary (pending-expiration rule)
+long g_invalidDaily    = 0;   // setups invalidated by the Daily setup-invalidation rule
+long g_invalidWeekly   = 0;   // setups discarded because the Weekly bias was invalidated
 
 double g_brokerStdOffsetHours   = 2.0;   // broker's resolved STANDARD (winter) UTC offset (hours)
 bool   g_brokerOffsetResolved   = false; // set once TimeCurrent/TimeGMT are valid (or manual mode)
@@ -702,6 +712,60 @@ void ExpirePendingIfArmed(bool isSell, SSignalState &st)
    g_expiredPending++;
    Dbg(StringFormat("%s PENDING EXPIRED at new day: untriggered retest on ref @ %s discarded; awaiting a new setup",
                     isSell ? "SELL" : "BUY", TimeToString(GetNairobiTime(st.expiredRefTime), TIME_DATE | TIME_MINUTES)));
+}
+
+// Discards the CURRENT active, UN-triggered 1H entry setup for one side (any
+// stage: LUCC/LDCC found, CC formed, or awaiting RC). The reference is stamped
+// expired so it can't re-arm — the EA waits for a genuinely NEW reference. Does
+// NOT touch open trades (rcTime != 0) or the Weekly bias or the 120 lookback.
+// No-op if there is no active untriggered setup, or it was already discarded.
+void DiscardSetup(bool isSell, SSignalState &st, string reason)
+{
+   if(st.refTime == 0 || st.rcTime != 0 || st.refTime == st.expiredRefTime)
+      return;
+   st.expiredRefTime = st.refTime;
+   st.ccTime         = 0;
+   st.slLevel        = 0;
+   st.lastAttemptBar = 0;
+   Dbg(StringFormat("%s SETUP INVALIDATED (%s): ref @ %s discarded; never reused; awaiting a new setup",
+                    isSell ? "SELL" : "BUY", reason,
+                    TimeToString(GetNairobiTime(st.expiredRefTime), TIME_DATE | TIME_MINUTES)));
+}
+
+// Applies both invalidation rules every tick, BEFORE the retest is checked, so
+// an invalidated setup can never open a trade.
+//   Rule 2 (Weekly-bias): when the weekly bias for a side is invalidated
+//           (ComputeBias already latches this per Weekly Candle-1), discard
+//           that side's active setup. The bias gate keeps that side blocked for
+//           the rest of the week; the bias resets on a new weekly candle.
+//   Rule 1 (Daily): the DAILY timeframe is used ONLY here — if the Daily candle
+//           trades beyond Daily Candle-1 (BUY: above C1 High; SELL: below C1
+//           Low), discard that side's active setup. Touch-based (no close). The
+//           Weekly bias is untouched, so a NEW 1H setup aligned with the same
+//           weekly bias may arm afterwards.
+void ApplyInvalidations(double bid, double ask)
+{
+   // Rule 2 — Weekly bias invalidation discards the active 1H setup.
+   if(InpUseBiasFilter)
+   {
+      if(g_bias.buyInvalid  && g_buy.refTime  != 0 && g_buy.rcTime  == 0 && g_buy.refTime  != g_buy.expiredRefTime)
+      { DiscardSetup(false, g_buy,  "Weekly BUY bias invalidated");  g_invalidWeekly++; }
+      if(g_bias.sellInvalid && g_sell.refTime != 0 && g_sell.rcTime == 0 && g_sell.refTime != g_sell.expiredRefTime)
+      { DiscardSetup(true,  g_sell, "Weekly SELL bias invalidated"); g_invalidWeekly++; }
+   }
+
+   // Rule 1 — Daily setup invalidation (Daily used ONLY here).
+   if(InpUseDailySetupInvalidation && iBars(_Symbol, PERIOD_D1) >= 2)
+   {
+      double dC1High = iHigh(_Symbol, PERIOD_D1, 1);
+      double dC1Low  = iLow(_Symbol, PERIOD_D1, 1);
+      double dHiNow  = MathMax(iHigh(_Symbol, PERIOD_D1, 0), ask); // this Daily candle's high incl. live tick
+      double dLoNow  = MathMin(iLow(_Symbol, PERIOD_D1, 0), bid);  // this Daily candle's low  incl. live tick
+      if(g_buy.refTime  != 0 && g_buy.rcTime  == 0 && g_buy.refTime  != g_buy.expiredRefTime  && dHiNow > dC1High)
+      { DiscardSetup(false, g_buy,  "Daily traded above Daily-C1 High"); g_invalidDaily++; }
+      if(g_sell.refTime != 0 && g_sell.rcTime == 0 && g_sell.refTime != g_sell.expiredRefTime && dLoNow < dC1Low)
+      { DiscardSetup(true,  g_sell, "Daily traded below Daily-C1 Low");  g_invalidDaily++; }
+   }
 }
 
 // Resets both directions' daily trade counters at the start of each new
@@ -1811,9 +1875,12 @@ void OnDeinit(const int reason)
 {
    // Funnel summary — the definitive "why no trades" readout. If refs>0 but
    // entries==0, the reject tally below shows exactly which gate stopped them.
-   PrintFormat("LUCC/LDCC EA FUNNEL: refs=%d CCs=%d retestTouches=%d ENTRIES=%d skippedAfterWin=%d pendingExpired=%d (StopAfterWinRule=%s, ExpirePendingDaily=%s)",
+   PrintFormat("LUCC/LDCC EA FUNNEL: refs=%d CCs=%d retestTouches=%d ENTRIES=%d skippedAfterWin=%d pendingExpired=%d invalidDaily=%d invalidWeekly=%d",
                g_cntRef, g_cntCc, g_cntTouch, g_cntEntries, g_skippedAfterWin, g_expiredPending,
-               InpStopAfterFirstWin ? "ON" : "OFF", InpExpirePendingDaily ? "ON" : "OFF");
+               g_invalidDaily, g_invalidWeekly);
+   PrintFormat("LUCC/LDCC EA RULES: StopAfterWinRule=%s ExpirePendingDaily=%s DailySetupInvalidation=%s BiasFilter=%s",
+               InpStopAfterFirstWin ? "ON" : "OFF", InpExpirePendingDaily ? "ON" : "OFF",
+               InpUseDailySetupInvalidation ? "ON" : "OFF", InpUseBiasFilter ? "ON" : "OFF");
    PrintFormat("LUCC/LDCC EA REJECTS: posOpen=%d doneToday=%d maxTrades=%d bias=%d slInvalid=%d minStop=%d lots=%d orderFail=%d",
                g_rejPosOpen, g_rejDoneToday, g_rejMaxTrades, g_rejBias,
                g_rejSlInvalid, g_rejMinStop, g_rejLots, g_rejOrderFail);
@@ -1873,6 +1940,10 @@ void OnTick()
    // Refresh the Weekly bias (direction + invalidation latches) before the
    // retest gate reads it this tick.
    ComputeBias(bid, ask);
+
+   // Rule 1 (Daily) + Rule 2 (Weekly-bias) setup invalidation — discard any
+   // invalidated setup BEFORE the retest can trigger it this tick.
+   ApplyInvalidations(bid, ask);
 
    MonitorRetest(true,  g_sell, bid, ask, mid);
    MonitorRetest(false, g_buy,  bid, ask, mid);
