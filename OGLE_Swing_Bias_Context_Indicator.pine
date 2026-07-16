@@ -28,8 +28,8 @@ layer1TFB = input.timeframe("2W", "Confirmation CL1-B (2W)", group=groupTF)
 layer2TFA = input.timeframe("D", "Confirmation CL2-A (1D)", group=groupTF)
 layer2TFB = input.timeframe("2D", "Confirmation CL2-B (2D)", group=groupTF)
 
-// Primary structural references (used by candle sweep / cross-week CRT logic)
-layer1TF = layer1TFA
+// Primary structural reference (used by the daily candle sweep / opposing
+// candle checks below)
 layer2TF = layer2TFA
 
 showTable = input.bool(true, "Show Context Table", group=groupTable)
@@ -50,7 +50,6 @@ buyColor = input.color(color.green, "Buy Color", group=groupVisuals)
 sellColor = input.color(color.red, "Sell Color", group=groupVisuals)
 neutralColor = input.color(color.new(color.black, 10), "Neutral Color", group=groupVisuals)
 showTargetLines = input.bool(true, "Show Target Lines", group=groupVisuals)
-targetLineColor = input.color(color.green, "Target Line Color", group=groupVisuals)
 
 // =====================
 // PATTERNS
@@ -72,66 +71,6 @@ f_bsbBuy() =>
 
 f_sbsSell() =>
     close[2] < open[2] and high[1] <= high[2] and low[1] >= low[2]
-
-f_crtBuyBase() =>
-    c1Mid = low[1] + ((high[1] - low[1]) / 2)
-    c1Sweep = low[1] < low[2]
-    c1CloseMid = close[1] > c1Mid
-    c1Decisive = low[1] < low[2] and high[1] > high[2]
-    c1CloseNotBelowC2Low = close[1] >= low[2]
-
-    c1Buy = close[1] > open[1]
-    c1Sell = close[1] < open[1]
-    c1Body = math.abs(close[1] - open[1])
-
-    c1UpperWick =
-         c1Buy ? high[1] - close[1] :
-         c1Sell ? high[1] - open[1] :
-         high[1] - close[1]
-
-    c1LowerWick =
-         c1Buy ? open[1] - low[1] :
-         c1Sell ? close[1] - low[1] :
-         open[1] - low[1]
-
-    c1OpenCloseAboveMid = open[1] > c1Mid and close[1] > c1Mid
-    c1BodyBiggerOneWick = c1Body > c1UpperWick or c1Body > c1LowerWick
-    c1BodyQuality = c1OpenCloseAboveMid or c1BodyBiggerOneWick
-
-    c1Sweep and c1CloseMid and not c1Decisive and c1CloseNotBelowC2Low and c1BodyQuality
-
-f_crtSellBase() =>
-    c1Mid = low[1] + ((high[1] - low[1]) / 2)
-    c1Sweep = high[1] > high[2]
-    c1CloseMid = close[1] < c1Mid
-    c1Decisive = high[1] > high[2] and low[1] < low[2]
-    c1CloseNotAboveC2High = close[1] <= high[2]
-
-    c1Buy = close[1] > open[1]
-    c1Sell = close[1] < open[1]
-    c1Body = math.abs(close[1] - open[1])
-
-    c1UpperWick =
-         c1Buy ? high[1] - close[1] :
-         c1Sell ? high[1] - open[1] :
-         high[1] - close[1]
-
-    c1LowerWick =
-         c1Buy ? open[1] - low[1] :
-         c1Sell ? close[1] - low[1] :
-         open[1] - low[1]
-
-    c1OpenCloseBelowMid = open[1] < c1Mid and close[1] < c1Mid
-    c1BodyBiggerOneWick = c1Body > c1UpperWick or c1Body > c1LowerWick
-    c1BodyQuality = c1OpenCloseBelowMid or c1BodyBiggerOneWick
-
-    c1Sweep and c1CloseMid and not c1Decisive and c1CloseNotAboveC2High and c1BodyQuality
-
-f_crtBuy() =>
-    f_crtBuyBase() and high < high[2]
-
-f_crtSell() =>
-    f_crtSellBase() and low > low[2]
 
 f_threeDPBuy() =>
     close[1] >= low[2] and close[1] <= high[2] and low < low[1] and low < low[2]
@@ -172,7 +111,6 @@ f_buyPatternText() =>
     txt := f_bodyCloseBuy() ? txt + "BC " : txt
     txt := f_decisiveBuy() ? txt + "DC " : txt
     txt := f_bsbBuy() ? txt + "BSB " : txt
-    txt := f_crtBuy() ? txt + "CRT " : txt
     txt := f_threeDPBuy() ? txt + "3DP " : txt
     txt := f_dsBuy() ? txt + "3DP-DS " : txt
     txt := f_near3DPBuy() ? txt + "N-3DP " : txt
@@ -184,74 +122,53 @@ f_sellPatternText() =>
     txt := f_bodyCloseSell() ? txt + "BC " : txt
     txt := f_decisiveSell() ? txt + "DC " : txt
     txt := f_sbsSell() ? txt + "SBS " : txt
-    txt := f_crtSell() ? txt + "CRT " : txt
     txt := f_threeDPSell() ? txt + "3DP " : txt
     txt := f_dsSell() ? txt + "3DP-DS " : txt
     txt := f_near3DPSell() ? txt + "N-3DP " : txt
     txt := f_nearDSSell() ? txt + "N-DS " : txt
     txt == "" ? "-" : txt
 
-f_c2Mid() =>
-    low[2] + ((high[2] - low[2]) / 2)
-
-f_currentCRT() =>
-    buyEvent = f_crtBuy()
-    sellEvent = f_crtSell()
-    mid = buyEvent ? f_c2Mid() : sellEvent ? f_c2Mid() : na
-
-    dir =
-         not na(mid) ?
-         close > mid ? "SELL" :
-         close < mid ? "BUY" :
-         "MID" :
-         "-"
-
-    typ = buyEvent ? "CRT BUY" : sellEvent ? "CRT SELL" : "-"
-
-    [dir, mid, typ]
-
 f_patternPack() =>
-    [crtDir, crtMid, crtType] = f_currentCRT()
-    [f_buyPatternText(), f_sellPatternText(), crtDir, crtMid, crtType]
+    [f_buyPatternText(), f_sellPatternText()]
 
 // =====================
 // HTF BIAS SCANS
 // =====================
-[buyB1, sellB1, bias1Dir, bias1Mid, bias1Type] =
+[buyB1, sellB1] =
      request.security(modelSymbol, biasTF1, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-[buyB2, sellB2, bias2Dir, bias2Mid, bias2Type] =
+[buyB2, sellB2] =
      request.security(modelSymbol, biasTF2, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-[buyB3, sellB3, bias3Dir, bias3Mid, bias3Type] =
+[buyB3, sellB3] =
      request.security(modelSymbol, biasTF3, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-[buyB4, sellB4, bias4Dir, bias4Mid, bias4Type] =
+[buyB4, sellB4] =
      request.security(modelSymbol, biasTF4, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-[buyB5, sellB5, bias5Dir, bias5Mid, bias5Type] =
+[buyB5, sellB5] =
      request.security(modelSymbol, biasTF5, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-[buyB6, sellB6, bias6Dir, bias6Mid, bias6Type] =
+[buyB6, sellB6] =
      request.security(modelSymbol, biasTF6, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
 // =====================
 // CONFIRMATION LAYER SCANS (CL1: 1W/2W, CL2: 1D/2D)
 // =====================
-[buyL1A, sellL1A, l1ADir, l1AMid, l1AType] =
+[buyL1A, sellL1A] =
      request.security(modelSymbol, layer1TFA, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-[buyL1B, sellL1B, l1BDir, l1BMid, l1BType] =
+[buyL1B, sellL1B] =
      request.security(modelSymbol, layer1TFB, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-[buyL2ARaw, sellL2ARaw, l2ADirIgnore, l2AMidIgnore, l2ATypeIgnore] =
+[buyL2ARaw, sellL2ARaw] =
      request.security(modelSymbol, layer2TFA, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
-[buyL2BRaw, sellL2BRaw, l2BDirIgnore, l2BMidIgnore, l2BTypeIgnore] =
+[buyL2BRaw, sellL2BRaw] =
      request.security(modelSymbol, layer2TFB, f_patternPack(), barmerge.gaps_off, barmerge.lookahead_off)
 
 // Collapse the two CL1 timeframes into a single "any confirmation found" var
-// (used by the pre-existing route logic below — CL1-A takes priority).
+// (used by the route logic below — CL1-A takes priority).
 buyL1 =
      buyL1A != "-" ? buyL1A :
      buyL1B != "-" ? buyL1B :
@@ -262,41 +179,15 @@ sellL1 =
      sellL1B != "-" ? sellL1B :
      "-"
 
-l1AValid = l1ADir == "BUY" or l1ADir == "SELL"
-l1BValid = l1BDir == "BUY" or l1BDir == "SELL"
-
-layer1CRTDir =
-     l1AValid ? l1ADir :
-     l1BValid ? l1BDir :
-     "-"
-
-layer1CRTMid =
-     l1AValid ? l1AMid :
-     l1BValid ? l1BMid :
-     na
-
-layer1CRTType =
-     l1AValid ? l1AType :
-     l1BValid ? l1BType :
-     "-"
-
 buyL2Raw = buyL2ARaw != "-" ? buyL2ARaw : buyL2BRaw
 sellL2Raw = sellL2ARaw != "-" ? sellL2ARaw : sellL2BRaw
 
-[weeklyC0High, weeklyC0Low, weeklyC1High, weeklyC1Low] =
-     request.security(modelSymbol, layer1TF, [high, low, high[1], low[1]], barmerge.gaps_off, barmerge.lookahead_off)
-
-[dailyC0High, dailyC0Low, dailyC0Close, dailyC1High, dailyC1Low, dailyC1Open, dailyC1Close, dailyC2High, dailyC2Low] =
-     request.security(modelSymbol, layer2TF, [high, low, close, high[1], low[1], open[1], close[1], high[2], low[2]], barmerge.gaps_off, barmerge.lookahead_off)
-
-[dailyBuyCRTNow, dailySellCRTNow, dailyNewWeeklyCandle, dailyC1C2PreviousSameWeek] =
-     request.security(
-         modelSymbol,
-         layer2TF,
-         [f_crtBuy(), f_crtSell(), time(layer1TF) != time(layer1TF)[1], time(layer1TF)[1] == time(layer1TF)[2]],
-         barmerge.gaps_off,
-         barmerge.lookahead_off
-     )
+// Daily (CL2-A) candle-sweep reference: current vs previous daily candle
+// high/low (used for the opposing-candle quality filter below), and the
+// previous daily candle's close vs the candle-2-back high/low (used to
+// detect an "opposing" confirmation candle).
+[dailyC0High, dailyC0Low, dailyC1High, dailyC1Low, dailyC1Close, dailyC2High, dailyC2Low] =
+     request.security(modelSymbol, layer2TF, [high, low, high[1], low[1], close[1], high[2], low[2]], barmerge.gaps_off, barmerge.lookahead_off)
 
 // Previous completed CL1 candle high/low (Candle 1 = last fully closed candle
 // on that timeframe, never Candle 0 / the currently forming one). Used for
@@ -319,12 +210,6 @@ sellL2Raw = sellL2ARaw != "-" ? sellL2ARaw : sellL2BRaw
 // =====================
 // CONFIRMATION LOGIC
 // =====================
-dailyCrossWeekBuyCRT = dailyBuyCRTNow and dailyNewWeeklyCandle and dailyC1C2PreviousSameWeek
-dailyCrossWeekSellCRT = dailySellCRTNow and dailyNewWeeklyCandle and dailyC1C2PreviousSameWeek
-
-weeklyC0TookC1High = weeklyC0High > weeklyC1High
-weeklyC0TookC1Low = weeklyC0Low < weeklyC1Low
-
 dailyC0TookC1High = dailyC0High > dailyC1High
 dailyC0TookC1Low = dailyC0Low < dailyC1Low
 
@@ -334,109 +219,28 @@ dailyBuyOpposingC1 = dailyC1Close < dailyC2Low
 dailySellOpposingCleared = dailyC0TookC1High
 dailyBuyOpposingCleared = dailyC0TookC1Low
 
-buyL2 =
-     buyL2Raw != "-" ? buyL2Raw :
-     dailyCrossWeekBuyCRT ? "CRT X-WEEK " :
-     "-"
-
-sellL2 =
-     sellL2Raw != "-" ? sellL2Raw :
-     dailyCrossWeekSellCRT ? "CRT X-WEEK " :
-     "-"
-
-buyLayer2OKRaw = buyL2 != "-"
-sellLayer2OKRaw = sellL2 != "-"
+buyLayer2OKRaw = buyL2Raw != "-"
+sellLayer2OKRaw = sellL2Raw != "-"
 
 buyLayer2OK =
      buyLayer2OKRaw and
-     (not dailyBuyOpposingC1 or dailyBuyOpposingCleared or dailyCrossWeekBuyCRT)
+     (not dailyBuyOpposingC1 or dailyBuyOpposingCleared)
 
 sellLayer2OK =
      sellLayer2OKRaw and
-     (not dailySellOpposingC1 or dailySellOpposingCleared or dailyCrossWeekSellCRT)
+     (not dailySellOpposingC1 or dailySellOpposingCleared)
 
 buyBiasOK = buyB1 != "-" or buyB2 != "-" or buyB3 != "-" or buyB4 != "-" or buyB5 != "-" or buyB6 != "-"
 sellBiasOK = sellB1 != "-" or sellB2 != "-" or sellB3 != "-" or sellB4 != "-" or sellB5 != "-" or sellB6 != "-"
 
-bias1ValidDir = bias1Dir == "BUY" or bias1Dir == "SELL"
-bias2ValidDir = bias2Dir == "BUY" or bias2Dir == "SELL"
-bias3ValidDir = bias3Dir == "BUY" or bias3Dir == "SELL"
-bias4ValidDir = bias4Dir == "BUY" or bias4Dir == "SELL"
-bias5ValidDir = bias5Dir == "BUY" or bias5Dir == "SELL"
-bias6ValidDir = bias6Dir == "BUY" or bias6Dir == "SELL"
-
-biasCRTDirection =
-     bias1ValidDir ? bias1Dir :
-     bias2ValidDir ? bias2Dir :
-     bias3ValidDir ? bias3Dir :
-     bias4ValidDir ? bias4Dir :
-     bias5ValidDir ? bias5Dir :
-     bias6ValidDir ? bias6Dir :
-     "-"
-
-biasCRTMidpoint =
-     bias1ValidDir ? bias1Mid :
-     bias2ValidDir ? bias2Mid :
-     bias3ValidDir ? bias3Mid :
-     bias4ValidDir ? bias4Mid :
-     bias5ValidDir ? bias5Mid :
-     bias6ValidDir ? bias6Mid :
-     na
-
-biasCRTFound = biasCRTDirection == "BUY" or biasCRTDirection == "SELL"
-
-priceOnBiasCRTSide =
-     biasCRTDirection == "SELL" ? close > biasCRTMidpoint :
-     biasCRTDirection == "BUY" ? close < biasCRTMidpoint :
-     false
-
 buyLayer1OK = buyL1 != "-"
 sellLayer1OK = sellL1 != "-"
-
-layer1CRTFound = layer1CRTDir == "BUY" or layer1CRTDir == "SELL"
-
-priceOnLayer1CRTSide =
-     layer1CRTDir == "SELL" ? close > layer1CRTMid :
-     layer1CRTDir == "BUY" ? close < layer1CRTMid :
-     false
 
 // =====================
 // ROUTES
 // =====================
 buyHTFOK = buyBiasOK and buyLayer1OK and buyLayer2OK
 sellHTFOK = sellBiasOK and sellLayer1OK and sellLayer2OK
-
-biasCRTWeeklyBuyOK = buyLayer1OK or weeklyC0TookC1Low
-biasCRTWeeklySellOK = sellLayer1OK or weeklyC0TookC1High
-
-biasCRTRouteBuy =
-     biasCRTFound and
-     biasCRTDirection == "BUY" and
-     priceOnBiasCRTSide and
-     biasCRTWeeklyBuyOK and
-     buyLayer2OK
-
-biasCRTRouteSell =
-     biasCRTFound and
-     biasCRTDirection == "SELL" and
-     priceOnBiasCRTSide and
-     biasCRTWeeklySellOK and
-     sellLayer2OK
-
-layer1CRTDailyBuyOK = buyLayer2OK or dailyC0TookC1Low or dailyCrossWeekBuyCRT
-layer1CRTDailySellOK = sellLayer2OK or dailyC0TookC1High or dailyCrossWeekSellCRT
-
-layer1CRTRouteBuy =
-     layer1CRTFound and
-     layer1CRTDir == "BUY" and
-     priceOnLayer1CRTSide and
-     layer1CRTDailyBuyOK
-
-layer1CRTRouteSell =
-     layer1CRTFound and
-     layer1CRTDir == "SELL" and
-     priceOnLayer1CRTSide and
-     layer1CRTDailySellOK
 
 // =====================
 // CL1 -> CL2 PATH VALIDATION
@@ -453,8 +257,8 @@ cl1ASellFound = sellL1A != "-"
 cl1BBuyFound = buyL1B != "-"
 cl1BSellFound = sellL1B != "-"
 
-cl2ABuyFound = buyL2ARaw != "-" or dailyCrossWeekBuyCRT
-cl2ASellFound = sellL2ARaw != "-" or dailyCrossWeekSellCRT
+cl2ABuyFound = buyL2ARaw != "-"
+cl2ASellFound = sellL2ARaw != "-"
 cl2BBuyFound = buyL2BRaw != "-"
 cl2BSellFound = sellL2BRaw != "-"
 
@@ -504,13 +308,11 @@ cl2BSellFoundNew = cl2BSellFound and not cl2BSellFound[1]
 // =====================
 // FINAL MODEL
 // -----------------------------------------------------------------------
-// The pre-existing route logic (buyHTFOK / biasCRTRouteBuy / layer1CRTRouteBuy)
-// is unchanged; the CL1->CL2 path validity is applied as a final gate so the
-// forbidden CL1-B(2W) -> CL2-A(1D) sequence can never produce a signal,
-// regardless of which route would otherwise have accepted it.
+// The CL1->CL2 path validity is applied as a final gate so the forbidden
+// CL1-B(2W) -> CL2-A(1D) sequence can never produce a signal.
 // =====================
-buyModelOK = (buyHTFOK or biasCRTRouteBuy or layer1CRTRouteBuy) and buyPathValid
-sellModelOK = (sellHTFOK or biasCRTRouteSell or layer1CRTRouteSell) and sellPathValid
+buyModelOK = buyHTFOK and buyPathValid
+sellModelOK = sellHTFOK and sellPathValid
 
 finalDirection =
      buyModelOK and not sellModelOK ? "BUY" :
@@ -527,8 +329,7 @@ contextColor =
 // =====================
 // DYNAMIC MULTI-LEVEL TARGET + LAYER-2 INVALIDATION
 // -----------------------------------------------------------------------
-// Each accepted setup is now a persistent state (not just a per-bar
-// recompute):
+// Each accepted setup is a persistent state (not just a per-bar recompute):
 //   - Initial target = the CL1 candle-1 high/low (1W or 2W, whichever
 //     generated the setup).
 //   - If price breaks that initial target, the target is PROMOTED ONCE to
@@ -537,7 +338,8 @@ contextColor =
 //   - Independently of promotion, the setup is INVALIDATED the moment price
 //     breaks the active CL2 candle-1 high/low. Once invalidated, no new
 //     setup is allowed until a brand-new confirmation candle forms on that
-//     SAME CL2 leg (the lockout is direction- and timeframe-specific).
+//     SAME CL2 leg (the lockout is direction- and timeframe-specific). Only
+//     the active CL2 leg can ever invalidate — the inactive one is ignored.
 // All target levels reference Candle 1 (the last fully closed candle on
 // that timeframe) — never Candle 0, the currently forming one.
 // =====================
@@ -573,12 +375,12 @@ f_freezeLine(_ln) =>
         line.set_extend(_ln, extend.none)
         line.set_x2(_ln, bar_index)
 
-f_pushTarget(_lines, _labels, _price) =>
+f_pushTarget(_lines, _labels, _price, _col) =>
     if array.size(_lines) >= 2
         line.delete(array.shift(_lines))
         label.delete(array.shift(_labels))
-    newLine = line.new(bar_index, _price, bar_index + 1, _price, xloc=xloc.bar_index, color=targetLineColor, width=1, style=line.style_solid, extend=extend.right)
-    newLabel = label.new(bar_index, _price, text="Target", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(targetLineColor, 20), textcolor=color.white, size=size.small)
+    newLine = line.new(bar_index, _price, bar_index + 1, _price, xloc=xloc.bar_index, color=_col, width=1, style=line.style_solid, extend=extend.right)
+    newLabel = label.new(bar_index, _price, text="Target", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(_col, 20), textcolor=color.white, size=size.small)
     array.push(_lines, newLine)
     array.push(_labels, newLabel)
     [newLine, newLabel]
@@ -605,7 +407,7 @@ if barstate.isconfirmed
         else if not buyTargetPromoted and high > buyActiveTargetLevel
             f_freezeLine(buyActiveLine)
             if showTargetLines
-                [nl, nlab] = f_pushTarget(buyTargetLines, buyTargetLabels, buyActiveCL2Level)
+                [nl, nlab] = f_pushTarget(buyTargetLines, buyTargetLabels, buyActiveCL2Level, buyColor)
                 buyActiveLine := nl
                 buyActiveLabel := nlab
             buyActiveTargetLevel := buyActiveCL2Level
@@ -620,7 +422,7 @@ if barstate.isconfirmed
             buyTargetPromoted := false
             buySetupActive := true
             if showTargetLines
-                [nl2, nlab2] = f_pushTarget(buyTargetLines, buyTargetLabels, buyInitialLevel)
+                [nl2, nlab2] = f_pushTarget(buyTargetLines, buyTargetLabels, buyInitialLevel, buyColor)
                 buyActiveLine := nl2
                 buyActiveLabel := nlab2
 
@@ -648,7 +450,7 @@ if barstate.isconfirmed
         else if not sellTargetPromoted and low < sellActiveTargetLevel
             f_freezeLine(sellActiveLine)
             if showTargetLines
-                [nl3, nlab3] = f_pushTarget(sellTargetLines, sellTargetLabels, sellActiveCL2Level)
+                [nl3, nlab3] = f_pushTarget(sellTargetLines, sellTargetLabels, sellActiveCL2Level, sellColor)
                 sellActiveLine := nl3
                 sellActiveLabel := nlab3
             sellActiveTargetLevel := sellActiveCL2Level
@@ -663,7 +465,7 @@ if barstate.isconfirmed
             sellTargetPromoted := false
             sellSetupActive := true
             if showTargetLines
-                [nl4, nlab4] = f_pushTarget(sellTargetLines, sellTargetLabels, sellInitialLevel)
+                [nl4, nlab4] = f_pushTarget(sellTargetLines, sellTargetLabels, sellInitialLevel, sellColor)
                 sellActiveLine := nl4
                 sellActiveLabel := nlab4
 
@@ -707,15 +509,13 @@ sellCL1Info := sellCL1Info == "" ? "-" : sellCL1Info
 
 buyCL2Info =
      (buyL2ARaw != "-" ? layer2TFA + ": " + buyL2ARaw + " " : "") +
-     (buyL2BRaw != "-" ? layer2TFB + ": " + buyL2BRaw + " " : "") +
-     (dailyCrossWeekBuyCRT ? "CRT X-WEEK" : "")
+     (buyL2BRaw != "-" ? layer2TFB + ": " + buyL2BRaw : "")
 
 buyCL2Info := buyCL2Info == "" ? "-" : buyCL2Info
 
 sellCL2Info =
      (sellL2ARaw != "-" ? layer2TFA + ": " + sellL2ARaw + " " : "") +
-     (sellL2BRaw != "-" ? layer2TFB + ": " + sellL2BRaw + " " : "") +
-     (dailyCrossWeekSellCRT ? "CRT X-WEEK" : "")
+     (sellL2BRaw != "-" ? layer2TFB + ": " + sellL2BRaw : "")
 
 sellCL2Info := sellCL2Info == "" ? "-" : sellCL2Info
 
@@ -747,16 +547,16 @@ if showTable and barstate.islast
     f_cell(2, 1, sellBiasInfo, sellBiasOK ? sellColor : neutralColor, color.white)
 
     f_cell(0, 2, "CL1", color.black, color.white)
-    f_cell(1, 2, buyCL1Info, buyLayer1OK or biasCRTRouteBuy or layer1CRTRouteBuy ? buyColor : neutralColor, color.white)
-    f_cell(2, 2, sellCL1Info, sellLayer1OK or biasCRTRouteSell or layer1CRTRouteSell ? sellColor : neutralColor, color.white)
+    f_cell(1, 2, buyCL1Info, buyLayer1OK ? buyColor : neutralColor, color.white)
+    f_cell(2, 2, sellCL1Info, sellLayer1OK ? sellColor : neutralColor, color.white)
 
     f_cell(0, 3, "CL2", color.black, color.white)
-    f_cell(1, 3, buyCL2Info, buyLayer2OK or dailyCrossWeekBuyCRT or (layer1CRTRouteBuy and dailyC0TookC1Low) ? buyColor : neutralColor, color.white)
-    f_cell(2, 3, sellCL2Info, sellLayer2OK or dailyCrossWeekSellCRT or (layer1CRTRouteSell and dailyC0TookC1High) ? sellColor : neutralColor, color.white)
+    f_cell(1, 3, buyCL2Info, buyLayer2OK ? buyColor : neutralColor, color.white)
+    f_cell(2, 3, sellCL2Info, sellLayer2OK ? sellColor : neutralColor, color.white)
 
     f_cell(0, 4, "Target", color.black, color.white)
-    f_cell(1, 4, buyTargetInfo, buyLockedOut ? color.gray : buySetupActive ? targetLineColor : neutralColor, color.white)
-    f_cell(2, 4, sellTargetInfo, sellLockedOut ? color.gray : sellSetupActive ? targetLineColor : neutralColor, color.white)
+    f_cell(1, 4, buyTargetInfo, buyLockedOut ? color.gray : buySetupActive ? buyColor : neutralColor, color.white)
+    f_cell(2, 4, sellTargetInfo, sellLockedOut ? color.gray : sellSetupActive ? sellColor : neutralColor, color.white)
 
     f_cell(0, 5, "Context", color.black, color.white)
     f_cell(1, 5, finalDirection == "BUY" or finalDirection == "BOTH" ? finalDirection : "-", finalDirection == "BUY" or finalDirection == "BOTH" ? buyColor : neutralColor, color.white)
