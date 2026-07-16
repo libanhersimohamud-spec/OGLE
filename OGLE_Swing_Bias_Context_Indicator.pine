@@ -331,17 +331,18 @@ contextColor =
 // -----------------------------------------------------------------------
 // Each accepted setup is a persistent state (not just a per-bar recompute):
 //   - Initial target = the CL1 candle-1 high/low (1W or 2W, whichever
-//     generated the setup).
-//   - If price breaks that initial target, the target is PROMOTED ONCE to
-//     the active CL2 candle-1 high/low (1D if the path used CL2-A,
-//     2D if it used CL2-B).
-//   - Independently of promotion, the setup is INVALIDATED the moment price
-//     breaks the active CL2 candle-1 high/low. Once invalidated, no new
-//     setup is allowed until a brand-new confirmation candle forms on that
-//     SAME CL2 leg (the lockout is direction- and timeframe-specific). Only
-//     the active CL2 leg can ever invalidate — the inactive one is ignored.
-// All target levels reference Candle 1 (the last fully closed candle on
-// that timeframe) — never Candle 0, the currently forming one.
+//     generated the setup), captured ONCE at setup creation.
+//   - The active CL2 candle-1 high/low (1D if the path used CL2-A, 2D if it
+//     used CL2-B) is ALSO captured once at setup creation and held fixed —
+//     it serves both as the invalidation trigger and, once the initial
+//     target is broken, as the PROMOTED target (a single, one-time swap).
+//   - Every price level is therefore a fixed, static anchor: it is
+//     calculated once from Candle 1 (the last fully closed candle on that
+//     timeframe, never Candle 0) at the moment it becomes relevant, and is
+//     never re-read or moved afterward. Only the line's right edge (x2) and
+//     the label's x-position grow forward each bar so the line visibly
+//     reaches the current candle — the price (y) never changes except when
+//     a promotion or a brand-new setup legitimately replaces it.
 // =====================
 buyNewSetupEdge = buyModelOK and not buyModelOK[1]
 sellNewSetupEdge = sellModelOK and not sellModelOK[1]
@@ -351,6 +352,7 @@ var bool buyLockedOut = false
 var string buyLockoutCL2 = na
 var string buyActiveCL1 = na
 var string buyActiveCL2 = na
+var float buyActiveCL2Level = na
 var float buyActiveTargetLevel = na
 var bool buyTargetPromoted = false
 var line buyActiveLine = na
@@ -363,6 +365,7 @@ var bool sellLockedOut = false
 var string sellLockoutCL2 = na
 var string sellActiveCL1 = na
 var string sellActiveCL2 = na
+var float sellActiveCL2Level = na
 var float sellActiveTargetLevel = na
 var bool sellTargetPromoted = false
 var line sellActiveLine = na
@@ -387,20 +390,13 @@ if barstate.isconfirmed
         buyLockoutCL2 := na
 
     if buySetupActive
-        // Re-derive the level from the LIVE Candle-1 reference every bar —
-        // never hold a stale snapshot. Before promotion this is the active
-        // CL1's candle-1 high; after promotion (and for invalidation, always)
-        // it is the active CL2's candle-1 high.
-        buyActiveCL2Level = buyActiveCL2 == "1D" ? prevCL2AHigh : prevCL2BHigh
-        buyActiveTargetLevel := buyTargetPromoted ? buyActiveCL2Level : (buyActiveCL1 == "1W" ? prevCL1AHigh : prevCL1BHigh)
-
-        // Keep the active line/label growing to the current bar at the live level.
+        // Grow the active line/label to the current bar. The price (y) is
+        // never touched here — it stays fixed at whatever it was set to on
+        // creation or at the last promotion.
         if not na(buyActiveLine)
-            line.set_y1(buyActiveLine, buyActiveTargetLevel)
-            line.set_y2(buyActiveLine, buyActiveTargetLevel)
             line.set_x2(buyActiveLine, bar_index)
         if not na(buyActiveLabel)
-            label.set_xy(buyActiveLabel, bar_index, buyActiveTargetLevel)
+            label.set_x(buyActiveLabel, bar_index)
 
         if high > buyActiveCL2Level
             buySetupActive := false
@@ -409,6 +405,7 @@ if barstate.isconfirmed
             buyActiveLine := na
             buyActiveLabel := na
             buyActiveTargetLevel := na
+            buyActiveCL2Level := na
             buyTargetPromoted := false
             buyActiveCL1 := na
             buyActiveCL2 := na
@@ -422,9 +419,11 @@ if barstate.isconfirmed
 
     if not buyLockedOut and not buySetupActive and buyNewSetupEdge
         buyInitialLevel = generatingCL1Buy == "1W" ? prevCL1AHigh : generatingCL1Buy == "2W" ? prevCL1BHigh : na
-        if not na(buyInitialLevel)
+        buyInitialCL2Level = activeCL2Buy == "1D" ? prevCL2AHigh : activeCL2Buy == "2D" ? prevCL2BHigh : na
+        if not na(buyInitialLevel) and not na(buyInitialCL2Level)
             buyActiveCL1 := generatingCL1Buy
             buyActiveCL2 := activeCL2Buy
+            buyActiveCL2Level := buyInitialCL2Level
             buyActiveTargetLevel := buyInitialLevel
             buyTargetPromoted := false
             buySetupActive := true
@@ -439,15 +438,10 @@ if barstate.isconfirmed
         sellLockoutCL2 := na
 
     if sellSetupActive
-        sellActiveCL2Level = sellActiveCL2 == "1D" ? prevCL2ALow : prevCL2BLow
-        sellActiveTargetLevel := sellTargetPromoted ? sellActiveCL2Level : (sellActiveCL1 == "1W" ? prevCL1ALow : prevCL1BLow)
-
         if not na(sellActiveLine)
-            line.set_y1(sellActiveLine, sellActiveTargetLevel)
-            line.set_y2(sellActiveLine, sellActiveTargetLevel)
             line.set_x2(sellActiveLine, bar_index)
         if not na(sellActiveLabel)
-            label.set_xy(sellActiveLabel, bar_index, sellActiveTargetLevel)
+            label.set_x(sellActiveLabel, bar_index)
 
         if low < sellActiveCL2Level
             sellSetupActive := false
@@ -456,6 +450,7 @@ if barstate.isconfirmed
             sellActiveLine := na
             sellActiveLabel := na
             sellActiveTargetLevel := na
+            sellActiveCL2Level := na
             sellTargetPromoted := false
             sellActiveCL1 := na
             sellActiveCL2 := na
@@ -469,9 +464,11 @@ if barstate.isconfirmed
 
     if not sellLockedOut and not sellSetupActive and sellNewSetupEdge
         sellInitialLevel = generatingCL1Sell == "1W" ? prevCL1ALow : generatingCL1Sell == "2W" ? prevCL1BLow : na
-        if not na(sellInitialLevel)
+        sellInitialCL2Level = activeCL2Sell == "1D" ? prevCL2ALow : activeCL2Sell == "2D" ? prevCL2BLow : na
+        if not na(sellInitialLevel) and not na(sellInitialCL2Level)
             sellActiveCL1 := generatingCL1Sell
             sellActiveCL2 := activeCL2Sell
+            sellActiveCL2Level := sellInitialCL2Level
             sellActiveTargetLevel := sellInitialLevel
             sellTargetPromoted := false
             sellSetupActive := true
