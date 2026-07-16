@@ -31,7 +31,8 @@
 // Inputs
 //======================================================================
 input group "Risk Management"
-input double InpRiskPercent          = 1.0;     // Risk per trade (% of account balance)
+input double InpRiskPercent          = 1.0;     // Risk per trade (% of the FIXED reference balance below)
+input double InpFixedRiskBalance     = 0;       // Reference balance for risk sizing (0 = use balance at EA start; never updated after that, so no compounding)
 input long   InpMagicNumber          = 20260716; // Magic number
 input int    InpSlippagePoints       = 20;       // Max slippage (points)
 
@@ -90,7 +91,7 @@ struct SSignalState
    double   entryPrice;      // actual fill price (CTrade::ResultPrice)
    double   slPrice;
    double   tpPrice;
-   double   riskAmount;      // $ risked on this trade (balance * risk% at entry)
+   double   riskAmount;      // $ risked on this trade (fixed reference balance * risk%, not live balance)
    double   lots;
    int      tradeSeqToday;   // 1st or 2nd trade of the day for this direction
    double   balanceBeforeEntry;
@@ -157,6 +158,8 @@ datetime g_lastResetDay = 0;
 double   g_prevMid      = 0.0;   // previous tick's mid price, for level-crossing detection
 bool     g_havePrevMid  = false;
 int      g_logHandle    = INVALID_HANDLE;
+double   g_riskBalance  = 0.0;   // frozen once in OnInit; every trade's risk% is % of THIS, not of
+                                  // the live/current balance, so wins/losses never change position size
 
 //======================================================================
 // Candle helpers — off is the "just-closed bar" offset described above
@@ -510,8 +513,8 @@ void TryOpen(bool isSell, SSignalState &st)
       return;
    }
 
-   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmount = balance * InpRiskPercent / 100.0;
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);   // for the journal only — not used for sizing
+   double riskAmount = g_riskBalance * InpRiskPercent / 100.0; // fixed reference balance — no compounding
    double lots = CalcLotSize(dist, riskAmount);
    if(lots <= 0)
       return;
@@ -751,6 +754,11 @@ int OnInit()
    g_lastResetDay = 0;
    g_prevMid      = 0.0;
    g_havePrevMid  = false;
+
+   // Freeze the risk-sizing reference balance once, here, so it can never
+   // drift with wins/losses (no compounding). InpFixedRiskBalance = 0 means
+   // "use whatever the account balance is right now, at EA start."
+   g_riskBalance = (InpFixedRiskBalance > 0) ? InpFixedRiskBalance : AccountInfoDouble(ACCOUNT_BALANCE);
 
    if(InpEnableTradeLog)
    {
