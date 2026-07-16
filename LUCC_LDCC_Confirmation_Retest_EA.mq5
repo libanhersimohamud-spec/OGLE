@@ -45,6 +45,10 @@ input int    InpSummerEndHour        = 18;    // Session end,   Nairobi time, su
 input int    InpWinterStartHour      = 5;     // Session start, Nairobi time, winter months
 input int    InpWinterEndHour        = 19;    // Session end,   Nairobi time, winter months
 
+input group "Trade Journal"
+input bool   InpEnableTradeLog       = true;                          // Write a per-trade CSV log
+input string InpTradeLogFileName     = "LUCC_LDCC_TradeLog.csv";      // File name (MQL5/Files)
+
 //======================================================================
 // Constants (indicator logic parameters — preserved exactly, not
 // exposed as inputs, so optimization can never alter the signal rules)
@@ -71,6 +75,18 @@ struct SSignalState
    long     positionId;
    int      tradesToday;
    bool     doneToday;   // true once a trade in this direction has won today
+
+   // --- trade journal state (filled in TryOpen, consumed in HandlePositionClosed) ---
+   datetime entryTime;
+   double   entryPrice;      // actual fill price (CTrade::ResultPrice)
+   double   slPrice;
+   double   tpPrice;
+   double   riskAmount;      // $ risked on this trade (balance * risk% at entry)
+   double   lots;
+   int      tradeSeqToday;   // 1st or 2nd trade of the day for this direction
+   double   balanceBeforeEntry;
+   double   mfePrice;        // best price reached while the position was open
+   double   maePrice;        // worst price reached while the position was open
 };
 
 SSignalState g_sell;   // SELL side, driven by the Bullish LUCC
@@ -81,6 +97,7 @@ datetime g_lastBarTime  = 0;
 datetime g_lastResetDay = 0;
 double   g_prevMid      = 0.0;   // previous tick's mid price, for level-crossing detection
 bool     g_havePrevMid  = false;
+int      g_logHandle    = INVALID_HANDLE;
 
 //======================================================================
 // Candle helpers — off is the "just-closed bar" offset described above
@@ -241,6 +258,30 @@ void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double
 }
 
 //+------------------------------------------------------------------+
+//| Tracks Maximum Favorable/Adverse Excursion while a position is    |
+//| open — the best and worst price the market reached before the    |
+//| trade closed. Logged in R-multiples alongside the realized R so  |
+//| you can see, e.g., "lost trades that were briefly +0.6R" (a       |
+//| trailing-stop candidate) vs. "losses that went straight to -1R".  |
+//+------------------------------------------------------------------+
+void UpdateExcursion(bool isSell, SSignalState &st, double bid, double ask)
+{
+   if(!st.positionOpen)
+      return;
+
+   if(isSell)
+   {
+      st.mfePrice = MathMin(st.mfePrice, bid); // lower price = more favorable for a sell
+      st.maePrice = MathMax(st.maePrice, ask); // higher price = more adverse for a sell
+   }
+   else
+   {
+      st.mfePrice = MathMax(st.mfePrice, ask);
+      st.maePrice = MathMin(st.maePrice, bid);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Nairobi (EAT, UTC+3, no DST) session handling                    |
 //+------------------------------------------------------------------+
 
@@ -330,15 +371,12 @@ void CheckDailyReset()
 
 //+------------------------------------------------------------------+
 //| Position sizing — fixed risk only, no compounding.                |
-//| lots = (balance * risk%) / (SL distance expressed in money/lot)   |
+//| lots = riskAmount / (SL distance expressed in money/lot)          |
 //+------------------------------------------------------------------+
-double CalcLotSize(double slDistance)
+double CalcLotSize(double slDistance, double riskAmount)
 {
-   if(slDistance <= 0)
+   if(slDistance <= 0 || riskAmount <= 0)
       return 0.0;
-
-   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmount = balance * InpRiskPercent / 100.0;
 
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -412,7 +450,9 @@ void TryOpen(bool isSell, SSignalState &st)
       return;
    }
 
-   double lots = CalcLotSize(dist);
+   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount = balance * InpRiskPercent / 100.0;
+   double lots = CalcLotSize(dist, riskAmount);
    if(lots <= 0)
       return;
 
@@ -430,6 +470,20 @@ void TryOpen(bool isSell, SSignalState &st)
       ulong dealTicket = g_trade.ResultDeal();
       if(HistoryDealSelect(dealTicket))
          st.positionId = (long)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+
+      // Trade journal: snapshot everything the position was opened with, so
+      // the eventual close event can log a complete, self-contained record.
+      double fillPrice      = g_trade.ResultPrice();
+      st.entryTime          = TimeCurrent();
+      st.entryPrice         = (fillPrice > 0) ? fillPrice : entry;
+      st.slPrice             = sl;
+      st.tpPrice              = tp;
+      st.riskAmount           = riskAmount;
+      st.lots                 = lots;
+      st.tradeSeqToday        = st.tradesToday;
+      st.balanceBeforeEntry   = balance;
+      st.mfePrice             = st.entryPrice;
+      st.maePrice             = st.entryPrice;
    }
    else
    {
@@ -452,17 +506,88 @@ void ProcessNewBar()
 }
 
 //+------------------------------------------------------------------+
-//| A direction's open position just closed — record win/loss.       |
+//| Trade journal — one CSV row per closed trade.                     |
+//+------------------------------------------------------------------+
+string CsvEscape(string s)
+{
+   StringReplace(s, ",", ";");
+   return s;
+}
+
+void WriteTradeLogHeader()
+{
+   FileWrite(g_logHandle,
+      "Direction", "PositionID",
+      "RefCandleTime", "RefHigh", "RefLow",
+      "CCTime", "RCTime_TouchTime",
+      "EntryTime", "EntryPrice", "SL", "TP",
+      "RiskPercent", "RiskAmount", "Lots", "TradeSeqToday",
+      "NairobiDate", "NairobiWeekday", "NairobiHour",
+      "ExitTime", "ExitPrice", "ExitReason",
+      "GrossProfit", "Commission", "Swap", "NetProfit",
+      "R_Realized", "MFE_R", "MAE_R",
+      "HoldingMinutes", "BalanceBefore", "BalanceAfter");
+}
+
+// isSell only affects the header meaning of MFE/MAE relative to entry;
+// everything else is read straight off the state snapshotted in TryOpen
+// and the close-deal details passed in from OnTradeTransaction.
+void WriteTradeLogRow(bool isSell, const SSignalState &st, long posId,
+                       datetime exitTime, double exitPrice, string exitReason,
+                       double grossProfit, double commission, double swap)
+{
+   if(g_logHandle == INVALID_HANDLE)
+      return;
+
+   double netProfit    = grossProfit + commission + swap;
+   double riskDistance = MathAbs(st.entryPrice - st.slPrice);
+   double rRealized    = (st.riskAmount > 0) ? netProfit / st.riskAmount : 0.0;
+   double mfeR          = (riskDistance > 0) ? MathAbs(st.entryPrice - st.mfePrice) / riskDistance : 0.0;
+   double maeR           = (riskDistance > 0) ? MathAbs(st.entryPrice - st.maePrice) / riskDistance : 0.0;
+   double holdingMinutes  = (double)(exitTime - st.entryTime) / 60.0;
+   double balanceAfter    = st.balanceBeforeEntry + netProfit;
+
+   datetime nairobiEntry = GetNairobiTime(st.entryTime);
+   MqlDateTime dt;
+   TimeToStruct(nairobiEntry, dt);
+   string weekdayNames[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+   string nairobiDate = StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day);
+
+   FileWrite(g_logHandle,
+      isSell ? "SELL" : "BUY", (string)posId,
+      TimeToString(st.refTime, TIME_DATE|TIME_MINUTES), DoubleToString(st.refHigh, _Digits), DoubleToString(st.refLow, _Digits),
+      TimeToString(st.ccTime, TIME_DATE|TIME_MINUTES), TimeToString(st.rcTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS),
+      TimeToString(st.entryTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(st.entryPrice, _Digits),
+      DoubleToString(st.slPrice, _Digits), DoubleToString(st.tpPrice, _Digits),
+      DoubleToString(InpRiskPercent, 2), DoubleToString(st.riskAmount, 2), DoubleToString(st.lots, 2), (string)st.tradeSeqToday,
+      nairobiDate, weekdayNames[dt.day_of_week], (string)dt.hour,
+      TimeToString(exitTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(exitPrice, _Digits), CsvEscape(exitReason),
+      DoubleToString(grossProfit, 2), DoubleToString(commission, 2), DoubleToString(swap, 2), DoubleToString(netProfit, 2),
+      DoubleToString(rRealized, 3), DoubleToString(mfeR, 3), DoubleToString(maeR, 3),
+      DoubleToString(holdingMinutes, 1), DoubleToString(st.balanceBeforeEntry, 2), DoubleToString(balanceAfter, 2));
+   FileFlush(g_logHandle);
+}
+
+//+------------------------------------------------------------------+
+//| A direction's open position just closed — record win/loss and    |
+//| write the full trade-journal row.                                 |
 //| "Win" = closed net profit (profit + swap + commission) > 0.       |
 //+------------------------------------------------------------------+
-void HandlePositionClosed(SSignalState &st, long closedPosId, double profit)
+void HandlePositionClosed(bool isSell, SSignalState &st, long closedPosId,
+                           datetime exitTime, double exitPrice, string exitReason,
+                           double grossProfit, double commission, double swap)
 {
    if(!st.positionOpen || st.positionId != closedPosId)
       return;
 
+   double netProfit = grossProfit + commission + swap;
+
+   if(InpEnableTradeLog)
+      WriteTradeLogRow(isSell, st, closedPosId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
+
    st.positionOpen = false;
    st.positionId   = 0;
-   if(profit > 0)
+   if(netProfit > 0)
       st.doneToday = true; // a win ends this direction's trading for the day
 }
 
@@ -479,11 +604,25 @@ int OnInit()
    g_lastResetDay = 0;
    g_prevMid      = 0.0;
    g_havePrevMid  = false;
+
+   if(InpEnableTradeLog)
+   {
+      g_logHandle = FileOpen(InpTradeLogFileName, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+      if(g_logHandle == INVALID_HANDLE)
+         PrintFormat("LUCC/LDCC EA: could not open trade log '%s', error=%d", InpTradeLogFileName, GetLastError());
+      else
+         WriteTradeLogHeader();
+   }
    return(INIT_SUCCEEDED);
 }
 
 void OnDeinit(const int reason)
 {
+   if(g_logHandle != INVALID_HANDLE)
+   {
+      FileClose(g_logHandle);
+      g_logHandle = INVALID_HANDLE;
+   }
 }
 
 void OnTick()
@@ -498,13 +637,16 @@ void OnTick()
       ProcessNewBar();
    }
 
-   // Tick-by-tick part: RC detection and immediate execution.
+   // Tick-by-tick part: RC detection/execution, plus MFE/MAE tracking on
+   // whichever direction currently has an open position.
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mid = (bid + ask) / 2.0;
 
    MonitorRetest(true,  g_sell, bid, ask, mid);
    MonitorRetest(false, g_buy,  bid, ask, mid);
+   UpdateExcursion(true,  g_sell, bid, ask);
+   UpdateExcursion(false, g_buy,  bid, ask);
 
    g_prevMid     = mid;
    g_havePrevMid = true;
@@ -525,12 +667,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(entryType != DEAL_ENTRY_OUT && entryType != DEAL_ENTRY_OUT_BY)
       return;
 
-   long   posId  = (long)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
-   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
-                 + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
-                 + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   long     posId       = (long)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   datetime exitTime      = (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
+   double   exitPrice      = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   string   exitReason      = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+   double   grossProfit      = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+   double   commission        = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   double   swap               = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
 
-   HandlePositionClosed(g_sell, posId, profit);
-   HandlePositionClosed(g_buy,  posId, profit);
+   HandlePositionClosed(true,  g_sell, posId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
+   HandlePositionClosed(false, g_buy,  posId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
 }
 //+------------------------------------------------------------------+
