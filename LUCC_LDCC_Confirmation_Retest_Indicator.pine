@@ -418,10 +418,16 @@ rawDir1D = f_resolveDir(buyTxt1D, sellTxt1D)
 // -----------------------------------------------------------------------------
 var string bias1DDir     = "NONE"
 var string bias1DPattern = "-"   // which pattern(s) produced the active Bias, e.g. "BC ", "DC BSB "
+var string bias1DTF      = "-"   // the timeframe that produced the active Bias (always the 1D engine here)
 var float  bias1DHigh    = na
 var float  bias1DLow     = na
 var bool   bias1DInvalid = false
 var int    lastC1Time1D  = na
+
+// The bias engine evaluates exactly one timeframe (Daily). This is the human-
+// readable label shown in the "Bias Timeframe" table row so it is always
+// unambiguous which timeframe produced the pattern shown alongside it.
+BIAS_TF_LABEL = "1D (Daily)"
 
 // (Re)selection — only when the Daily Candle 1 reference itself changes to
 // a genuinely new bar (confirmed bars only, non-repainting, matching the
@@ -435,6 +441,11 @@ if barstate.isconfirmed
         bias1DInvalid := false
         bias1DDir     := rawDir1D
         bias1DPattern := rawDir1D == "BUY" ? buyTxt1D : rawDir1D == "SELL" ? sellTxt1D : "-"
+        // Bind the reported timeframe to the SAME (re)selection that sets the
+        // pattern above, so the "Bias Timeframe" and "Bias Pattern" rows can
+        // never disagree — the pattern shown is always the one this timeframe
+        // produced on this Bias candle.
+        bias1DTF      := rawDir1D != "NONE" ? BIAS_TF_LABEL : "-"
         bias1DHigh    := rawDir1D != "NONE" ? c1High1D : na
         bias1DLow     := rawDir1D != "NONE" ? c1Low1D  : na
 
@@ -470,7 +481,7 @@ plotshape(buyTradeConfirmed,  title = "Buy CONFIRMED (Bias-aligned)",  style = s
 // (LDCC) are shown as separate rows since both run independently and can
 // be active — or not — at the same time.
 // -----------------------------------------------------------------------------
-var table biasTable = table.new(position.top_right, 2, 7, border_width = 1)
+var table biasTable = table.new(position.top_right, 2, 8, border_width = 1)
 
 f_biasCell(_r, _label, _value, _bg) =>
     table.cell(biasTable, 0, _r, _label, bgcolor = color.black, text_color = color.white, text_size = size.small)
@@ -491,10 +502,15 @@ if showBiasTable and barstate.islast
     sellTargetStr = not na(luccLow)  ? str.tostring(luccLow, format.mintick)  : "-"
     buyTargetStr  = not na(ldccHigh) ? str.tostring(ldccHigh, format.mintick) : "-"
 
+    // Rows 0-3 are the self-contained Bias summary: Direction, the exact
+    // Timeframe that produced it, the Pattern that timeframe generated, and
+    // whether it is still ACTIVE. Timeframe and Pattern are frozen together at
+    // (re)selection, so the pattern always belongs to the timeframe shown.
     f_biasCell(0, "Bias Direction", bias1DDir, bias1DColor)
-    f_biasCell(1, "Bias Pattern",   bias1DPattern, bias1DColor)
-    f_biasCell(2, "Bias Status",    bias1DDir == "NONE" ? "-" : bias1DInvalid ? "INVALIDATED" : "ACTIVE", bias1DColor)
-    f_biasCell(3, "Sell CC Time",   sellCcTimeStr, not na(ccBarSell) ? color.red : neutralBg)
-    f_biasCell(4, "Sell Target",    sellTargetStr, not na(ccBarSell) ? color.red : neutralBg)
-    f_biasCell(5, "Buy CC Time",    buyCcTimeStr, not na(ccBarBuy) ? color.green : neutralBg)
-    f_biasCell(6, "Buy Target",     buyTargetStr, not na(ccBarBuy) ? color.green : neutralBg)
+    f_biasCell(1, "Bias Timeframe", bias1DDir == "NONE" ? "-" : bias1DTF, bias1DColor)
+    f_biasCell(2, "Bias Pattern",   bias1DPattern, bias1DColor)
+    f_biasCell(3, "Bias Status",    bias1DDir == "NONE" ? "-" : bias1DInvalid ? "INVALIDATED" : "ACTIVE", bias1DColor)
+    f_biasCell(4, "Sell CC Time",   sellCcTimeStr, not na(ccBarSell) ? color.red : neutralBg)
+    f_biasCell(5, "Sell Target",    sellTargetStr, not na(ccBarSell) ? color.red : neutralBg)
+    f_biasCell(6, "Buy CC Time",    buyCcTimeStr, not na(ccBarBuy) ? color.green : neutralBg)
+    f_biasCell(7, "Buy Target",     buyTargetStr, not na(ccBarBuy) ? color.green : neutralBg)
