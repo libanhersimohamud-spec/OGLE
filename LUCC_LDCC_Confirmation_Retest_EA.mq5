@@ -145,8 +145,10 @@ struct SPendingLog
    double   grossProfit;
    double   commission;
    double   swap;
-   double   mfePrice;   // continues updating past the actual exit, until trackUntil
-   double   maePrice;
+   double   mfePriceAtClose; // frozen the instant the REAL position closed — the only
+   double   maePriceAtClose; // valid basis for "when to move to breakeven" questions
+   double   mfePrice;        // continues updating past the actual exit, until trackUntil —
+   double   maePrice;        // answers "how far could price have run", NOT "in-trade excursion"
    datetime trackUntil;
 };
 
@@ -635,7 +637,7 @@ void WriteTradeLogHeader()
       "NairobiDate", "NairobiWeekday", "NairobiHour",
       "ExitTime", "ExitPrice", "ExitReason",
       "GrossProfit", "Commission", "Swap", "NetProfit",
-      "R_Realized", "MFE_R", "MAE_R",
+      "R_Realized", "MFE_R_InTrade", "MAE_R_InTrade", "MFE_R_Extended", "MAE_R_Extended",
       "ExcursionWindowHours", "ExcursionComplete",
       "HoldingMinutes", "BalanceBefore", "BalanceAfter");
 }
@@ -672,6 +674,13 @@ void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
    g_pending[n].grossProfit        = grossProfit;
    g_pending[n].commission         = commission;
    g_pending[n].swap               = swap;
+   // st.mfePrice/maePrice are still exactly as they were the instant the
+   // real position closed (UpdateExcursion only touches them while
+   // positionOpen is true, and this runs before that flag flips below) —
+   // freeze that as the true in-trade figure before extended tracking
+   // carries the mfePrice/maePrice fields further past the actual exit.
+   g_pending[n].mfePriceAtClose    = st.mfePrice;
+   g_pending[n].maePriceAtClose    = st.maePrice;
    g_pending[n].mfePrice           = st.mfePrice;
    g_pending[n].maePrice           = st.maePrice;
 
@@ -687,8 +696,14 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
    double netProfit    = p.grossProfit + p.commission + p.swap;
    double riskDistance = MathAbs(p.entryPrice - p.slPrice);
    double rRealized    = (p.riskAmount > 0) ? netProfit / p.riskAmount : 0.0;
-   double mfeR          = (riskDistance > 0) ? MathAbs(p.entryPrice - p.mfePrice) / riskDistance : 0.0;
-   double maeR           = (riskDistance > 0) ? MathAbs(p.entryPrice - p.maePrice) / riskDistance : 0.0;
+   // In-trade: excursion while the real position was actually open — the
+   // only valid basis for "what R would a breakeven-stop / trailing rule
+   // have triggered on". Extended: keeps tracking past the real exit, for
+   // "how far could price have run" / target-selection questions only.
+   double mfeRInTrade   = (riskDistance > 0) ? MathAbs(p.entryPrice - p.mfePriceAtClose) / riskDistance : 0.0;
+   double maeRInTrade    = (riskDistance > 0) ? MathAbs(p.entryPrice - p.maePriceAtClose) / riskDistance : 0.0;
+   double mfeRExtended     = (riskDistance > 0) ? MathAbs(p.entryPrice - p.mfePrice) / riskDistance : 0.0;
+   double maeRExtended      = (riskDistance > 0) ? MathAbs(p.entryPrice - p.maePrice) / riskDistance : 0.0;
    double holdingMinutes  = (double)(p.exitTime - p.entryTime) / 60.0;
    double balanceAfter    = p.balanceBeforeEntry + netProfit;
 
@@ -708,7 +723,9 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
       nairobiDate, weekdayNames[dt.day_of_week], (string)dt.hour,
       TimeToString(p.exitTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(p.exitPrice, _Digits), CsvEscape(p.exitReason),
       DoubleToString(p.grossProfit, 2), DoubleToString(p.commission, 2), DoubleToString(p.swap, 2), DoubleToString(netProfit, 2),
-      DoubleToString(rRealized, 3), DoubleToString(mfeR, 3), DoubleToString(maeR, 3),
+      DoubleToString(rRealized, 3),
+      DoubleToString(mfeRInTrade, 3), DoubleToString(maeRInTrade, 3),
+      DoubleToString(mfeRExtended, 3), DoubleToString(maeRExtended, 3),
       (string)InpExcursionTrackingHours, windowComplete ? "true" : "false",
       DoubleToString(holdingMinutes, 1), DoubleToString(p.balanceBeforeEntry, 2), DoubleToString(balanceAfter, 2));
    FileFlush(g_logHandle);
