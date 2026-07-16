@@ -234,6 +234,9 @@ long g_rejMinStop    = 0;
 long g_rejLots       = 0;
 long g_rejOrderFail  = 0;
 
+bool g_lastSessionOpen  = false;  // for logging session OPEN/closed transitions
+bool g_haveSessionState = false;
+
 // Detailed accept/reject trace to the Experts log, gated by InpDebugLog.
 void Dbg(const string msg)
 {
@@ -606,6 +609,15 @@ void CheckDailyReset()
 
    if(today != g_lastResetDay)
    {
+      // Once-a-day progress heartbeat so the funnel is visible DURING the run,
+      // not only at the end — refs/CCs/touches/entries so far, plus the live
+      // Weekly-bias state that is currently gating entries.
+      if(g_lastResetDay != 0)
+         Dbg(StringFormat("DAY %04d.%02d.%02d | funnel refs=%d CCs=%d touches=%d entries=%d | bias dir=%s buy=[%s]%s sell=[%s]%s",
+                          dt.year, dt.mon, dt.day, g_cntRef, g_cntCc, g_cntTouch, g_cntEntries, g_bias.dir,
+                          g_bias.buyText,  g_bias.buyInvalid  ? " INVALID" : "",
+                          g_bias.sellText, g_bias.sellInvalid ? " INVALID" : ""));
+
       g_lastResetDay = today;
       g_sell.tradesToday = 0; g_sell.doneToday = false;
       g_buy.tradesToday  = 0; g_buy.doneToday  = false;
@@ -1436,6 +1448,11 @@ void UpdatePanel()
 
    PanelSet(11, StringFormat("Risk %.2f%% of %.2f = %.2f",
             InpRiskPercent, g_riskBalance, g_riskBalance * InpRiskPercent / 100.0), clrGainsboro);
+
+   // Without this the panel text does not reliably repaint between ticks in the
+   // Strategy Tester visualization, so it can look frozen (e.g. Session stuck
+   // on one value) even though the underlying state is updating every tick.
+   ChartRedraw();
 }
 
 void DestroyPanel()
@@ -1538,6 +1555,19 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    CheckDailyReset();
+
+   // Log every session OPEN/closed flip once, so the Experts log proves the
+   // Nairobi window is actually opening (and when) rather than staying shut.
+   bool sessionOpen = IsWithinSession();
+   if(!g_haveSessionState || sessionOpen != g_lastSessionOpen)
+   {
+      MqlDateTime ns; TimeToStruct(GetNairobiTime(TimeCurrent()), ns);
+      Dbg(StringFormat("SESSION -> %s  (Nairobi %02d:%02d, server %s)",
+                       sessionOpen ? "OPEN" : "closed", ns.hour, ns.min,
+                       TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES)));
+      g_lastSessionOpen  = sessionOpen;
+      g_haveSessionState = true;
+   }
 
    // Closed-bar part: reference-candle (re)selection and CC detection.
    datetime curBarTime = iTime(_Symbol, PERIOD_H1, 0);
