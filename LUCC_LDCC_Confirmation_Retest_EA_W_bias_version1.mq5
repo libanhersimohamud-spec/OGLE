@@ -59,7 +59,8 @@ input int    InpWinterEndHour        = 19;    // Session end,   Nairobi time, wi
 
 input group "Trade Journal"
 input bool   InpEnableTradeLog       = true;                          // Write a per-trade CSV log
-input string InpTradeLogFileName     = "LUCC_LDCC_TradeLog.csv";      // File name (MQL5/Files)
+input string InpTradeLogFileName     = "LUCC_LDCC_TradeLog.csv";      // Per-trade CSV file (MQL5/Files)
+input string InpWeeklyStatsFileName  = "LUCC_LDCC_WeeklyStats.csv";   // Per-week summary CSV (MQL5/Files)
 input bool   InpEnableExcursionTracking = true;  // Keep watching price past the actual exit for true MFE/MAE
 input int    InpExcursionTrackingHours  = 120;   // Hours from ENTRY to keep tracking (uncapped by SL/TP)
 
@@ -67,8 +68,10 @@ input group "1W Bias Filter"
 input bool   InpUseBiasFilter        = true;  // Gate entries on the Weekly (1W) directional bias
 
 input group "Filters (isolation / debugging)"
-input bool   InpUseSessionFilter     = true;  // Require setups AND entries inside the Nairobi session
-                                               // (turn OFF to test the raw entry engine with no time gate)
+// NOTE: the trading-session gate has been REMOVED in this version — every valid
+// setup is taken regardless of session (data-collection mode). Session/UTC are
+// still COMPUTED and LOGGED per trade for later analysis, just never used to
+// block a trade or a reference candle.
 input bool   InpUseBarCloseRetest    = true;  // Detect the retest on bar close too (range brackets the
                                                // level), not only tick-by-tick — REQUIRED for entries in
                                                // the tester's "Open prices"/"1 min OHLC" modes
@@ -85,7 +88,7 @@ input color  InpPanelBackColor       = C'18,18,22';  // Panel background color
 // Constants (indicator logic parameters — preserved exactly, not
 // exposed as inputs, so optimization can never alter the signal rules)
 //======================================================================
-#define LOOKBACK 24   // rolling window: only the latest 24 closed candles are ever searched
+#define LOOKBACK 120   // rolling window: only the latest 120 closed candles are ever searched
 
 //======================================================================
 // Per-direction signal + trade-management state
@@ -149,6 +152,9 @@ struct SSignalState
    string   journalBiasSellText;   // full Weekly sell-pattern text at entry
    string   journalSideBiasText;   // Weekly bias text for THIS trade's side (what authorized it)
    datetime journalBiasCandleTime; // Weekly candle-1 time the bias was read from
+   double   journalEquityBefore;   // account equity at entry
+   double   journalWeekO, journalWeekH, journalWeekL, journalWeekC; // Weekly candle-1 OHLC (bias ref)
+   double   journalDayO,  journalDayH,  journalDayL,  journalDayC;  // previous Daily candle OHLC (context)
 };
 
 SSignalState g_sell;   // SELL side, driven by the Bullish LUCC
@@ -200,6 +206,9 @@ struct SPendingLog
    string   biasSellText;
    string   sideBiasText;
    datetime biasCandleTime;
+   double   equityBefore;
+   double   weekO, weekH, weekL, weekC;
+   double   dayO,  dayH,  dayL,  dayC;
 };
 
 SPendingLog g_pending[];
@@ -227,7 +236,6 @@ long g_cntEntries    = 0;   // orders actually sent OK
 long g_rejPosOpen    = 0;
 long g_rejDoneToday  = 0;
 long g_rejMaxTrades  = 0;
-long g_rejSession    = 0;
 long g_rejBias       = 0;
 long g_rejSlInvalid  = 0;
 long g_rejMinStop    = 0;
@@ -278,11 +286,9 @@ int GetMaxBack()
 //| (isSell=false) candidate in the last LOOKBACK closed candles.    |
 //| Exact mirror of the indicator's scan: qualification (bullish/    |
 //| bearish + breakout), PROTECTED filter, then the shared NOT        |
-//| CONTAINED range-containment filter — PLUS a session gate: a       |
-//| candidate whose own bar didn't open within the trading window     |
-//| is skipped outright, so it can never become a reference candle,   |
-//| never spawn a CC/RC cycle, and never waste a retest that would    |
-//| just get rejected later at entry anyway. Returns -1 if none found.|
+//| CONTAINED range-containment filter. (The session gate that used   |
+//| to skip off-hours candidates has been removed — every valid setup |
+//| is now eligible regardless of session.) Returns -1 if none found. |
 //+------------------------------------------------------------------+
 int FindReferenceOffset(bool isSell)
 {
@@ -296,8 +302,6 @@ int FindReferenceOffset(bool isSell)
          ? (IsBullish(i) && BarClose(i) > BarHigh(i + 1))
          : (IsBearish(i) && BarClose(i) < BarLow(i + 1));
       if(!qualifies)
-         continue;
-      if(!IsBarWithinSession(BarTime(i)))
          continue;
 
       bool valid = true;
@@ -577,23 +581,11 @@ bool IsNairobiTimeWithinSession(datetime nairobiTime)
    return (nowMin >= startMin && nowMin < endMin);
 }
 
+// Informational only now (never gates a trade): used by the info panel and the
+// session-transition log, and to tag each trade with the session it fell in.
 bool IsWithinSession()
 {
-   if(!InpUseSessionFilter)
-      return true;
    return IsNairobiTimeWithinSession(GetNairobiTime(TimeCurrent()));
-}
-
-// Was the H1 bar that opened at barServerTime within the session window?
-// Used to keep LUCC/LDCC candidates that formed outside your trading
-// hours from ever being selected as a reference candle in the first
-// place (see FindReferenceOffset), rather than only blocking the final
-// entry after a whole cycle has already played out on an off-hours setup.
-bool IsBarWithinSession(datetime barServerTime)
-{
-   if(!InpUseSessionFilter)
-      return true;
-   return IsNairobiTimeWithinSession(GetNairobiTime(barServerTime));
 }
 
 // Resets both directions' daily trade counters at the start of each new
@@ -879,13 +871,7 @@ bool TryOpen(bool isSell, SSignalState &st)
    { g_rejDoneToday++; Dbg(side + " retest REJECT: this side already booked a win today (doneToday)"); return false; }
    if(st.tradesToday >= 2)
    { g_rejMaxTrades++; Dbg(side + " retest REJECT: daily 2-trade limit reached"); return false; }
-   if(!IsWithinSession())
-   {
-      g_rejSession++;
-      MqlDateTime nd; TimeToStruct(GetNairobiTime(TimeCurrent()), nd);
-      Dbg(StringFormat("%s retest REJECT: out of session (Nairobi %02d:%02d)", side, nd.hour, nd.min));
-      return false;
-   }
+   // (Session gate removed — every valid setup is taken regardless of session.)
 
    // 1W bias gate — a Retest Candle only becomes an actionable entry if the
    // Weekly bias currently supports this direction and hasn't been invalidated.
@@ -1011,6 +997,10 @@ bool TryOpen(bool isSell, SSignalState &st)
       st.journalBiasSellText   = g_bias.sellText;
       st.journalSideBiasText   = isSell ? g_bias.sellText : g_bias.buyText;
       st.journalBiasCandleTime = g_bias.c1Time;
+      st.journalEquityBefore   = AccountInfoDouble(ACCOUNT_EQUITY);
+      st.journalWeekO = WOpen(1); st.journalWeekH = WHigh(1); st.journalWeekL = WLow(1); st.journalWeekC = WClose(1);
+      st.journalDayO  = iOpen(_Symbol, PERIOD_D1, 1); st.journalDayH = iHigh(_Symbol, PERIOD_D1, 1);
+      st.journalDayL  = iLow(_Symbol, PERIOD_D1, 1);  st.journalDayC = iClose(_Symbol, PERIOD_D1, 1);
 
       g_cntEntries++;
       Dbg(StringFormat("%s ENTRY OK: fill=%.5f sl=%.5f tp=%.5f lots=%.2f risk=%.2f  bias[%s]",
@@ -1115,7 +1105,14 @@ void WriteTradeLogHeader()
       // --- calendar / session context ---
       "SessionUTC", "UTCHour", "NairobiDate", "NairobiWeekday", "NairobiHour",
       // --- account ---
-      "BalanceBefore", "BalanceAfter", "Magic"
+      "BalanceBefore", "BalanceAfter", "Magic",
+      // --- v2 research additions ---
+      "Result", "HoldingHours", "MaxFavorableRR", "FinalRR",
+      "BarsRefToCC", "BarsCCtoRC", "BarsRCtoEntry", "TriggerTiming", "EntryCandleTime",
+      "EquityBefore",
+      "WeeklyC1_Open", "WeeklyC1_High", "WeeklyC1_Low", "WeeklyC1_Close",
+      "DailyPrev_Open", "DailyPrev_High", "DailyPrev_Low", "DailyPrev_Close",
+      "EntryServerTime", "EntryUTCTime"
    };
    g_logCols = ArraySize(h);
    WriteCsvRow(h);
@@ -1175,9 +1172,98 @@ void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
    g_pending[n].biasSellText       = st.journalBiasSellText;
    g_pending[n].sideBiasText       = st.journalSideBiasText;
    g_pending[n].biasCandleTime     = st.journalBiasCandleTime;
+   g_pending[n].equityBefore       = st.journalEquityBefore;
+   g_pending[n].weekO = st.journalWeekO; g_pending[n].weekH = st.journalWeekH;
+   g_pending[n].weekL = st.journalWeekL; g_pending[n].weekC = st.journalWeekC;
+   g_pending[n].dayO  = st.journalDayO;  g_pending[n].dayH  = st.journalDayH;
+   g_pending[n].dayL  = st.journalDayL;  g_pending[n].dayC  = st.journalDayC;
 
    datetime windowEnd = st.entryTime + InpExcursionTrackingHours * 3600;
    g_pending[n].trackUntil = InpEnableExcursionTracking ? MathMax(exitTime, windowEnd) : exitTime;
+}
+
+//======================================================================
+// Weekly statistics — one aggregated row per calendar week, keyed by the
+// broker's weekly-candle start (each trade counted in the week it was
+// ENTERED). Streamed as trades finalize; the CSV is written at shutdown.
+//======================================================================
+struct SWeekStat
+{
+   datetime weekStart;
+   int      trades, wins, losses, breakeven;
+   double   totalR;
+   int      curWin, curLoss, maxWin, maxLoss;
+};
+SWeekStat g_weeks[];
+
+datetime WeekStartOf(datetime t)
+{
+   int sh = iBarShift(_Symbol, PERIOD_W1, t, false);
+   return (sh < 0) ? 0 : iTime(_Symbol, PERIOD_W1, sh);
+}
+
+void UpdateWeeklyStats(datetime entryTime, double rRealized, double netProfit)
+{
+   datetime wk = WeekStartOf(entryTime);
+   int idx = -1;
+   for(int i = 0; i < ArraySize(g_weeks); i++)
+      if(g_weeks[i].weekStart == wk) { idx = i; break; }
+   if(idx == -1)
+   {
+      idx = ArraySize(g_weeks);
+      ArrayResize(g_weeks, idx + 1);
+      g_weeks[idx].weekStart = wk;
+      g_weeks[idx].trades = 0; g_weeks[idx].wins = 0; g_weeks[idx].losses = 0; g_weeks[idx].breakeven = 0;
+      g_weeks[idx].totalR = 0; g_weeks[idx].curWin = 0; g_weeks[idx].curLoss = 0;
+      g_weeks[idx].maxWin = 0; g_weeks[idx].maxLoss = 0;
+   }
+   g_weeks[idx].trades++;
+   g_weeks[idx].totalR += rRealized;
+   if(netProfit > 0)
+   {
+      g_weeks[idx].wins++; g_weeks[idx].curWin++; g_weeks[idx].curLoss = 0;
+      if(g_weeks[idx].curWin > g_weeks[idx].maxWin) g_weeks[idx].maxWin = g_weeks[idx].curWin;
+   }
+   else if(netProfit < 0)
+   {
+      g_weeks[idx].losses++; g_weeks[idx].curLoss++; g_weeks[idx].curWin = 0;
+      if(g_weeks[idx].curLoss > g_weeks[idx].maxLoss) g_weeks[idx].maxLoss = g_weeks[idx].curLoss;
+   }
+   else
+   {
+      g_weeks[idx].breakeven++; g_weeks[idx].curWin = 0; g_weeks[idx].curLoss = 0;
+   }
+}
+
+void WriteWeeklyStats()
+{
+   int n = ArraySize(g_weeks);
+   for(int i = 1; i < n; i++)   // insertion sort by weekStart (few rows)
+   {
+      SWeekStat key = g_weeks[i];
+      int j = i - 1;
+      while(j >= 0 && g_weeks[j].weekStart > key.weekStart) { g_weeks[j + 1] = g_weeks[j]; j--; }
+      g_weeks[j + 1] = key;
+   }
+
+   int h = FileOpen(InpWeeklyStatsFileName, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(h == INVALID_HANDLE)
+   {
+      PrintFormat("LUCC/LDCC EA: could not open weekly-stats '%s', error=%d", InpWeeklyStatsFileName, GetLastError());
+      return;
+   }
+   FileWrite(h, "WeekStart,Trades,Wins,Losses,Breakeven,WinRatePct,TotalR,AvgR,MaxConsecWins,MaxConsecLosses");
+   for(int i = 0; i < n; i++)
+   {
+      double winRate = (g_weeks[i].trades > 0) ? 100.0 * g_weeks[i].wins / g_weeks[i].trades : 0.0;
+      double avgR    = (g_weeks[i].trades > 0) ? g_weeks[i].totalR / g_weeks[i].trades : 0.0;
+      FileWrite(h, StringFormat("%s,%d,%d,%d,%d,%.1f,%.3f,%.3f,%d,%d",
+                TimeToString(g_weeks[i].weekStart, TIME_DATE),
+                g_weeks[i].trades, g_weeks[i].wins, g_weeks[i].losses, g_weeks[i].breakeven,
+                winRate, g_weeks[i].totalR, avgR, g_weeks[i].maxWin, g_weeks[i].maxLoss));
+   }
+   FileClose(h);
+   PrintFormat("LUCC/LDCC EA: wrote %d weekly-stat rows to %s", n, InpWeeklyStatsFileName);
 }
 
 void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
@@ -1234,7 +1320,18 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
    string patternSeq     = "WK[" + sideCombo + "]>" + entryPattern + ">CC>RC";
    // Every gate that had to pass for this trade to exist (all true by
    // construction — recorded so a future filter change is auditable).
-   string filtersPassed  = "position_free;not_done_today;under_2_today;in_session;bias_allowed;sl_valid;min_stop_ok";
+   string filtersPassed  = "position_free;not_done_today;under_2_today;no_session_gate;bias_allowed;sl_valid;min_stop_ok";
+
+   // --- v2 additions: timing, result, and context ---
+   double   holdingHours  = holdingMinutes / 60.0;
+   int      barsRefToCC   = (p.refTime > 0 && p.ccTime > 0) ? (int)MathRound((double)(p.ccTime - p.refTime) / 3600.0) : 0;
+   int      barsCcToRc    = (p.ccTime > 0 && p.rcTime > 0)  ? (int)MathRound((double)(p.rcTime - p.ccTime) / 3600.0) : 0;
+   int      barsRcToEntry = (p.rcTime > 0) ? (int)MathRound((double)(p.entryTime - p.rcTime) / 3600.0) : 0;
+   // "IMMEDIATE" = retest on the first bar after the CC; "WAITED" = it took longer.
+   string   triggerTiming = (barsCcToRc <= 1) ? "IMMEDIATE" : "WAITED";
+   int      entryShift    = iBarShift(_Symbol, PERIOD_H1, p.entryTime, false);
+   datetime entryCandle   = (entryShift < 0) ? p.entryTime : iTime(_Symbol, PERIOD_H1, entryShift);
+   string   result        = (netProfit > 0) ? "WIN" : (netProfit < 0) ? "LOSS" : "BE";
 
    datetime nairobiEntry = GetNairobiTime(p.entryTime);
    datetime utcEntry     = GetUtcTime(p.entryTime);
@@ -1275,7 +1372,15 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
       // calendar / session context
       SessionNameUtc(utcEntry), (string)du.hour, nairobiDate, weekdayNames[dt.day_of_week], (string)dt.hour,
       // account
-      DoubleToString(p.balanceBeforeEntry, 2), DoubleToString(balanceAfter, 2), (string)InpMagicNumber
+      DoubleToString(p.balanceBeforeEntry, 2), DoubleToString(balanceAfter, 2), (string)InpMagicNumber,
+      // --- v2 research additions ---
+      result, DoubleToString(holdingHours, 2),
+      DoubleToString(mfeRInTrade, 3), DoubleToString(rRealized, 3),
+      (string)barsRefToCC, (string)barsCcToRc, (string)barsRcToEntry, triggerTiming, FmtTime(entryCandle),
+      DoubleToString(p.equityBefore, 2),
+      DoubleToString(p.weekO, _Digits), DoubleToString(p.weekH, _Digits), DoubleToString(p.weekL, _Digits), DoubleToString(p.weekC, _Digits),
+      DoubleToString(p.dayO, _Digits),  DoubleToString(p.dayH, _Digits),  DoubleToString(p.dayL, _Digits),  DoubleToString(p.dayC, _Digits),
+      FmtTime(p.entryTime), FmtTime(utcEntry)
    };
 
    if(g_logCols > 0 && ArraySize(v) != g_logCols)
@@ -1283,6 +1388,7 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
                   g_logCols, ArraySize(v));
 
    WriteCsvRow(v);
+   UpdateWeeklyStats(p.entryTime, rRealized, netProfit);
 }
 
 // Called every tick: extends MFE/MAE for every trade still in its tracking
@@ -1510,9 +1616,8 @@ int OnInit()
                     SymbolInfoDouble(_Symbol, SYMBOL_POINT), PipSize(),
                     TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES), nd.hour, nd.min,
                     IsWithinSession() ? "yes" : "no"));
-   Dbg(StringFormat("INIT filters: SessionFilter=%s  BiasFilter=%s  BarCloseRetest=%s  | H1bars=%d W1bars=%d riskBal=%.2f",
-                    InpUseSessionFilter ? "ON" : "OFF", InpUseBiasFilter ? "ON" : "OFF",
-                    InpUseBarCloseRetest ? "ON" : "OFF",
+   Dbg(StringFormat("INIT filters: SessionGate=REMOVED  BiasFilter=%s  BarCloseRetest=%s  Lookback=%d | H1bars=%d W1bars=%d riskBal=%.2f",
+                    InpUseBiasFilter ? "ON" : "OFF", InpUseBarCloseRetest ? "ON" : "OFF", LOOKBACK,
                     iBars(_Symbol, PERIOD_H1), iBars(_Symbol, PERIOD_W1), g_riskBalance));
    return(INIT_SUCCEEDED);
 }
@@ -1523,8 +1628,8 @@ void OnDeinit(const int reason)
    // entries==0, the reject tally below shows exactly which gate stopped them.
    PrintFormat("LUCC/LDCC EA FUNNEL: refs=%d CCs=%d retestTouches=%d ENTRIES=%d",
                g_cntRef, g_cntCc, g_cntTouch, g_cntEntries);
-   PrintFormat("LUCC/LDCC EA REJECTS: posOpen=%d doneToday=%d maxTrades=%d session=%d bias=%d slInvalid=%d minStop=%d lots=%d orderFail=%d",
-               g_rejPosOpen, g_rejDoneToday, g_rejMaxTrades, g_rejSession, g_rejBias,
+   PrintFormat("LUCC/LDCC EA REJECTS: posOpen=%d doneToday=%d maxTrades=%d bias=%d slInvalid=%d minStop=%d lots=%d orderFail=%d",
+               g_rejPosOpen, g_rejDoneToday, g_rejMaxTrades, g_rejBias,
                g_rejSlInvalid, g_rejMinStop, g_rejLots, g_rejOrderFail);
 
    // Flush whatever excursion data was gathered for trades whose tracking
@@ -1536,6 +1641,11 @@ void OnDeinit(const int reason)
          FinalizePendingLog(g_pending[i], false);
    }
    ArrayFree(g_pending);
+
+   // Weekly summary CSV — written after all trades (incl. the just-flushed
+   // pending ones) have been folded into the weekly aggregator.
+   if(InpEnableTradeLog)
+      WriteWeeklyStats();
 
    DestroyPanel();
 
