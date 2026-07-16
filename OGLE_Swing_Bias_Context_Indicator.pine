@@ -370,16 +370,11 @@ var label sellActiveLabel = na
 var array<line> sellTargetLines = array.new<line>()
 var array<label> sellTargetLabels = array.new<label>()
 
-f_freezeLine(_ln) =>
-    if not na(_ln)
-        line.set_extend(_ln, extend.none)
-        line.set_x2(_ln, bar_index)
-
 f_pushTarget(_lines, _labels, _price, _col) =>
     if array.size(_lines) >= 2
         line.delete(array.shift(_lines))
         label.delete(array.shift(_labels))
-    newLine = line.new(bar_index, _price, bar_index + 1, _price, xloc=xloc.bar_index, color=_col, width=1, style=line.style_solid, extend=extend.right)
+    newLine = line.new(bar_index, _price, bar_index + 1, _price, xloc=xloc.bar_index, color=_col, width=1, style=line.style_solid, extend=extend.none)
     newLabel = label.new(bar_index, _price, text="Target", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(_col, 20), textcolor=color.white, size=size.small)
     array.push(_lines, newLine)
     array.push(_labels, newLabel)
@@ -392,12 +387,25 @@ if barstate.isconfirmed
         buyLockoutCL2 := na
 
     if buySetupActive
+        // Re-derive the level from the LIVE Candle-1 reference every bar —
+        // never hold a stale snapshot. Before promotion this is the active
+        // CL1's candle-1 high; after promotion (and for invalidation, always)
+        // it is the active CL2's candle-1 high.
         buyActiveCL2Level = buyActiveCL2 == "1D" ? prevCL2AHigh : prevCL2BHigh
+        buyActiveTargetLevel := buyTargetPromoted ? buyActiveCL2Level : (buyActiveCL1 == "1W" ? prevCL1AHigh : prevCL1BHigh)
+
+        // Keep the active line/label growing to the current bar at the live level.
+        if not na(buyActiveLine)
+            line.set_y1(buyActiveLine, buyActiveTargetLevel)
+            line.set_y2(buyActiveLine, buyActiveTargetLevel)
+            line.set_x2(buyActiveLine, bar_index)
+        if not na(buyActiveLabel)
+            label.set_xy(buyActiveLabel, bar_index, buyActiveTargetLevel)
+
         if high > buyActiveCL2Level
             buySetupActive := false
             buyLockedOut := true
             buyLockoutCL2 := buyActiveCL2
-            f_freezeLine(buyActiveLine)
             buyActiveLine := na
             buyActiveLabel := na
             buyActiveTargetLevel := na
@@ -405,7 +413,6 @@ if barstate.isconfirmed
             buyActiveCL1 := na
             buyActiveCL2 := na
         else if not buyTargetPromoted and high > buyActiveTargetLevel
-            f_freezeLine(buyActiveLine)
             if showTargetLines
                 [nl, nlab] = f_pushTarget(buyTargetLines, buyTargetLabels, buyActiveCL2Level, buyColor)
                 buyActiveLine := nl
@@ -426,9 +433,6 @@ if barstate.isconfirmed
                 buyActiveLine := nl2
                 buyActiveLabel := nlab2
 
-    if buySetupActive and not na(buyActiveLabel)
-        label.set_x(buyActiveLabel, bar_index)
-
     // ---------------- SELL SIDE (mirror) ----------------
     if sellLockedOut and ((sellLockoutCL2 == "1D" and cl2ASellFoundNew) or (sellLockoutCL2 == "2D" and cl2BSellFoundNew))
         sellLockedOut := false
@@ -436,11 +440,19 @@ if barstate.isconfirmed
 
     if sellSetupActive
         sellActiveCL2Level = sellActiveCL2 == "1D" ? prevCL2ALow : prevCL2BLow
+        sellActiveTargetLevel := sellTargetPromoted ? sellActiveCL2Level : (sellActiveCL1 == "1W" ? prevCL1ALow : prevCL1BLow)
+
+        if not na(sellActiveLine)
+            line.set_y1(sellActiveLine, sellActiveTargetLevel)
+            line.set_y2(sellActiveLine, sellActiveTargetLevel)
+            line.set_x2(sellActiveLine, bar_index)
+        if not na(sellActiveLabel)
+            label.set_xy(sellActiveLabel, bar_index, sellActiveTargetLevel)
+
         if low < sellActiveCL2Level
             sellSetupActive := false
             sellLockedOut := true
             sellLockoutCL2 := sellActiveCL2
-            f_freezeLine(sellActiveLine)
             sellActiveLine := na
             sellActiveLabel := na
             sellActiveTargetLevel := na
@@ -448,7 +460,6 @@ if barstate.isconfirmed
             sellActiveCL1 := na
             sellActiveCL2 := na
         else if not sellTargetPromoted and low < sellActiveTargetLevel
-            f_freezeLine(sellActiveLine)
             if showTargetLines
                 [nl3, nlab3] = f_pushTarget(sellTargetLines, sellTargetLabels, sellActiveCL2Level, sellColor)
                 sellActiveLine := nl3
@@ -468,9 +479,6 @@ if barstate.isconfirmed
                 [nl4, nlab4] = f_pushTarget(sellTargetLines, sellTargetLabels, sellInitialLevel, sellColor)
                 sellActiveLine := nl4
                 sellActiveLabel := nlab4
-
-    if sellSetupActive and not na(sellActiveLabel)
-        label.set_x(sellActiveLabel, bar_index)
 
 // =====================
 // CLEAN INFO TEXT
