@@ -1,0 +1,302 @@
+//@version=6
+// =============================================================================
+// Major Market Structure Engine (Bullish & Bearish)
+//
+// Identifies, maintains and analyses the current major market structure in both
+// bullish and bearish markets. The engine continuously detects confirmed market
+// structure, identifies valid Breaks of Structure (BOS), builds a Major Leg,
+// keeps that leg updated while it stays valid, and derives every trading
+// component (Fibonacci levels, Premium/Discount Zone and the qualifying Fair
+// Value Gap) from that single active Major Leg. Both directions use identical,
+// fully mirrored logic.
+//
+// Confirmation model (non-repainting): market structure is built exclusively
+// from confirmed swings. A swing is confirmed only after an 11-candle fractal
+// completes — five candles to the left of the pivot, the pivot itself, and five
+// candles to the right (ta.pivothigh/low(5, 5)). All BOS / invalidation events
+// and every state mutation are committed on bar close only; wicks never confirm
+// a BOS or an invalidation. Only one Major Leg may be active at a time.
+// =============================================================================
+indicator("Major Market Structure Engine (Bullish & Bearish)", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+grpDisp = "Display"
+showLegLines = input.bool(true,  "Leg High / Leg Low",        group = grpDisp)
+showFibs     = input.bool(true,  "Fibonacci Levels",          group = grpDisp)
+showZone     = input.bool(true,  "Premium / Discount Zone",   group = grpDisp)
+showFVG      = input.bool(true,  "Fair Value Gap",            group = grpDisp)
+showBOS      = input.bool(true,  "BOS Markers",               group = grpDisp)
+
+grpCol = "Colors"
+bearCol  = input.color(color.red,                       "Bearish",   group = grpCol)
+bullCol  = input.color(color.teal,                      "Bullish",   group = grpCol)
+fibCol   = input.color(color.new(color.gray, 0),        "Fib Lines", group = grpCol)
+zoneCol  = input.color(color.new(color.orange, 82),     "Zone Fill", group = grpCol)
+fvgCol   = input.color(color.new(color.blue, 72),       "FVG Fill",  group = grpCol)
+
+// Fractal geometry — 5 left, pivot, 5 right = the 11-candle confirmation window.
+LEFT  = 5
+RIGHT = 5
+MAX_FVG = 300   // hard cap on stored FVGs per active leg (memory guard)
+
+confirmed = barstate.isconfirmed
+
+// -----------------------------------------------------------------------------
+// 1. Confirmed market structure (alternating highs & lows)
+//
+// ta.pivothigh/low(5, 5) only return a value once the full 11-candle fractal has
+// completed, so a confirmed high/low is stamped 5 bars back. We always keep the
+// newest confirmed high and the newest confirmed low: when several highs form
+// before the next low (or several lows before the next high) the newest simply
+// overwrites the previous one, which is exactly the "keep only the newest of a
+// consecutive run" rule, leaving the latest valid alternating structure.
+// -----------------------------------------------------------------------------
+ph = ta.pivothigh(LEFT, RIGHT)
+pl = ta.pivotlow(LEFT, RIGHT)
+
+var float confHigh    = na
+var int   confHighBar = na
+var float confLow     = na
+var int   confLowBar  = na
+
+if not na(ph)
+    confHigh    := ph
+    confHighBar := bar_index - RIGHT
+if not na(pl)
+    confLow    := pl
+    confLowBar := bar_index - RIGHT
+
+// -----------------------------------------------------------------------------
+// 2. Break of Structure (close-based, one event per confirmed level)
+//
+// Bearish BOS: a candle closes below the latest Confirmed Low.
+// Bullish BOS: a candle closes above the latest Confirmed High.
+// A fresh confirmed level re-arms its side so each level can fire only once.
+// -----------------------------------------------------------------------------
+var bool lowArmed  = false
+var bool highArmed = false
+if not na(pl)
+    lowArmed := true
+if not na(ph)
+    highArmed := true
+
+bearBOS = confirmed and not na(confLow)  and lowArmed  and close < confLow
+bullBOS = confirmed and not na(confHigh) and highArmed and close > confHigh
+if bearBOS
+    lowArmed := false
+if bullBOS
+    highArmed := false
+
+// -----------------------------------------------------------------------------
+// 3. Major Leg state
+//
+// Bearish leg: Leg High is FIXED at creation, Leg Low is DYNAMIC (lower lows).
+// Bullish leg: Leg Low  is FIXED at creation, Leg High is DYNAMIC (higher highs).
+// Only the first BOS (while no leg exists) creates a leg; same-direction BOS
+// during an active leg is ignored — only the dynamic boundary keeps updating.
+// -----------------------------------------------------------------------------
+var int   legDir     = 0     // 0 = none, -1 = bearish, 1 = bullish
+var float legHigh    = na
+var float legLow     = na
+var int   legLeftBar = na
+var bool  touched    = false // has price first reached the entry Fib level?
+var int   frozenRight = na   // right edge captured at first touch
+
+legCreatedBear = false
+legCreatedBull = false
+legInvalidated = false
+
+if confirmed
+    // --- Invalidation (close beyond the FIXED boundary) ---------------------
+    if legDir == -1 and close > legHigh
+        legDir := 0
+        legInvalidated := true
+    else if legDir == 1 and close < legLow
+        legDir := 0
+        legInvalidated := true
+
+    // --- Creation (only when no leg is active) ------------------------------
+    if legDir == 0
+        if bearBOS and not na(confHigh)
+            legDir      := -1
+            legHigh     := confHigh                       // fixed
+            legLow      := confLow                        // dynamic (level just broken)
+            legLeftBar  := math.min(confHighBar, confLowBar)
+            touched     := false
+            frozenRight := na
+            legCreatedBear := true
+        else if bullBOS and not na(confLow)
+            legDir      := 1
+            legLow      := confLow                        // fixed
+            legHigh     := confHigh                       // dynamic (level just broken)
+            legLeftBar  := math.min(confHighBar, confLowBar)
+            touched     := false
+            frozenRight := na
+            legCreatedBull := true
+
+    // --- Dynamic boundary update -------------------------------------------
+    if legDir == -1 and not na(pl) and pl < legLow
+        legLow := pl
+    if legDir == 1 and not na(ph) and ph > legHigh
+        legHigh := ph
+
+// -----------------------------------------------------------------------------
+// 4. Fibonacci levels, Premium / Discount Zone and entry level
+//
+// 0.00 anchors the Leg Low, 1.00 anchors the Leg High.
+//   Bearish: Premium Zone = 0.75 → 1.00, entry Fib = 0.75.
+//   Bullish: Discount Zone = 0.00 → 0.25, entry Fib = 0.25.
+// -----------------------------------------------------------------------------
+float f000 = na
+float f025 = na
+float f050 = na
+float f075 = na
+float f100 = na
+float entry   = na
+float zoneTop = na
+float zoneBot = na
+
+if legDir != 0
+    rng  = legHigh - legLow
+    f000 := legLow
+    f025 := legLow + rng * 0.25
+    f050 := legLow + rng * 0.50
+    f075 := legLow + rng * 0.75
+    f100 := legHigh
+    if legDir == -1
+        entry   := f075
+        zoneTop := f100
+        zoneBot := f075
+    else
+        entry   := f025
+        zoneTop := f025
+        zoneBot := f000
+
+// First-touch detection — extension stops once price reaches the entry Fib.
+if confirmed and legDir != 0 and not touched
+    if (legDir == -1 and high >= entry) or (legDir == 1 and low <= entry)
+        touched     := true
+        frozenRight := bar_index
+
+// -----------------------------------------------------------------------------
+// 5. Fair Value Gaps inside the active leg
+//
+// A 3-candle FVG completes on the current bar:
+//   Bullish FVG: low > high[2]  → gap [high[2] .. low].
+//   Bearish FVG: high < low[2]  → gap [high .. low[2]].
+// While a leg is active we collect same-direction FVGs, then each bar keep the
+// single LARGEST one that sits COMPLETELY inside the current zone. Arrays are
+// reset whenever a new leg is created so only the active leg is ever scanned.
+// -----------------------------------------------------------------------------
+var array<float> fvgTop = array.new_float()
+var array<float> fvgBot = array.new_float()
+var array<int>   fvgTyp = array.new_int()
+
+if legCreatedBear or legCreatedBull
+    array.clear(fvgTop)
+    array.clear(fvgBot)
+    array.clear(fvgTyp)
+
+if confirmed and legDir != 0
+    bullFVG = low > high[2]
+    bearFVG = high < low[2]
+    if bullFVG
+        array.push(fvgTop, low)
+        array.push(fvgBot, high[2])
+        array.push(fvgTyp, 1)
+    if bearFVG
+        array.push(fvgTop, low[2])
+        array.push(fvgBot, high)
+        array.push(fvgTyp, -1)
+    while array.size(fvgTyp) > MAX_FVG
+        array.shift(fvgTop)
+        array.shift(fvgBot)
+        array.shift(fvgTyp)
+
+// Select the largest same-direction FVG fully contained in the zone.
+float bestTop = na
+float bestBot = na
+if legDir != 0 and array.size(fvgTyp) > 0
+    bestSize = -1.0
+    for i = 0 to array.size(fvgTyp) - 1
+        if array.get(fvgTyp, i) == legDir
+            t = array.get(fvgTop, i)
+            b = array.get(fvgBot, i)
+            if b >= zoneBot and t <= zoneTop
+                sz = t - b
+                if sz > bestSize
+                    bestSize := sz
+                    bestTop  := t
+                    bestBot  := b
+
+// -----------------------------------------------------------------------------
+// 6. Drawing — objects extend right until first touch, then freeze; all objects
+//    are removed on invalidation. Handles are deleted and rebuilt each bar so
+//    the extend-until-touch behaviour needs no per-object bookkeeping.
+// -----------------------------------------------------------------------------
+var line  lnHigh = na
+var line  lnLow  = na
+var line  ln000  = na
+var line  ln025  = na
+var line  ln050  = na
+var line  ln075  = na
+var line  ln100  = na
+var box   bxZone = na
+var box   bxFVG  = na
+
+if not na(lnHigh)
+    line.delete(lnHigh)
+if not na(lnLow)
+    line.delete(lnLow)
+if not na(ln000)
+    line.delete(ln000)
+if not na(ln025)
+    line.delete(ln025)
+if not na(ln050)
+    line.delete(ln050)
+if not na(ln075)
+    line.delete(ln075)
+if not na(ln100)
+    line.delete(ln100)
+if not na(bxZone)
+    box.delete(bxZone)
+if not na(bxFVG)
+    box.delete(bxFVG)
+
+if legDir != 0
+    legCol = legDir == -1 ? bearCol : bullCol
+    rEdge  = touched ? frozenRight : bar_index
+
+    if showZone
+        bxZone := box.new(legLeftBar, zoneTop, rEdge, zoneBot, border_color = color.new(legCol, 40), bgcolor = zoneCol)
+
+    if showFibs
+        ln100 := line.new(legLeftBar, f100, rEdge, f100, color = fibCol, style = line.style_dotted)
+        ln075 := line.new(legLeftBar, f075, rEdge, f075, color = fibCol, style = line.style_dotted)
+        ln050 := line.new(legLeftBar, f050, rEdge, f050, color = fibCol, style = line.style_dotted)
+        ln025 := line.new(legLeftBar, f025, rEdge, f025, color = fibCol, style = line.style_dotted)
+        ln000 := line.new(legLeftBar, f000, rEdge, f000, color = fibCol, style = line.style_dotted)
+
+    if showLegLines
+        lnHigh := line.new(legLeftBar, legHigh, rEdge, legHigh, color = legCol, width = 2)
+        lnLow  := line.new(legLeftBar, legLow,  rEdge, legLow,  color = legCol, width = 2)
+
+    if showFVG and not na(bestTop)
+        bxFVG := box.new(legLeftBar, bestTop, rEdge, bestBot, border_color = color.new(legCol, 20), bgcolor = fvgCol)
+
+// -----------------------------------------------------------------------------
+// 7. BOS markers
+// -----------------------------------------------------------------------------
+plotshape(showBOS and bearBOS, title = "Bearish BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.tiny, text = "BOS")
+plotshape(showBOS and bullBOS, title = "Bullish BOS", style = shape.triangleup,   location = location.belowbar, color = bullCol, size = size.tiny, text = "BOS")
+
+// -----------------------------------------------------------------------------
+// 8. Alerts — only fire after all confirmation rules are satisfied.
+// -----------------------------------------------------------------------------
+alertcondition(bearBOS,        title = "Bearish BOS",           message = "Bearish Break of Structure confirmed")
+alertcondition(bullBOS,        title = "Bullish BOS",           message = "Bullish Break of Structure confirmed")
+alertcondition(legCreatedBear, title = "Bearish Major Leg",     message = "Bearish Major Leg created")
+alertcondition(legCreatedBull, title = "Bullish Major Leg",     message = "Bullish Major Leg created")
+alertcondition(legInvalidated, title = "Major Leg Invalidated", message = "Major Leg invalidated")
