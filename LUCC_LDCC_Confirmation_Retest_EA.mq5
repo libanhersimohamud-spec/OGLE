@@ -105,73 +105,98 @@ input color  InpPanelBackColor       = C'18,18,22';  // Panel background color
 //======================================================================
 struct SSignalState
 {
-   // --- indicator state (mirrors luccBarIndex/luccHigh/luccLow, ccBar*, rcBar*) ---
+   // --- detection state only (LUCC/LDCC/CC/RC) + per-side per-day counters ---
    datetime refTime;    // bar time of the active LUCC / LDCC candle (0 = none)
    double   refHigh;
    double   refLow;
    datetime ccTime;     // bar time of the Confirmation Candle (0 = none yet)
-   datetime rcTime;      // bar time of the Retest Candle that actually OPENED a trade (0 = none)
+   datetime rcTime;      // RC that opened a trade for the CURRENT detection cycle (0 = none)
    datetime lastAttemptBar; // H1 bar time of the last entry ATTEMPT — throttles retries to 1/bar so a
                             // rejected touch neither spams nor permanently kills the setup
    double   slLevel;    // the indicator's "Stop Loss Level" for this cycle
-
-   // --- trade-management state ---
-   bool     positionOpen;
-   long     positionId;
    int      tradesToday;
    bool     doneToday;   // true once a trade in this direction has won today
-   // Weekly-bias win lock: the weekly-bias episode (weekly candle-1 time) in
-   // which this side already booked a WIN. While the current episode equals
-   // this, InpStopAfterFirstWin blocks further entries in this direction; it
-   // clears automatically once a new weekly candle (new bias) begins. 0 = none.
-   datetime winBookedEpisode;
-
-   // --- trade journal state (filled in TryOpen, consumed in HandlePositionClosed) ---
-   datetime entryTime;
-   double   entryPrice;      // actual fill price (CTrade::ResultPrice)
-   double   slPrice;
-   double   tpPrice;
-   double   riskAmount;      // $ risked on this trade (fixed reference balance * risk%, not live balance)
-   double   lots;
-   int      tradeSeqToday;   // 1st or 2nd trade of the day for this direction
-   double   balanceBeforeEntry;
-   double   mfePrice;        // best price reached while the position was open
-   double   maePrice;        // worst price reached while the position was open
-
-   // Frozen copy of refTime/refHigh/refLow/ccTime/rcTime AT THE MOMENT this
-   // trade was opened. Needed because the live fields above keep changing
-   // after entry — UpdateDirection() carries on searching for the NEXT
-   // LUCC/LDCC cycle every closed bar regardless of whether a position from
-   // the PREVIOUS cycle is still open, and can reset/overwrite them (e.g.
-   // to na if no candidate currently qualifies) long before this trade
-   // closes. QueuePendingLog() must read these frozen copies, not the live
-   // ones, or the journal ends up logging the wrong (or blank) origin for
-   // a trade that's still open.
-   datetime journalRefTime;
-   double   journalRefHigh;
-   double   journalRefLow;
-   datetime journalCcTime;
-   datetime journalRcTime;
-
-   // --- extended research snapshot, all frozen at entry in TryOpen ---
-   double   journalStructuralSl;   // original SL level BEFORE the +pad
-   double   journalRequestedEntry; // intended entry price (pre-fill) — for slippage
-   double   journalBidAtEntry;     // market conditions at the entry tick
-   double   journalAskAtEntry;
-   double   journalSpreadPoints;   // spread at entry, in points
-   double   journalAtrH1AtEntry;   // H1 ATR(14), last closed — volatility context
-   string   journalBiasDir;        // Weekly bias direction at entry (BUY/SELL/BOTH/NONE)
-   string   journalBiasBuyText;    // full Weekly buy-pattern text at entry
-   string   journalBiasSellText;   // full Weekly sell-pattern text at entry
-   string   journalSideBiasText;   // Weekly bias text for THIS trade's side (what authorized it)
-   datetime journalBiasCandleTime; // Weekly candle-1 time the bias was read from
-   double   journalEquityBefore;   // account equity at entry
-   double   journalWeekO, journalWeekH, journalWeekL, journalWeekC; // Weekly candle-1 OHLC (bias ref)
-   double   journalDayO,  journalDayH,  journalDayL,  journalDayC;  // previous Daily candle OHLC (context)
 };
 
 SSignalState g_sell;   // SELL side, driven by the Bullish LUCC
 SSignalState g_buy;    // BUY side,  driven by the Bearish LDCC
+
+//======================================================================
+// One record per CURRENTLY-OPEN trade. MULTIPLE may be open at once — even
+// in the same direction — as long as they originate from DIFFERENT weekly-
+// bias episodes (different weekly candles). This is exactly what lets a
+// Week-2 buy bias open a new buy trade while a Week-1 buy trade is still
+// running: each weekly bias is an independent instance with its own trade.
+// All origin/market fields are frozen at entry; mfe/maePrice track live.
+//======================================================================
+struct SOpenTrade
+{
+   bool     isSell;
+   long     positionId;
+   datetime episode;        // weekly-bias candle time this trade belongs to (bias identity)
+   datetime refTime; double refHigh; double refLow;
+   datetime ccTime;  datetime rcTime;
+   datetime entryTime; double entryPrice; double slPrice; double tpPrice;
+   double   structuralSl; double requestedEntry;
+   double   riskAmount; double lots; int tradeSeqToday;
+   double   balanceBeforeEntry; double equityBefore;
+   double   bidAtEntry; double askAtEntry; double spreadPoints; double atrH1AtEntry;
+   string   biasDir; string biasBuyText; string biasSellText; string sideBiasText;
+   datetime biasCandleTime;
+   double   weekO, weekH, weekL, weekC;
+   double   dayO, dayH, dayL, dayC;
+   double   mfePrice; double maePrice;   // in-trade excursion, updated live each tick
+};
+SOpenTrade g_openTrades[];
+
+// Weekly-bias episodes (per side) in which a WIN has already been booked.
+// Enforces "only one winning trade per weekly-bias instance"; because an
+// episode IS a weekly candle, each new week is automatically a fresh,
+// independent instance and the restriction resets with no lingering state.
+datetime g_sellWinEpisodes[];
+datetime g_buyWinEpisodes[];
+
+bool HasOpenTradeForEpisode(bool isSell, datetime episode)
+{
+   for(int i = 0; i < ArraySize(g_openTrades); i++)
+      if(g_openTrades[i].isSell == isSell && g_openTrades[i].episode == episode)
+         return true;
+   return false;
+}
+bool HasOpenTrade(bool isSell)
+{
+   for(int i = 0; i < ArraySize(g_openTrades); i++)
+      if(g_openTrades[i].isSell == isSell)
+         return true;
+   return false;
+}
+int OpenTradeCount(bool isSell)
+{
+   int c = 0;
+   for(int i = 0; i < ArraySize(g_openTrades); i++)
+      if(g_openTrades[i].isSell == isSell)
+         c++;
+   return c;
+}
+bool HasWinEpisode(bool isSell, datetime episode)
+{
+   if(episode == 0)
+      return false;
+   if(isSell)
+   { for(int i = 0; i < ArraySize(g_sellWinEpisodes); i++) if(g_sellWinEpisodes[i] == episode) return true; }
+   else
+   { for(int i = 0; i < ArraySize(g_buyWinEpisodes); i++) if(g_buyWinEpisodes[i] == episode) return true; }
+   return false;
+}
+void AddWinEpisode(bool isSell, datetime episode)
+{
+   if(HasWinEpisode(isSell, episode))
+      return;
+   if(isSell)
+   { int n = ArraySize(g_sellWinEpisodes); ArrayResize(g_sellWinEpisodes, n + 1); g_sellWinEpisodes[n] = episode; }
+   else
+   { int n = ArraySize(g_buyWinEpisodes);  ArrayResize(g_buyWinEpisodes, n + 1);  g_buyWinEpisodes[n] = episode; }
+}
 
 //======================================================================
 // A trade that has already closed, still being watched so its MFE/MAE
@@ -413,7 +438,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
    // still runs for live/every-tick precision; whichever sees the touch first
    // wins, and positionOpen/rcTime keep them from double-firing.
    if(InpUseBarCloseRetest && st.refTime != 0 && st.ccTime != 0 && st.rcTime == 0
-      && !st.positionOpen && BarTime(0) > st.ccTime && st.lastAttemptBar != BarTime(0))
+      && BarTime(0) > st.ccTime && st.lastAttemptBar != BarTime(0))
    {
       double level    = isSell ? st.refLow : st.refHigh;
       bool   brackets = (BarLow(0) <= level && BarHigh(0) >= level);
@@ -448,11 +473,13 @@ void UpdateDirection(bool isSell, SSignalState &st)
 //+------------------------------------------------------------------+
 void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double mid)
 {
-   // Active only while a CC has closed, no position is open, and no trade has
-   // been taken for this cycle yet (rcTime == 0). rcTime now latches ONLY when
-   // an entry actually opens (see below), so a touch that gets rejected does
-   // NOT permanently kill the setup — a later, valid touch can still fire.
-   if(st.ccTime == 0 || st.rcTime != 0 || st.positionOpen)
+   // Active only while a CC has closed and no trade has been taken for this
+   // detection cycle yet (rcTime == 0). rcTime latches ONLY when an entry
+   // actually opens (see below), so a touch that gets rejected does NOT
+   // permanently kill the setup — a later, valid touch can still fire.
+   // (No global "position open" guard: overlapping trades from different
+   //  weekly-bias episodes are allowed; TryOpen enforces one-per-episode.)
+   if(st.ccTime == 0 || st.rcTime != 0)
       return;
 
    double level    = isSell ? st.refLow : st.refHigh;
@@ -475,26 +502,24 @@ void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double
 }
 
 //+------------------------------------------------------------------+
-//| Tracks Maximum Favorable/Adverse Excursion while a position is    |
-//| open — the best and worst price the market reached before the    |
-//| trade closed. Logged in R-multiples alongside the realized R so  |
-//| you can see, e.g., "lost trades that were briefly +0.6R" (a       |
-//| trailing-stop candidate) vs. "losses that went straight to -1R".  |
+//| Tracks Maximum Favorable/Adverse Excursion for EVERY open trade   |
+//| (there can be several at once, from different weekly-bias         |
+//| episodes) — the best/worst price each reached before it closed.   |
 //+------------------------------------------------------------------+
-void UpdateExcursion(bool isSell, SSignalState &st, double bid, double ask)
+void UpdateOpenExcursions(double bid, double ask)
 {
-   if(!st.positionOpen)
-      return;
-
-   if(isSell)
+   for(int i = 0; i < ArraySize(g_openTrades); i++)
    {
-      st.mfePrice = MathMin(st.mfePrice, bid); // lower price = more favorable for a sell
-      st.maePrice = MathMax(st.maePrice, ask); // higher price = more adverse for a sell
-   }
-   else
-   {
-      st.mfePrice = MathMax(st.mfePrice, ask);
-      st.maePrice = MathMin(st.maePrice, bid);
+      if(g_openTrades[i].isSell)
+      {
+         g_openTrades[i].mfePrice = MathMin(g_openTrades[i].mfePrice, bid); // lower = favorable for a sell
+         g_openTrades[i].maePrice = MathMax(g_openTrades[i].maePrice, ask); // higher = adverse for a sell
+      }
+      else
+      {
+         g_openTrades[i].mfePrice = MathMax(g_openTrades[i].mfePrice, ask);
+         g_openTrades[i].maePrice = MathMin(g_openTrades[i].maePrice, bid);
+      }
    }
 }
 
@@ -877,11 +902,12 @@ bool TryOpen(bool isSell, SSignalState &st)
 {
    string side = isSell ? "SELL" : "BUY";
 
-   // One open position per direction at a time (mirrors "one position
-   // per signal" and lets the daily win/loss rules track a single
-   // outcome before deciding whether a second same-day trade is allowed).
-   if(st.positionOpen)
-   { g_rejPosOpen++; Dbg(side + " retest REJECT: a position is already open this side"); return false; }
+   // One open trade per weekly-bias EPISODE per side. A trade from a DIFFERENT
+   // (earlier) weekly bias may still be open — that does NOT block this one,
+   // which is the whole point: overlapping trades are allowed when they come
+   // from different weekly biases.
+   if(HasOpenTradeForEpisode(isSell, g_bias.c1Time))
+   { g_rejPosOpen++; Dbg(side + " retest REJECT: a trade for the current weekly-bias episode is already open"); return false; }
    if(st.doneToday)
    { g_rejDoneToday++; Dbg(side + " retest REJECT: this side already booked a win today (doneToday)"); return false; }
    if(st.tradesToday >= 2)
@@ -904,11 +930,11 @@ bool TryOpen(bool isSell, SSignalState &st)
    }
 
    // Stop-after-first-win rule: once this side booked a WIN in the CURRENT
-   // weekly-bias episode (same weekly candle), skip further setups in this
-   // direction until a new weekly bias begins. Auto-clears when the weekly
-   // candle rolls over (winBookedEpisode != current c1Time). Losses do not
-   // trigger this. Toggle off for the "unlimited trades per weekly bias" set.
-   if(InpStopAfterFirstWin && g_bias.c1Time != 0 && st.winBookedEpisode == g_bias.c1Time)
+   // weekly-bias episode, skip further setups in this direction FOR THAT
+   // EPISODE ONLY. Because episodes are per weekly candle, a new week is a
+   // fresh instance with no restriction. Losses do not trigger this. Toggle
+   // off for the "unlimited trades per weekly bias" dataset.
+   if(InpStopAfterFirstWin && HasWinEpisode(isSell, g_bias.c1Time))
    {
       g_skippedAfterWin++;
       RecordWeeklySkip(TimeCurrent());
@@ -982,57 +1008,47 @@ bool TryOpen(bool isSell, SSignalState &st)
 
    if(ok)
    {
-      st.positionOpen  = true;
       st.tradesToday++;
+
+      long posId = 0;
       ulong dealTicket = g_trade.ResultDeal();
       if(HistoryDealSelect(dealTicket))
-         st.positionId = (long)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+         posId = (long)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      double fillPrice = g_trade.ResultPrice();
 
-      // Trade journal: snapshot everything the position was opened with, so
-      // the eventual close event can log a complete, self-contained record.
-      double fillPrice      = g_trade.ResultPrice();
-      st.entryTime          = TimeCurrent();
-      st.entryPrice         = (fillPrice > 0) ? fillPrice : entry;
-      st.slPrice             = sl;
-      st.tpPrice              = tp;
-      st.riskAmount           = riskAmount;
-      st.lots                 = lots;
-      st.tradeSeqToday        = st.tradesToday;
-      st.balanceBeforeEntry   = balance;
-      st.mfePrice             = st.entryPrice;
-      st.maePrice             = st.entryPrice;
+      // Build the open-trade record — a full, self-contained snapshot frozen
+      // at entry. Pushed onto g_openTrades so it can coexist with other open
+      // trades (including same-direction ones from other weekly biases).
+      SOpenTrade ot;
+      ot.isSell          = isSell;
+      ot.positionId      = posId;
+      ot.episode         = g_bias.c1Time;   // this trade's weekly-bias identity
+      ot.refTime         = st.refTime;  ot.refHigh = st.refHigh;  ot.refLow = st.refLow;
+      ot.ccTime          = st.ccTime;   ot.rcTime  = st.rcTime;
+      ot.entryTime       = TimeCurrent();
+      ot.entryPrice      = (fillPrice > 0) ? fillPrice : entry;
+      ot.slPrice         = sl;   ot.tpPrice = tp;
+      ot.structuralSl    = structuralSl;   ot.requestedEntry = entry;
+      ot.riskAmount      = riskAmount;   ot.lots = lots;   ot.tradeSeqToday = st.tradesToday;
+      ot.balanceBeforeEntry = balance;   ot.equityBefore = AccountInfoDouble(ACCOUNT_EQUITY);
+      ot.bidAtEntry      = bidAtEntry;   ot.askAtEntry = askAtEntry;
+      ot.spreadPoints    = spreadPoints; ot.atrH1AtEntry = atrH1AtEntry;
+      ot.biasDir         = g_bias.dir;   ot.biasBuyText = g_bias.buyText;   ot.biasSellText = g_bias.sellText;
+      ot.sideBiasText    = isSell ? g_bias.sellText : g_bias.buyText;
+      ot.biasCandleTime  = g_bias.c1Time;
+      ot.weekO = WOpen(1); ot.weekH = WHigh(1); ot.weekL = WLow(1); ot.weekC = WClose(1);
+      ot.dayO  = iOpen(_Symbol, PERIOD_D1, 1); ot.dayH = iHigh(_Symbol, PERIOD_D1, 1);
+      ot.dayL  = iLow(_Symbol, PERIOD_D1, 1);  ot.dayC = iClose(_Symbol, PERIOD_D1, 1);
+      ot.mfePrice = ot.entryPrice; ot.maePrice = ot.entryPrice;
 
-      // Freeze the origin of this cycle for the journal — see the field
-      // comments on journalRefTime etc. for why this can't just be read
-      // live off st.refTime/ccTime/rcTime at close time.
-      st.journalRefTime = st.refTime;
-      st.journalRefHigh = st.refHigh;
-      st.journalRefLow  = st.refLow;
-      st.journalCcTime  = st.ccTime;
-      st.journalRcTime  = st.rcTime;
-
-      // Extended research snapshot — the Weekly-bias context and market
-      // conditions AT THE ENTRY TICK, frozen now because g_bias and the
-      // spread keep moving after entry and would otherwise be lost.
-      st.journalStructuralSl   = structuralSl;
-      st.journalRequestedEntry = entry;                 // normalized intended price (pre-fill)
-      st.journalBidAtEntry     = bidAtEntry;
-      st.journalAskAtEntry     = askAtEntry;
-      st.journalSpreadPoints   = spreadPoints;
-      st.journalAtrH1AtEntry   = atrH1AtEntry;
-      st.journalBiasDir        = g_bias.dir;
-      st.journalBiasBuyText    = g_bias.buyText;
-      st.journalBiasSellText   = g_bias.sellText;
-      st.journalSideBiasText   = isSell ? g_bias.sellText : g_bias.buyText;
-      st.journalBiasCandleTime = g_bias.c1Time;
-      st.journalEquityBefore   = AccountInfoDouble(ACCOUNT_EQUITY);
-      st.journalWeekO = WOpen(1); st.journalWeekH = WHigh(1); st.journalWeekL = WLow(1); st.journalWeekC = WClose(1);
-      st.journalDayO  = iOpen(_Symbol, PERIOD_D1, 1); st.journalDayH = iHigh(_Symbol, PERIOD_D1, 1);
-      st.journalDayL  = iLow(_Symbol, PERIOD_D1, 1);  st.journalDayC = iClose(_Symbol, PERIOD_D1, 1);
+      int oi = ArraySize(g_openTrades);
+      ArrayResize(g_openTrades, oi + 1);
+      g_openTrades[oi] = ot;
 
       g_cntEntries++;
-      Dbg(StringFormat("%s ENTRY OK: fill=%.5f sl=%.5f tp=%.5f lots=%.2f risk=%.2f  bias[%s]",
-                       side, st.entryPrice, sl, tp, lots, riskAmount, st.journalSideBiasText));
+      Dbg(StringFormat("%s ENTRY OK: fill=%.5f sl=%.5f tp=%.5f lots=%.2f risk=%.2f episode=%s bias[%s] (openTrades=%d)",
+                       side, ot.entryPrice, sl, tp, lots, riskAmount,
+                       TimeToString(ot.episode, TIME_DATE), ot.sideBiasText, ArraySize(g_openTrades)));
       return true;
    }
 
@@ -1148,10 +1164,10 @@ void WriteTradeLogHeader()
 }
 
 // Queues a just-closed trade for extended tracking rather than writing it
-// immediately, so MFE_R/MAE_R can keep growing past the real exit. mfePrice/
-// maePrice carry over from st (already tracked live while the position was
-// open by UpdateExcursion) so the series is continuous from entry onward.
-void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
+// immediately, so MFE_R/MAE_R can keep growing past the real exit. All the
+// origin/entry data comes from the frozen SOpenTrade record; mfe/maePrice
+// were tracked live while the position was open, so the series is continuous.
+void QueuePendingLog(const SOpenTrade &t,
                       datetime exitTime, double exitPrice, string exitReason,
                       double grossProfit, double commission, double swap,
                       bool firstWinOfBias)
@@ -1159,57 +1175,54 @@ void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
    int n = ArraySize(g_pending);
    ArrayResize(g_pending, n + 1);
 
-   g_pending[n].isSell             = isSell;
-   g_pending[n].posId              = posId;
-   g_pending[n].refTime            = st.journalRefTime;
-   g_pending[n].refHigh            = st.journalRefHigh;
-   g_pending[n].refLow             = st.journalRefLow;
-   g_pending[n].ccTime             = st.journalCcTime;
-   g_pending[n].rcTime             = st.journalRcTime;
-   g_pending[n].entryTime          = st.entryTime;
-   g_pending[n].entryPrice         = st.entryPrice;
-   g_pending[n].slPrice            = st.slPrice;
-   g_pending[n].tpPrice            = st.tpPrice;
-   g_pending[n].riskAmount         = st.riskAmount;
-   g_pending[n].lots               = st.lots;
-   g_pending[n].tradeSeqToday      = st.tradeSeqToday;
-   g_pending[n].balanceBeforeEntry = st.balanceBeforeEntry;
+   g_pending[n].isSell             = t.isSell;
+   g_pending[n].posId              = t.positionId;
+   g_pending[n].refTime            = t.refTime;
+   g_pending[n].refHigh            = t.refHigh;
+   g_pending[n].refLow             = t.refLow;
+   g_pending[n].ccTime             = t.ccTime;
+   g_pending[n].rcTime             = t.rcTime;
+   g_pending[n].entryTime          = t.entryTime;
+   g_pending[n].entryPrice         = t.entryPrice;
+   g_pending[n].slPrice            = t.slPrice;
+   g_pending[n].tpPrice            = t.tpPrice;
+   g_pending[n].riskAmount         = t.riskAmount;
+   g_pending[n].lots               = t.lots;
+   g_pending[n].tradeSeqToday      = t.tradeSeqToday;
+   g_pending[n].balanceBeforeEntry = t.balanceBeforeEntry;
    g_pending[n].exitTime           = exitTime;
    g_pending[n].exitPrice          = exitPrice;
    g_pending[n].exitReason         = exitReason;
    g_pending[n].grossProfit        = grossProfit;
    g_pending[n].commission         = commission;
    g_pending[n].swap               = swap;
-   // st.mfePrice/maePrice are still exactly as they were the instant the
-   // real position closed (UpdateExcursion only touches them while
-   // positionOpen is true, and this runs before that flag flips below) —
-   // freeze that as the true in-trade figure before extended tracking
-   // carries the mfePrice/maePrice fields further past the actual exit.
-   g_pending[n].mfePriceAtClose    = st.mfePrice;
-   g_pending[n].maePriceAtClose    = st.maePrice;
-   g_pending[n].mfePrice           = st.mfePrice;
-   g_pending[n].maePrice           = st.maePrice;
+   // t.mfePrice/maePrice are exactly as they were the instant the position
+   // closed — freeze that as the true in-trade figure before extended
+   // tracking carries the mfePrice/maePrice fields further past the exit.
+   g_pending[n].mfePriceAtClose    = t.mfePrice;
+   g_pending[n].maePriceAtClose    = t.maePrice;
+   g_pending[n].mfePrice           = t.mfePrice;
+   g_pending[n].maePrice           = t.maePrice;
 
-   // Extended research snapshot, carried through from the frozen entry values.
-   g_pending[n].structuralSl       = st.journalStructuralSl;
-   g_pending[n].requestedEntry     = st.journalRequestedEntry;
-   g_pending[n].bidAtEntry         = st.journalBidAtEntry;
-   g_pending[n].askAtEntry         = st.journalAskAtEntry;
-   g_pending[n].spreadPoints       = st.journalSpreadPoints;
-   g_pending[n].atrH1AtEntry       = st.journalAtrH1AtEntry;
-   g_pending[n].biasDir            = st.journalBiasDir;
-   g_pending[n].biasBuyText        = st.journalBiasBuyText;
-   g_pending[n].biasSellText       = st.journalBiasSellText;
-   g_pending[n].sideBiasText       = st.journalSideBiasText;
-   g_pending[n].biasCandleTime     = st.journalBiasCandleTime;
-   g_pending[n].equityBefore       = st.journalEquityBefore;
-   g_pending[n].weekO = st.journalWeekO; g_pending[n].weekH = st.journalWeekH;
-   g_pending[n].weekL = st.journalWeekL; g_pending[n].weekC = st.journalWeekC;
-   g_pending[n].dayO  = st.journalDayO;  g_pending[n].dayH  = st.journalDayH;
-   g_pending[n].dayL  = st.journalDayL;  g_pending[n].dayC  = st.journalDayC;
+   g_pending[n].structuralSl       = t.structuralSl;
+   g_pending[n].requestedEntry     = t.requestedEntry;
+   g_pending[n].bidAtEntry         = t.bidAtEntry;
+   g_pending[n].askAtEntry         = t.askAtEntry;
+   g_pending[n].spreadPoints       = t.spreadPoints;
+   g_pending[n].atrH1AtEntry       = t.atrH1AtEntry;
+   g_pending[n].biasDir            = t.biasDir;
+   g_pending[n].biasBuyText        = t.biasBuyText;
+   g_pending[n].biasSellText       = t.biasSellText;
+   g_pending[n].sideBiasText       = t.sideBiasText;
+   g_pending[n].biasCandleTime     = t.biasCandleTime;
+   g_pending[n].equityBefore       = t.equityBefore;
+   g_pending[n].weekO = t.weekO; g_pending[n].weekH = t.weekH;
+   g_pending[n].weekL = t.weekL; g_pending[n].weekC = t.weekC;
+   g_pending[n].dayO  = t.dayO;  g_pending[n].dayH  = t.dayH;
+   g_pending[n].dayL  = t.dayL;  g_pending[n].dayC  = t.dayC;
    g_pending[n].firstWinOfBias = firstWinOfBias;
 
-   datetime windowEnd = st.entryTime + InpExcursionTrackingHours * 3600;
+   datetime windowEnd = t.entryTime + InpExcursionTrackingHours * 3600;
    g_pending[n].trackUntil = InpEnableExcursionTracking ? MathMax(exitTime, windowEnd) : exitTime;
 }
 
@@ -1462,40 +1475,48 @@ void UpdatePendingExcursions(double bid, double ask)
 }
 
 //+------------------------------------------------------------------+
-//| A direction's open position just closed — record win/loss and     |
-//| queue the trade for the trade-journal write (see QueuePendingLog).|
-//| "Win" = closed net profit (profit + swap + commission) > 0.       |
+//| An open position just closed — find it in g_openTrades by position |
+//| id, book the outcome, queue the journal row, and remove it. Works  |
+//| for any of the (possibly several) concurrently open trades.        |
+//| "Win" = closed net profit (profit + swap + commission) > 0.        |
 //+------------------------------------------------------------------+
-void HandlePositionClosed(bool isSell, SSignalState &st, long closedPosId,
-                           datetime exitTime, double exitPrice, string exitReason,
-                           double grossProfit, double commission, double swap)
+void HandleClose(long closedPosId, datetime exitTime, double exitPrice, string exitReason,
+                 double grossProfit, double commission, double swap)
 {
-   if(!st.positionOpen || st.positionId != closedPosId)
-      return;
+   int idx = -1;
+   for(int i = 0; i < ArraySize(g_openTrades); i++)
+      if(g_openTrades[i].positionId == closedPosId) { idx = i; break; }
+   if(idx < 0)
+      return; // not one of ours (or already handled)
 
+   SOpenTrade t = g_openTrades[idx];
    double netProfit = grossProfit + commission + swap;
 
-   // First win of this side's weekly-bias episode? Tracked ALWAYS (even when
+   // First win of THIS trade's weekly-bias episode? Tracked ALWAYS (even when
    // the toggle is off) so the "first winning trade" is identifiable in every
-   // dataset; the win-lock is keyed to the trade's ENTRY weekly-bias candle.
+   // dataset. The episode is the trade's own weekly-bias candle, so each week
+   // is independent and the restriction resets per weekly bias automatically.
    bool firstWin = false;
    if(netProfit > 0)
    {
-      datetime episode = st.journalBiasCandleTime;
-      if(st.winBookedEpisode != episode)
+      if(!HasWinEpisode(t.isSell, t.episode))
       {
          firstWin = true;
-         st.winBookedEpisode = episode;
+         AddWinEpisode(t.isSell, t.episode);
       }
+      if(t.isSell) g_sell.doneToday = true; else g_buy.doneToday = true; // daily win-stop (unchanged)
    }
 
-   if(InpEnableTradeLog)
-      QueuePendingLog(isSell, st, closedPosId, exitTime, exitPrice, exitReason, grossProfit, commission, swap, firstWin);
+   Dbg(StringFormat("%s CLOSE posId=%d net=%.2f %s%s episode=%s (openTrades left=%d)",
+                    t.isSell ? "SELL" : "BUY", closedPosId, netProfit,
+                    netProfit > 0 ? "WIN" : (netProfit < 0 ? "LOSS" : "BE"),
+                    firstWin ? " [FIRST-WIN]" : "", TimeToString(t.episode, TIME_DATE),
+                    ArraySize(g_openTrades) - 1));
 
-   st.positionOpen = false;
-   st.positionId   = 0;
-   if(netProfit > 0)
-      st.doneToday = true; // a win ends this direction's trading for the day
+   if(InpEnableTradeLog)
+      QueuePendingLog(t, exitTime, exitPrice, exitReason, grossProfit, commission, swap, firstWin);
+
+   ArrayRemove(g_openTrades, idx, 1);
 }
 
 //======================================================================
@@ -1555,12 +1576,12 @@ void PanelSet(int row, string text, color clr)
 string SideStateText(bool isSell, const SSignalState &st)
 {
    string tag = isSell ? "LUCC" : "LDCC";
-   if(st.positionOpen) return "position OPEN";
-   if(st.doneToday)    return "done today (win booked)";
-   if(st.refTime == 0) return "scanning - no " + tag;
-   if(st.ccTime  == 0) return tag + " @ " + TimeToString(st.refTime, TIME_DATE|TIME_MINUTES) + " (awaiting CC)";
+   int openN = OpenTradeCount(isSell);
+   string openTag = (openN > 0) ? StringFormat(" [%d open]", openN) : "";
+   if(st.refTime == 0) return "scanning - no " + tag + openTag;
+   if(st.ccTime  == 0) return tag + " @ " + TimeToString(st.refTime, TIME_DATE|TIME_MINUTES) + " (awaiting CC)" + openTag;
    double lvl = isSell ? st.refLow : st.refHigh;
-   return "CC set - awaiting retest @ " + DoubleToString(lvl, _Digits);
+   return "CC set - awaiting retest @ " + DoubleToString(lvl, _Digits) + openTag;
 }
 
 void UpdatePanel()
@@ -1594,16 +1615,16 @@ void UpdatePanel()
             InpUseBiasFilter ? clrGold : clrSilver);
 
    PanelSet(6, "SELL (LUCC): " + SideStateText(true, g_sell),
-            g_sell.positionOpen ? clrRed : clrGainsboro);
-   bool sellWinLock = InpStopAfterFirstWin && g_bias.c1Time != 0 && g_sell.winBookedEpisode == g_bias.c1Time;
+            HasOpenTrade(true) ? clrRed : clrGainsboro);
+   bool sellWinLock = InpStopAfterFirstWin && HasWinEpisode(true, g_bias.c1Time);
    PanelSet(7, StringFormat("   trades today %d/2%s   bias %s%s",
             g_sell.tradesToday, g_sell.doneToday ? " (done)" : "",
             SellBiasAllowed() ? "OK" : "blocked", sellWinLock ? "  [WK-WIN-LOCK]" : ""),
             sellWinLock ? clrGold : (SellBiasAllowed() ? clrGainsboro : clrGray));
 
    PanelSet(8, "BUY (LDCC): " + SideStateText(false, g_buy),
-            g_buy.positionOpen ? clrLime : clrGainsboro);
-   bool buyWinLock = InpStopAfterFirstWin && g_bias.c1Time != 0 && g_buy.winBookedEpisode == g_bias.c1Time;
+            HasOpenTrade(false) ? clrLime : clrGainsboro);
+   bool buyWinLock = InpStopAfterFirstWin && HasWinEpisode(false, g_bias.c1Time);
    PanelSet(9, StringFormat("   trades today %d/2%s   bias %s%s",
             g_buy.tradesToday, g_buy.doneToday ? " (done)" : "",
             BuyBiasAllowed() ? "OK" : "blocked", buyWinLock ? "  [WK-WIN-LOCK]" : ""),
@@ -1702,6 +1723,9 @@ void OnDeinit(const int reason)
          FinalizePendingLog(g_pending[i], false);
    }
    ArrayFree(g_pending);
+   ArrayFree(g_openTrades);
+   ArrayFree(g_sellWinEpisodes);
+   ArrayFree(g_buyWinEpisodes);
 
    // Weekly summary CSV — written after all trades (incl. the just-flushed
    // pending ones) have been folded into the weekly aggregator.
@@ -1760,8 +1784,7 @@ void OnTick()
 
    MonitorRetest(true,  g_sell, bid, ask, mid);
    MonitorRetest(false, g_buy,  bid, ask, mid);
-   UpdateExcursion(true,  g_sell, bid, ask);
-   UpdateExcursion(false, g_buy,  bid, ask);
+   UpdateOpenExcursions(bid, ask);   // MFE/MAE for every currently-open trade
    if(InpEnableTradeLog)
       UpdatePendingExcursions(bid, ask);
 
@@ -1797,7 +1820,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    double   commission        = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
    double   swap               = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
 
-   HandlePositionClosed(true,  g_sell, posId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
-   HandlePositionClosed(false, g_buy,  posId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
+   HandleClose(posId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
 }
 //+------------------------------------------------------------------+
