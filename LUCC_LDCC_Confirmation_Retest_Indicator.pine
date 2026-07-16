@@ -1,7 +1,7 @@
 //@version=6
 
 // =============================================================================
-// LUCC / LDCC Confirmation & Retest Indicator
+// LUCC / LDCC Confirmation & Retest Indicator — with 1D Bias
 //
 // SELL side: tracks the most recent Bullish "Last Up Close Candle" (LUCC) —
 //            a bullish breakout candle whose High stays protected — then
@@ -15,9 +15,24 @@
 //
 // Both sides only ever look at the most recent 24 CLOSED candles, run fully
 // independently of each other, and never repaint (all state is updated only
-// once a bar is confirmed / closed).
+// once a bar is confirmed / closed). THIS BLOCK IS UNCHANGED from the
+// original LUCC/LDCC indicator — the Bias engine below is purely additive.
+//
+// BIAS ENGINE (new): a directional filter built from the pattern-detection
+// logic of a separate script (BC/DC/BSB-SBS/3DP/DS/N-3DP/N-DS candle
+// patterns), evaluated ONLY on the Daily (1D) timeframe — every other
+// timeframe from that script (the monthly Bias layer, the Weekly/2-Week/
+// 5-Day/10-Day Confirmation Layer 1, and 2-Day) has been removed per spec,
+// and all CRT logic has been stripped out entirely.
+//
+// GATING: a Sell RC only becomes a confirmed, tradeable signal
+// (sellTradeConfirmed) if 1D bias currently reads SELL and hasn't been
+// invalidated; mirror for Buy. The underlying LUCC/LDCC/CC/RC detection
+// itself is completely untouched by this — same as the existing Nairobi-
+// session gating pattern in the EA, the Bias layer only gates whether the
+// final RC is *actionable*, not whether it's found.
 // =============================================================================
-indicator("LUCC / LDCC Confirmation & Retest Indicator", overlay = true, max_labels_count = 500, max_lines_count = 500)
+indicator("LUCC / LDCC Confirmation & Retest Indicator (1D Bias)", overlay = true, max_labels_count = 500, max_lines_count = 500)
 
 // -----------------------------------------------------------------------------
 // Inputs
@@ -30,6 +45,8 @@ indicator("LUCC / LDCC Confirmation & Retest Indicator", overlay = true, max_lab
 // Sell markers sit ABOVE the candle, Buy markers BELOW it.
 ccMarkerStyle = input.string("Arrow", title = "CC Marker Style", options = ["Arrow", "Flag", "Triangle", "Circle", "Diamond", "Cross"])
 rcMarkerStyle = input.string("Flag",  title = "RC Marker Style", options = ["Arrow", "Flag", "Triangle", "Circle", "Diamond", "Cross"])
+
+showBiasTable = input.bool(true, "Show Bias Table", group = "Bias Engine (1D)")
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -278,3 +295,177 @@ plotshape(buySignal and rcMarkerStyle == "Triangle", title = "Buy RC (Triangle)"
 plotshape(buySignal and rcMarkerStyle == "Circle",   title = "Buy RC (Circle)",   style = shape.circle,      location = location.belowbar, color = color.green, size = size.small)
 plotshape(buySignal and rcMarkerStyle == "Diamond",  title = "Buy RC (Diamond)",  style = shape.diamond,     location = location.belowbar, color = color.green, size = size.small)
 plotshape(buySignal and rcMarkerStyle == "Cross",    title = "Buy RC (Cross)",    style = shape.cross,       location = location.belowbar, color = color.green, size = size.small)
+
+// =============================================================================
+// BIAS ENGINE (1D, CRT-free) — everything below this line is new.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Pattern detection, copied from the provided script with ALL CRT logic
+// removed: f_crtBuyBase/f_crtSellBase/f_crtBuy/f_crtSell/f_currentCRT/f_c2Mid
+// are gone entirely, and the "CRT " token is gone from both pattern-text
+// builders below. Every remaining pattern (BC, DC, BSB/SBS, 3DP, DS, N-3DP,
+// N-DS) is unchanged from the source script.
+// -----------------------------------------------------------------------------
+f_bodyCloseBuy() =>
+    close[1] > high[2]
+
+f_bodyCloseSell() =>
+    close[1] < low[2]
+
+f_decisiveBuy() =>
+    low[1] < low[2] and high[1] > high[2] and close[1] > open[1]
+
+f_decisiveSell() =>
+    high[1] > high[2] and low[1] < low[2] and close[1] < open[1]
+
+f_bsbBuy() =>
+    close[2] > open[2] and high[1] <= high[2] and low[1] >= low[2]
+
+f_sbsSell() =>
+    close[2] < open[2] and high[1] <= high[2] and low[1] >= low[2]
+
+f_threeDPBuy() =>
+    close[1] >= low[2] and close[1] <= high[2] and low < low[1] and low < low[2]
+
+f_threeDPSell() =>
+    close[1] >= low[2] and close[1] <= high[2] and high > high[1] and high > high[2]
+
+f_dsBuy() =>
+    close[1] < low[2] and close[1] < low[3] and
+     close[2] >= low[1] and close[2] >= low[2] and close[2] >= low[3] and
+     low < low[1]
+
+f_dsSell() =>
+    close[1] > high[2] and close[1] > high[3] and
+     close[2] <= high[1] and close[2] <= high[2] and close[2] <= high[3] and
+     high > high[1]
+
+f_near3DPBuy() =>
+    high[1] <= high[2] and low[1] >= low[2] and low < low[1] and low < low[2]
+
+f_near3DPSell() =>
+    high[1] <= high[2] and low[1] >= low[2] and high > high[1] and high > high[2]
+
+f_nearDSBuy() =>
+    high[2] <= high[3] and low[2] >= low[3] and
+     close[1] < low[2] and close[1] < low[3] and
+     low < low[1] and low < low[2] and low < low[3] and
+     high[2] <= high[3] and high[1] <= high[3] and high <= high[3]
+
+f_nearDSSell() =>
+    high[2] <= high[3] and low[2] >= low[3] and
+     close[1] > high[2] and close[1] > high[3] and
+     high > high[1] and high > high[2] and high > high[3] and
+     low[2] >= low[3] and low[1] >= low[3] and low >= low[3]
+
+f_buyPatternText() =>
+    string txt = ""
+    txt := f_bodyCloseBuy() ? txt + "BC " : txt
+    txt := f_decisiveBuy() ? txt + "DC " : txt
+    txt := f_bsbBuy() ? txt + "BSB " : txt
+    txt := f_threeDPBuy() ? txt + "3DP " : txt
+    txt := f_dsBuy() ? txt + "3DP-DS " : txt
+    txt := f_near3DPBuy() ? txt + "N-3DP " : txt
+    txt := f_nearDSBuy() ? txt + "N-DS " : txt
+    txt == "" ? "-" : txt
+
+f_sellPatternText() =>
+    string txt = ""
+    txt := f_bodyCloseSell() ? txt + "BC " : txt
+    txt := f_decisiveSell() ? txt + "DC " : txt
+    txt := f_sbsSell() ? txt + "SBS " : txt
+    txt := f_threeDPSell() ? txt + "3DP " : txt
+    txt := f_dsSell() ? txt + "3DP-DS " : txt
+    txt := f_near3DPSell() ? txt + "N-3DP " : txt
+    txt := f_nearDSSell() ? txt + "N-DS " : txt
+    txt == "" ? "-" : txt
+
+// Candle 1 (offset [1] on the bias TF) is what every invalidation rule
+// references — bundle its High/Low/Time alongside the pattern text so a
+// single request.security call gives us everything needed for that TF.
+f_biasPack() =>
+    [f_buyPatternText(), f_sellPatternText(), high[1], low[1], time[1]]
+
+// -----------------------------------------------------------------------------
+// HTF request — ONLY 1D, exactly as specified. No monthly Bias timeframes,
+// no Weekly/2-Week/5-Day/10-Day Confirmation Layer 1, no 2-Day — all
+// eliminated entirely rather than kept around unused.
+// -----------------------------------------------------------------------------
+[buyTxt1D, sellTxt1D, c1High1D, c1Low1D, c1Time1D] =
+     request.security(syminfo.tickerid, "D", f_biasPack(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// The timeframe's raw direction for THIS candle: BUY if only a buy pattern
+// matched, SELL if only a sell pattern matched. If somehow both matched on
+// the same Candle 1 (or neither did), there's no single clean directional
+// read, so it resolves to NONE rather than guessing.
+f_resolveDir(buyTxt, sellTxt) =>
+    buyFound = buyTxt != "-"
+    sellFound = sellTxt != "-"
+    buyFound and not sellFound ? "BUY" : sellFound and not buyFound ? "SELL" : "NONE"
+
+rawDir1D = f_resolveDir(buyTxt1D, sellTxt1D)
+
+// -----------------------------------------------------------------------------
+// Persistent Bias state (1D only).
+// -----------------------------------------------------------------------------
+var string bias1DDir     = "NONE"
+var float  bias1DHigh    = na
+var float  bias1DLow     = na
+var bool   bias1DInvalid = false
+var int    lastC1Time1D  = na
+
+// (Re)selection — only when the Daily Candle 1 reference itself changes to
+// a genuinely new bar (confirmed bars only, non-repainting, matching the
+// LUCC/LDCC block's own selection style). A new Bias candle always clears
+// any prior invalidation and re-freezes the High/Low that governs
+// invalidation for this cycle, per "wait for a completely new Bias candle
+// before starting a new setup."
+if barstate.isconfirmed
+    if nz(c1Time1D, -1) != nz(lastC1Time1D, -1)
+        lastC1Time1D := c1Time1D
+        bias1DInvalid := false
+        bias1DDir  := rawDir1D
+        bias1DHigh := rawDir1D != "NONE" ? c1High1D : na
+        bias1DLow  := rawDir1D != "NONE" ? c1Low1D  : na
+
+// Invalidation — checked on EVERY tick (not just confirmed bars), since the
+// rule is "if price breaks above/below ... IMMEDIATELY invalidate".
+if bias1DDir == "BUY" and not bias1DInvalid and not na(bias1DHigh) and high > bias1DHigh
+    bias1DInvalid := true
+if bias1DDir == "SELL" and not bias1DInvalid and not na(bias1DLow) and low < bias1DLow
+    bias1DInvalid := true
+
+// A direction is tradeable if the 1D bias currently supports it and hasn't
+// been invalidated.
+buyBiasAllowed  = bias1DDir == "BUY"  and not bias1DInvalid
+sellBiasAllowed = bias1DDir == "SELL" and not bias1DInvalid
+
+// -----------------------------------------------------------------------------
+// Final confirmed signal — the unchanged RC signal, gated by Bias. This is
+// the actionable trade signal; sellSignal/buySignal above still fire and
+// draw exactly as before regardless of Bias (LUCC/LDCC/CC/RC untouched).
+// -----------------------------------------------------------------------------
+sellTradeConfirmed = sellSignal and sellBiasAllowed
+buyTradeConfirmed  = buySignal  and buyBiasAllowed
+
+plotshape(sellTradeConfirmed, title = "Sell CONFIRMED (Bias-aligned)", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0), textcolor = color.white, text = "SELL", size = size.normal)
+plotshape(buyTradeConfirmed,  title = "Buy CONFIRMED (Bias-aligned)",  style = shape.labelup,   location = location.belowbar, color = color.new(color.green, 0), textcolor = color.white, text = "BUY",  size = size.normal)
+
+// -----------------------------------------------------------------------------
+// Bias table — quick visual read of the 1D state.
+// -----------------------------------------------------------------------------
+var table biasTable = table.new(position.top_right, 3, 2, border_width = 1)
+
+f_biasCell(_c, _r, _txt, _bg) =>
+    table.cell(biasTable, _c, _r, _txt, bgcolor = _bg, text_color = color.white, text_size = size.small)
+
+if showBiasTable and barstate.islast
+    f_biasCell(0, 0, "TF", color.black)
+    f_biasCell(1, 0, "Dir", color.black)
+    f_biasCell(2, 0, "Status", color.black)
+
+    color bias1DColor = bias1DDir == "BUY" ? color.green : bias1DDir == "SELL" ? color.red : color.new(color.black, 10)
+    f_biasCell(0, 1, "1D", color.black)
+    f_biasCell(1, 1, bias1DDir, bias1DColor)
+    f_biasCell(2, 1, bias1DDir == "NONE" ? "-" : bias1DInvalid ? "INVALIDATED" : "ACTIVE", bias1DColor)
