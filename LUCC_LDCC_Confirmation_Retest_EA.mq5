@@ -48,6 +48,8 @@ input int    InpWinterEndHour        = 19;    // Session end,   Nairobi time, wi
 input group "Trade Journal"
 input bool   InpEnableTradeLog       = true;                          // Write a per-trade CSV log
 input string InpTradeLogFileName     = "LUCC_LDCC_TradeLog.csv";      // File name (MQL5/Files)
+input bool   InpEnableExcursionTracking = true;  // Keep watching price past the actual exit for true MFE/MAE
+input int    InpExcursionTrackingHours  = 120;   // Hours from ENTRY to keep tracking (uncapped by SL/TP)
 
 //======================================================================
 // Constants (indicator logic parameters — preserved exactly, not
@@ -91,6 +93,41 @@ struct SSignalState
 
 SSignalState g_sell;   // SELL side, driven by the Bullish LUCC
 SSignalState g_buy;    // BUY side,  driven by the Bearish LDCC
+
+//======================================================================
+// A trade that has already closed, still being watched so its MFE/MAE
+// aren't capped by the actual SL/TP — see the "Trade Journal — excursion
+// tracking" section below for why this exists.
+//======================================================================
+struct SPendingLog
+{
+   bool     isSell;
+   long     posId;
+   datetime refTime;
+   double   refHigh;
+   double   refLow;
+   datetime ccTime;
+   datetime rcTime;
+   datetime entryTime;
+   double   entryPrice;
+   double   slPrice;
+   double   tpPrice;
+   double   riskAmount;
+   double   lots;
+   int      tradeSeqToday;
+   double   balanceBeforeEntry;
+   datetime exitTime;
+   double   exitPrice;
+   string   exitReason;
+   double   grossProfit;
+   double   commission;
+   double   swap;
+   double   mfePrice;   // continues updating past the actual exit, until trackUntil
+   double   maePrice;
+   datetime trackUntil;
+};
+
+SPendingLog g_pending[];
 
 CTrade   g_trade;
 datetime g_lastBarTime  = 0;
@@ -507,6 +544,17 @@ void ProcessNewBar()
 
 //+------------------------------------------------------------------+
 //| Trade journal — one CSV row per closed trade.                     |
+//|                                                                    |
+//| R_Realized is what the trade actually made under the current      |
+//| fixed 1:1 TP, so by construction it will basically always read    |
+//| ~+1 or ~-1 — it does NOT tell you whether a bigger target would   |
+//| have worked. MFE_R / MAE_R exist for that: they are NOT capped at |
+//| the actual exit. Once a trade closes it moves to a "pending"      |
+//| queue (see SPendingLog) where UpdatePendingExcursions() keeps     |
+//| extending mfePrice/maePrice for InpExcursionTrackingHours from    |
+//| ENTRY, same as if the trade had no stop or target at all, before  |
+//| the row is finally written. That's the number to look at when     |
+//| deciding what R:R target the next version should use.             |
 //+------------------------------------------------------------------+
 string CsvEscape(string s)
 {
@@ -526,51 +574,113 @@ void WriteTradeLogHeader()
       "ExitTime", "ExitPrice", "ExitReason",
       "GrossProfit", "Commission", "Swap", "NetProfit",
       "R_Realized", "MFE_R", "MAE_R",
+      "ExcursionWindowHours", "ExcursionComplete",
       "HoldingMinutes", "BalanceBefore", "BalanceAfter");
 }
 
-// isSell only affects the header meaning of MFE/MAE relative to entry;
-// everything else is read straight off the state snapshotted in TryOpen
-// and the close-deal details passed in from OnTradeTransaction.
-void WriteTradeLogRow(bool isSell, const SSignalState &st, long posId,
-                       datetime exitTime, double exitPrice, string exitReason,
-                       double grossProfit, double commission, double swap)
+// Queues a just-closed trade for extended tracking rather than writing it
+// immediately, so MFE_R/MAE_R can keep growing past the real exit. mfePrice/
+// maePrice carry over from st (already tracked live while the position was
+// open by UpdateExcursion) so the series is continuous from entry onward.
+void QueuePendingLog(bool isSell, const SSignalState &st, long posId,
+                      datetime exitTime, double exitPrice, string exitReason,
+                      double grossProfit, double commission, double swap)
+{
+   int n = ArraySize(g_pending);
+   ArrayResize(g_pending, n + 1);
+
+   g_pending[n].isSell             = isSell;
+   g_pending[n].posId              = posId;
+   g_pending[n].refTime            = st.refTime;
+   g_pending[n].refHigh            = st.refHigh;
+   g_pending[n].refLow             = st.refLow;
+   g_pending[n].ccTime             = st.ccTime;
+   g_pending[n].rcTime             = st.rcTime;
+   g_pending[n].entryTime          = st.entryTime;
+   g_pending[n].entryPrice         = st.entryPrice;
+   g_pending[n].slPrice            = st.slPrice;
+   g_pending[n].tpPrice            = st.tpPrice;
+   g_pending[n].riskAmount         = st.riskAmount;
+   g_pending[n].lots               = st.lots;
+   g_pending[n].tradeSeqToday      = st.tradeSeqToday;
+   g_pending[n].balanceBeforeEntry = st.balanceBeforeEntry;
+   g_pending[n].exitTime           = exitTime;
+   g_pending[n].exitPrice          = exitPrice;
+   g_pending[n].exitReason         = exitReason;
+   g_pending[n].grossProfit        = grossProfit;
+   g_pending[n].commission         = commission;
+   g_pending[n].swap               = swap;
+   g_pending[n].mfePrice           = st.mfePrice;
+   g_pending[n].maePrice           = st.maePrice;
+
+   datetime windowEnd = st.entryTime + InpExcursionTrackingHours * 3600;
+   g_pending[n].trackUntil = InpEnableExcursionTracking ? MathMax(exitTime, windowEnd) : exitTime;
+}
+
+void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
 {
    if(g_logHandle == INVALID_HANDLE)
       return;
 
-   double netProfit    = grossProfit + commission + swap;
-   double riskDistance = MathAbs(st.entryPrice - st.slPrice);
-   double rRealized    = (st.riskAmount > 0) ? netProfit / st.riskAmount : 0.0;
-   double mfeR          = (riskDistance > 0) ? MathAbs(st.entryPrice - st.mfePrice) / riskDistance : 0.0;
-   double maeR           = (riskDistance > 0) ? MathAbs(st.entryPrice - st.maePrice) / riskDistance : 0.0;
-   double holdingMinutes  = (double)(exitTime - st.entryTime) / 60.0;
-   double balanceAfter    = st.balanceBeforeEntry + netProfit;
+   double netProfit    = p.grossProfit + p.commission + p.swap;
+   double riskDistance = MathAbs(p.entryPrice - p.slPrice);
+   double rRealized    = (p.riskAmount > 0) ? netProfit / p.riskAmount : 0.0;
+   double mfeR          = (riskDistance > 0) ? MathAbs(p.entryPrice - p.mfePrice) / riskDistance : 0.0;
+   double maeR           = (riskDistance > 0) ? MathAbs(p.entryPrice - p.maePrice) / riskDistance : 0.0;
+   double holdingMinutes  = (double)(p.exitTime - p.entryTime) / 60.0;
+   double balanceAfter    = p.balanceBeforeEntry + netProfit;
 
-   datetime nairobiEntry = GetNairobiTime(st.entryTime);
+   datetime nairobiEntry = GetNairobiTime(p.entryTime);
    MqlDateTime dt;
    TimeToStruct(nairobiEntry, dt);
    string weekdayNames[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
    string nairobiDate = StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day);
 
    FileWrite(g_logHandle,
-      isSell ? "SELL" : "BUY", (string)posId,
-      TimeToString(st.refTime, TIME_DATE|TIME_MINUTES), DoubleToString(st.refHigh, _Digits), DoubleToString(st.refLow, _Digits),
-      TimeToString(st.ccTime, TIME_DATE|TIME_MINUTES), TimeToString(st.rcTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS),
-      TimeToString(st.entryTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(st.entryPrice, _Digits),
-      DoubleToString(st.slPrice, _Digits), DoubleToString(st.tpPrice, _Digits),
-      DoubleToString(InpRiskPercent, 2), DoubleToString(st.riskAmount, 2), DoubleToString(st.lots, 2), (string)st.tradeSeqToday,
+      p.isSell ? "SELL" : "BUY", (string)p.posId,
+      TimeToString(p.refTime, TIME_DATE|TIME_MINUTES), DoubleToString(p.refHigh, _Digits), DoubleToString(p.refLow, _Digits),
+      TimeToString(p.ccTime, TIME_DATE|TIME_MINUTES), TimeToString(p.rcTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS),
+      TimeToString(p.entryTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(p.entryPrice, _Digits),
+      DoubleToString(p.slPrice, _Digits), DoubleToString(p.tpPrice, _Digits),
+      DoubleToString(InpRiskPercent, 2), DoubleToString(p.riskAmount, 2), DoubleToString(p.lots, 2), (string)p.tradeSeqToday,
       nairobiDate, weekdayNames[dt.day_of_week], (string)dt.hour,
-      TimeToString(exitTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(exitPrice, _Digits), CsvEscape(exitReason),
-      DoubleToString(grossProfit, 2), DoubleToString(commission, 2), DoubleToString(swap, 2), DoubleToString(netProfit, 2),
+      TimeToString(p.exitTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS), DoubleToString(p.exitPrice, _Digits), CsvEscape(p.exitReason),
+      DoubleToString(p.grossProfit, 2), DoubleToString(p.commission, 2), DoubleToString(p.swap, 2), DoubleToString(netProfit, 2),
       DoubleToString(rRealized, 3), DoubleToString(mfeR, 3), DoubleToString(maeR, 3),
-      DoubleToString(holdingMinutes, 1), DoubleToString(st.balanceBeforeEntry, 2), DoubleToString(balanceAfter, 2));
+      (string)InpExcursionTrackingHours, windowComplete ? "true" : "false",
+      DoubleToString(holdingMinutes, 1), DoubleToString(p.balanceBeforeEntry, 2), DoubleToString(balanceAfter, 2));
    FileFlush(g_logHandle);
 }
 
+// Called every tick: extends MFE/MAE for every trade still in its tracking
+// window, and finalizes (writes + dequeues) any whose window has elapsed.
+void UpdatePendingExcursions(double bid, double ask)
+{
+   for(int i = ArraySize(g_pending) - 1; i >= 0; i--)
+   {
+      if(g_pending[i].isSell)
+      {
+         g_pending[i].mfePrice = MathMin(g_pending[i].mfePrice, bid);
+         g_pending[i].maePrice = MathMax(g_pending[i].maePrice, ask);
+      }
+      else
+      {
+         g_pending[i].mfePrice = MathMax(g_pending[i].mfePrice, ask);
+         g_pending[i].maePrice = MathMin(g_pending[i].maePrice, bid);
+      }
+
+      if(TimeCurrent() >= g_pending[i].trackUntil)
+      {
+         if(InpEnableTradeLog)
+            FinalizePendingLog(g_pending[i], true);
+         ArrayRemove(g_pending, i, 1);
+      }
+   }
+}
+
 //+------------------------------------------------------------------+
-//| A direction's open position just closed — record win/loss and    |
-//| write the full trade-journal row.                                 |
+//| A direction's open position just closed — record win/loss and     |
+//| queue the trade for the trade-journal write (see QueuePendingLog).|
 //| "Win" = closed net profit (profit + swap + commission) > 0.       |
 //+------------------------------------------------------------------+
 void HandlePositionClosed(bool isSell, SSignalState &st, long closedPosId,
@@ -583,7 +693,7 @@ void HandlePositionClosed(bool isSell, SSignalState &st, long closedPosId,
    double netProfit = grossProfit + commission + swap;
 
    if(InpEnableTradeLog)
-      WriteTradeLogRow(isSell, st, closedPosId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
+      QueuePendingLog(isSell, st, closedPosId, exitTime, exitPrice, exitReason, grossProfit, commission, swap);
 
    st.positionOpen = false;
    st.positionId   = 0;
@@ -618,6 +728,16 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   // Flush whatever excursion data was gathered for trades whose tracking
+   // window hadn't finished yet (e.g. the backtest/EA ended first) rather
+   // than silently dropping those rows.
+   for(int i = ArraySize(g_pending) - 1; i >= 0; i--)
+   {
+      if(InpEnableTradeLog)
+         FinalizePendingLog(g_pending[i], false);
+   }
+   ArrayFree(g_pending);
+
    if(g_logHandle != INVALID_HANDLE)
    {
       FileClose(g_logHandle);
@@ -647,6 +767,8 @@ void OnTick()
    MonitorRetest(false, g_buy,  bid, ask, mid);
    UpdateExcursion(true,  g_sell, bid, ask);
    UpdateExcursion(false, g_buy,  bid, ask);
+   if(InpEnableTradeLog)
+      UpdatePendingExcursions(bid, ask);
 
    g_prevMid     = mid;
    g_havePrevMid = true;
