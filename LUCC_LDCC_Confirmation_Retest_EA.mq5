@@ -106,6 +106,12 @@ input bool            InpEnablePathLog   = true;                        // Per-t
 input string          InpPathLogFileName = "LUCC_LDCC_PathLog.csv";     // Path-log CSV file
 input ENUM_TIMEFRAMES InpPathLogTimeframe = PERIOD_H1;                  // Granularity of the path log (H1 = entry
                                                                         // TF; set M15/M5 for a finer path)
+input bool   InpLogMissedSetups   = true;  // Log every armed setup (LUCC/LDCC + CC) that NEVER produced an RC
+                                           // entry, with a HYPOTHETICAL "enter at CC close, no retest" outcome.
+                                           // This is the RC-filter opportunity-cost dataset: how many setups we
+                                           // skipped by requiring the retest, and how far they would have run
+                                           // (unconstrained MaxFavR, and stop-constrained TP/SL) had we entered.
+input string InpMissedLogFileName = "LUCC_LDCC_MissedSetups.csv";      // Missed-setup (RC opportunity-cost) CSV
 
 input group "1W Bias Filter"
 input bool   InpUseBiasFilter        = true;  // Gate entries on the Weekly (1W) directional bias
@@ -178,6 +184,10 @@ struct SSignalState
    double   slLevel;    // the indicator's "Stop Loss Level" for this cycle
    datetime expiredRefTime; // a reference whose armed retest was EXPIRED at a day boundary: it stays
                             // dormant (no CC/entry) until a genuinely NEW reference appears. 0 = none.
+   bool     rcLevelTouched; // (missed-setup research) did price reach the retest level at least once while
+                            // this CC was armed but before any entry? Distinguishes "RC filter blocked us"
+                            // (touched, no entry) from "price never came back" (never touched). Reset when a
+                            // new CC arms / the reference changes; set on any retest touch (tick or bar close).
    int      tradesToday;
    bool     doneToday;   // true once a trade in this direction has won today
 };
@@ -325,6 +335,40 @@ struct SPendingLog
 
 SPendingLog g_pending[];
 
+//======================================================================
+// MISSED SETUP — one record per armed setup (LUCC/LDCC reference + a
+// closed Confirmation Candle) that NEVER produced a Retest-Candle entry,
+// so no real trade was ever taken. Captured the instant the setup is
+// abandoned (reference changed / lost, day-boundary expiration, or the
+// run ended while still armed). Each carries a HYPOTHETICAL "enter at the
+// CC close, ignore the retest requirement" trade so we can measure the
+// RC filter's opportunity cost: how far the setup would have run
+// unconstrained (MaxFavR -> 1R/2R/3R/4R buckets) and whether it would
+// have hit TP or SL first under the same padded stop / fixed-RR target.
+// Finalized (its future H1 path scanned) once the tracking window from
+// the CC has fully elapsed, mirroring the SPendingLog excursion mechanism.
+//======================================================================
+struct SMissedSetup
+{
+   bool     isSell;
+   datetime refTime; double refHigh; double refLow;
+   datetime ccTime;
+   double   slLevel;        // structural SL level frozen at the CC (same span the real trade would use)
+   double   hypoEntry;      // CC close — the hypothetical "no-retest" entry price
+   double   hypoSL;         // padded SL: hypoEntry +/- |hypoEntry - slLevel| * InpStopLossMultiplier
+   double   hypoTP;         // fixed-RR TP measured from the padded stop
+   double   initRiskDist;   // final padded risk distance = |hypoEntry - hypoSL| (the "1R" for the buckets)
+   string   reason;         // why it never entered: "RefChanged" / "RefLost" / "DayExpired" / "RunEnded"
+   bool     rcLevelTouched; // did price reach the retest level at all while armed (but no entry followed)?
+   bool     biasAllowed;    // was the Weekly bias supporting this side at discard? (real entries need this)
+   bool     dailyConfirm;   // did the Daily confirmation agree with this side at discard?
+   string   biasDir; string sideBiasText;
+   datetime biasCandleTime;
+   datetime discardTime;    // server time the setup was abandoned
+   datetime trackUntil;     // ccTime + InpExcursionTrackingHours*3600 — when its path is complete
+};
+SMissedSetup g_missed[];
+
 CTrade   g_trade;
 datetime g_lastBarTime  = 0;
 datetime g_lastResetDay = 0;
@@ -334,6 +378,7 @@ int      g_logHandle    = INVALID_HANDLE;
 int      g_logCols      = 0;                // column count from the header — row-width sanity guard
 int      g_pathHandle   = INVALID_HANDLE;   // per-trade bar-by-bar path log
 datetime g_lastPathBar  = 0;                // last path-TF bar already logged
+int      g_missedHandle = INVALID_HANDLE;   // missed-setup (RC opportunity-cost) log
 int      g_atrHandle    = INVALID_HANDLE;   // H1 ATR(14) — logged as volatility context at entry
 double   g_riskBalance  = 0.0;   // frozen once in OnInit; every trade's risk% is % of THIS, not of
                                   // the live/current balance, so wins/losses never change position size
@@ -359,6 +404,8 @@ long g_rejOrderFail  = 0;
 long g_skippedAfterWin = 0;   // setups skipped by the stop-after-first-win-per-weekly-bias rule
 long g_expiredPending  = 0;   // armed retest setups discarded at a day boundary (pending-expiration rule)
 long g_beDailyMoved    = 0;   // trades whose SL was moved to BE by the Daily-C1 break rule
+long g_missedCaptured  = 0;   // armed setups (CC formed) that never produced an RC entry (opportunity-cost log)
+long g_missedWouldWin  = 0;   // of those, how many the hypothetical "enter at CC close" trade would have WON
 
 double g_brokerStdOffsetHours   = 2.0;   // broker's resolved STANDARD (winter) UTC offset (hours)
 bool   g_brokerOffsetResolved   = false; // set once TimeCurrent/TimeGMT are valid (or manual mode)
@@ -488,6 +535,12 @@ void UpdateDirection(bool isSell, SSignalState &st)
    // the confirmation & retest state for this direction only.
    if(newRefTime != st.refTime)
    {
+      // The old setup is being abandoned. If it had armed (CC formed) but never
+      // produced an RC entry, log it as a missed setup BEFORE the state is wiped
+      // (RC opportunity-cost dataset). A na/changed reference are distinct reasons.
+      if(st.refTime != 0 && st.ccTime != 0 && st.rcTime == 0)
+         CaptureMissedSetup(isSell, st, (newRefTime == 0) ? "RefLost" : "RefChanged");
+
       st.refTime = newRefTime;
       st.refHigh = newRefHigh;
       st.refLow  = newRefLow;
@@ -495,6 +548,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
       st.rcTime  = 0;
       st.slLevel = 0;
       st.lastAttemptBar = 0;
+      st.rcLevelTouched = false;
       // A genuinely NEW (non-zero) reference clears any pending-expiration lock,
       // so the fresh setup can arm normally. A reference that becomes na (0) or
       // that returns to the previously expired one keeps the lock in place.
@@ -517,6 +571,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
       if(ccTriggered)
       {
          st.ccTime = BarTime(0);
+         st.rcLevelTouched = false;   // fresh arm — no retest touch has happened yet for this CC
 
          // Stop Loss Level — highest high (sell) / lowest low (buy) from the
          // reference candle through the CC, inclusive. Same span the
@@ -549,6 +604,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
       if(brackets)
       {
          st.lastAttemptBar = BarTime(0);
+         st.rcLevelTouched = true;   // the retest level WAS reached (for missed-setup analysis)
          g_cntTouch++;
          Dbg(StringFormat("%s RETEST touch (bar close) @ %s level %.5f",
                           isSell ? "SELL" : "BUY", TimeToString(GetNairobiTime(BarTime(0)), TIME_DATE | TIME_MINUTES), level));
@@ -595,6 +651,7 @@ void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double
    // Throttle to one entry attempt per H1 bar per side, so a sustained
    // straddle doesn't spam TryOpen (and the Experts log) every tick.
    datetime curBar = iTime(_Symbol, PERIOD_H1, 0);
+   st.rcLevelTouched = true;   // the retest level WAS reached (for missed-setup analysis)
    if(st.lastAttemptBar == curBar)
       return;
    st.lastAttemptBar = curBar;
@@ -910,10 +967,13 @@ void ExpirePendingIfArmed(bool isSell, SSignalState &st)
    bool armedUntriggered = (st.refTime != 0 && st.ccTime != 0 && st.rcTime == 0);
    if(!armedUntriggered)
       return;
+   // Log the abandoned setup for the RC opportunity-cost dataset before wiping it.
+   CaptureMissedSetup(isSell, st, "DayExpired");
    st.expiredRefTime = st.refTime;
    st.ccTime         = 0;
    st.slLevel        = 0;
    st.lastAttemptBar = 0;
+   st.rcLevelTouched = false;
    g_expiredPending++;
    Dbg(StringFormat("%s PENDING EXPIRED at new day: untriggered retest on ref @ %s discarded; awaiting a new setup",
                     isSell ? "SELL" : "BUY", TimeToString(GetNairobiTime(st.expiredRefTime), TIME_DATE | TIME_MINUTES)));
@@ -1584,6 +1644,204 @@ void WritePathBars()
    FileFlush(g_pathHandle);
 }
 
+//======================================================================
+// MISSED-SETUP LOGGING (RC-filter opportunity cost)
+//======================================================================
+
+// Captures an armed setup (LUCC/LDCC reference + closed CC) that never
+// produced an RC entry, building the HYPOTHETICAL "enter at CC close,
+// ignore the retest" trade (same padded stop / fixed-RR target the real
+// entry would use). Pushed onto g_missed[] and finalized later once its
+// tracking window from the CC has elapsed (see FinalizeMissedSetup()).
+// MUST be called with the setup's ORIGINAL state, before it is wiped.
+void CaptureMissedSetup(bool isSell, const SSignalState &st, string reason)
+{
+   if(!InpLogMissedSetups)
+      return;
+   if(st.refTime == 0 || st.ccTime == 0)   // only armed-but-un-entered setups qualify
+      return;
+
+   // Hypothetical entry = the CC close (the first moment a real trade could
+   // have been taken had the retest requirement not existed).
+   int ccShift = iBarShift(_Symbol, PERIOD_H1, st.ccTime, true);
+   if(ccShift < 0)
+      return;
+   double hypoEntry = iClose(_Symbol, PERIOD_H1, ccShift);
+   if(hypoEntry <= 0.0)
+      return;
+
+   double structuralSl = st.slLevel;
+   // The structural stop must sit on the correct side of the CC-close entry,
+   // exactly as TryOpen requires — otherwise the hypothetical trade is invalid.
+   if(structuralSl <= 0.0 || (isSell && structuralSl <= hypoEntry) || (!isSell && structuralSl >= hypoEntry))
+      return;
+
+   double origRange  = MathAbs(hypoEntry - structuralSl);
+   double finalRange = origRange * InpStopLossMultiplier;
+   double hypoSL     = isSell ? hypoEntry + finalRange : hypoEntry - finalRange;
+   double hypoTP     = isSell ? hypoEntry - finalRange * InpTakeProfitRMultiple
+                              : hypoEntry + finalRange * InpTakeProfitRMultiple;
+
+   SMissedSetup m;
+   m.isSell         = isSell;
+   m.refTime        = st.refTime;  m.refHigh = st.refHigh;  m.refLow = st.refLow;
+   m.ccTime         = st.ccTime;
+   m.slLevel        = structuralSl;
+   m.hypoEntry      = hypoEntry;
+   m.hypoSL         = hypoSL;
+   m.hypoTP         = hypoTP;
+   m.initRiskDist   = finalRange;
+   m.reason         = reason;
+   m.rcLevelTouched = st.rcLevelTouched;
+   m.biasAllowed    = isSell ? SellBiasAllowed() : BuyBiasAllowed();
+   m.dailyConfirm   = !InpUseDailyConfirmation ? true : (isSell ? DailySellConfirms() : DailyBuyConfirms());
+   m.biasDir        = g_bias.dir;
+   m.sideBiasText   = isSell ? g_bias.sellText : g_bias.buyText;
+   m.biasCandleTime = g_bias.c1Time;
+   m.discardTime    = TimeCurrent();
+   m.trackUntil     = st.ccTime + (datetime)((long)InpExcursionTrackingHours * 3600);
+
+   int n = ArraySize(g_missed);
+   ArrayResize(g_missed, n + 1);
+   g_missed[n] = m;
+   g_missedCaptured++;
+   Dbg(StringFormat("%s MISSED SETUP captured (%s): CC @ %s hypoEntry=%.5f hypoSL=%.5f hypoTP=%.5f touched=%s biasOK=%s (queued=%d)",
+                    isSell ? "SELL" : "BUY", reason, FmtNairobi(st.ccTime), hypoEntry, hypoSL, hypoTP,
+                    st.rcLevelTouched ? "yes" : "no", m.biasAllowed ? "yes" : "no", ArraySize(g_missed)));
+}
+
+void WriteMissedHeader()
+{
+   if(g_missedHandle == INVALID_HANDLE)
+      return;
+   FileWrite(g_missedHandle,
+      "MissID,Direction,EntryPattern,DiscardReason,RCLevelTouched,BiasDirection,TradeSideBiasPatterns,"
+      "BiasAllowed,DailyConfirm,BiasCandleTime,RefCandleTime,RefHigh,RefLow,CCTime,DiscardTime,BarsArmed,"
+      "HypoEntry,StructuralSL,HypoSL,HypoTP,InitRiskPips,MaxFavR,MaxAdvR,"
+      "Reached1R,Reached2R,Reached3R,Reached4R,ConstrainedOutcome,WouldBeWin,TimeToTP,TimeToSL,BarsScanned,TrackHours");
+}
+
+// Scans the CC's forward H1 path (up to trackUntil) and writes one row:
+//  * unconstrained MaxFavR / MaxAdvR (ignores the stop — how far it ran)
+//  * the R buckets it reached (1R/2R/3R/4R+)
+//  * the stop-CONSTRAINED outcome under the padded SL + fixed-RR TP, scanned
+//    bar-by-bar with a PESSIMISTIC SL-first rule (if a bar's range brackets
+//    both levels, the stop is assumed hit first) — TP / SL / OPEN.
+void FinalizeMissedSetup(const SMissedSetup &m)
+{
+   if(g_missedHandle == INVALID_HANDLE)
+      return;
+
+   double pip  = PipSize();
+   double risk = m.initRiskDist;
+
+   double maxFav = 0.0, maxAdv = 0.0;   // in price, relative to hypoEntry
+   string outcome = "OPEN";
+   datetime tpTime = 0, slTime = 0;
+   int barsScanned = 0;
+
+   int ccShift = iBarShift(_Symbol, PERIOD_H1, m.ccTime, true);
+   if(ccShift < 0)
+      ccShift = 0;
+   // Walk bars strictly AFTER the CC bar, newest shift last. shift 0 is the
+   // live bar; the bt>ccTime / bt<=trackUntil guards keep the scan in-window.
+   for(int sh = ccShift - 1; sh >= 0; sh--)
+   {
+      datetime bt = iTime(_Symbol, PERIOD_H1, sh);
+      if(bt == 0 || bt <= m.ccTime)
+         continue;
+      if(bt > m.trackUntil)
+         break;
+      double hi = iHigh(_Symbol, PERIOD_H1, sh);
+      double lo = iLow(_Symbol, PERIOD_H1, sh);
+      if(hi <= 0.0 || lo <= 0.0)
+         continue;
+      barsScanned++;
+
+      double fav = m.isSell ? (m.hypoEntry - lo) : (hi - m.hypoEntry);   // best-case move in our favor
+      double adv = m.isSell ? (m.hypoEntry - hi) : (lo - m.hypoEntry);   // worst-case move against us (<=0)
+      maxFav = MathMax(maxFav, fav);
+      maxAdv = MathMin(maxAdv, adv);
+
+      if(outcome == "OPEN")
+      {
+         bool slHit = m.isSell ? (hi >= m.hypoSL) : (lo <= m.hypoSL);
+         bool tpHit = m.isSell ? (lo <= m.hypoTP) : (hi >= m.hypoTP);
+         if(slHit)      { outcome = "SL"; slTime = bt; }
+         else if(tpHit) { outcome = "TP"; tpTime = bt; }
+      }
+   }
+
+   double maxFavR = (risk > 0.0) ? maxFav / risk : 0.0;
+   double maxAdvR = (risk > 0.0) ? maxAdv / risk : 0.0;   // negative
+   bool   wouldWin = (outcome == "TP");
+   if(wouldWin)
+      g_missedWouldWin++;
+
+   // How many H1 bars the setup stayed armed (CC close -> discard) before it was
+   // abandoned for never producing an RC — i.e. how long the retest never came.
+   int barsArmed = (m.discardTime > m.ccTime) ? (int)((long)(m.discardTime - m.ccTime) / 3600) : 0;
+
+   // Build the row explicitly (stable column order = WriteMissedHeader()).
+   // MissID = CC bar time + side, a stable unique key per missed setup.
+   string row =
+        (string)m.ccTime + "-" + (m.isSell ? "S" : "B") + ","
+      + (m.isSell ? "SELL" : "BUY") + ","
+      + (m.isSell ? "LUCC" : "LDCC") + ","
+      + m.reason + ","
+      + (m.rcLevelTouched ? "1" : "0") + ","
+      + CsvEscape(m.biasDir) + ","
+      + CsvEscape(m.sideBiasText) + ","
+      + (m.biasAllowed ? "1" : "0") + ","
+      + (m.dailyConfirm ? "1" : "0") + ","
+      + FmtNairobi(m.biasCandleTime) + ","
+      + FmtNairobi(m.refTime) + ","
+      + DoubleToString(m.refHigh, _Digits) + ","
+      + DoubleToString(m.refLow, _Digits) + ","
+      + FmtNairobi(m.ccTime) + ","
+      + FmtNairobi(m.discardTime) + ","
+      + (string)barsArmed + ","
+      + DoubleToString(m.hypoEntry, _Digits) + ","
+      + DoubleToString(m.slLevel, _Digits) + ","
+      + DoubleToString(m.hypoSL, _Digits) + ","
+      + DoubleToString(m.hypoTP, _Digits) + ","
+      + DoubleToString(pip > 0.0 ? m.initRiskDist / pip : 0.0, 1) + ","
+      + DoubleToString(maxFavR, 3) + ","
+      + DoubleToString(maxAdvR, 3) + ","
+      + (maxFavR >= 1.0 ? "1" : "0") + ","
+      + (maxFavR >= 2.0 ? "1" : "0") + ","
+      + (maxFavR >= 3.0 ? "1" : "0") + ","
+      + (maxFavR >= 4.0 ? "1" : "0") + ","
+      + outcome + ","
+      + (wouldWin ? "1" : "0") + ","
+      + FmtNairobi(tpTime) + ","
+      + FmtNairobi(slTime) + ","
+      + (string)barsScanned + ","
+      + (string)InpExcursionTrackingHours;
+   FileWrite(g_missedHandle, row);
+   FileFlush(g_missedHandle);
+}
+
+// Finalize every queued missed setup whose forward tracking window is complete
+// (its whole CC-forward path is now available). Removes finalized entries.
+void ProcessMissedFinalize(bool force)
+{
+   if(g_missedHandle == INVALID_HANDLE)
+      return;
+   datetime now = TimeCurrent();
+   for(int i = ArraySize(g_missed) - 1; i >= 0; i--)
+   {
+      if(force || now >= g_missed[i].trackUntil)
+      {
+         FinalizeMissedSetup(g_missed[i]);
+         int last = ArraySize(g_missed) - 1;
+         if(i != last)
+            g_missed[i] = g_missed[last];
+         ArrayResize(g_missed, last);
+      }
+   }
+}
+
 // The single source of truth for the column layout. FinalizePendingLog()
 // builds its value array in this exact order.
 void WriteTradeLogHeader()
@@ -2208,6 +2466,18 @@ int OnInit()
             Print("LUCC/LDCC EA: PATH LOG -> ", FullFilePath(InpPathLogFileName));
          }
       }
+
+      if(InpLogMissedSetups)
+      {
+         g_missedHandle = FileOpen(InpMissedLogFileName, FileFlagsCsv(), ',');
+         if(g_missedHandle == INVALID_HANDLE)
+            PrintFormat("LUCC/LDCC EA: could not open missed-setup log '%s', error=%d", InpMissedLogFileName, GetLastError());
+         else
+         {
+            WriteMissedHeader();
+            Print("LUCC/LDCC EA: MISSED-SETUP LOG -> ", FullFilePath(InpMissedLogFileName));
+         }
+      }
    }
 
    // One-shot config snapshot so the current filter setup is always visible at
@@ -2245,6 +2515,19 @@ void OnDeinit(const int reason)
                g_rejPosOpen, g_rejDoneToday, g_rejMaxTrades, g_rejBias, g_rejDailyConf,
                g_rejSlInvalid, g_rejMinStop, g_rejLots, g_rejOrderFail);
 
+   // Any setup still armed (CC formed, no RC entry) when the run ends is also a
+   // missed setup — capture it before flushing so its opportunity cost is logged.
+   if(InpLogMissedSetups)
+   {
+      if(g_sell.refTime != 0 && g_sell.ccTime != 0 && g_sell.rcTime == 0)
+         CaptureMissedSetup(true,  g_sell, "RunEnded");
+      if(g_buy.refTime != 0 && g_buy.ccTime != 0 && g_buy.rcTime == 0)
+         CaptureMissedSetup(false, g_buy,  "RunEnded");
+      ProcessMissedFinalize(true);   // force-write all queued missed setups (partial windows included)
+      PrintFormat("LUCC/LDCC EA MISSED-SETUP: captured=%d wouldWin(hypoTP)=%d (armed CC that never produced an RC entry)",
+                  g_missedCaptured, g_missedWouldWin);
+   }
+
    // Flush whatever excursion data was gathered for trades whose tracking
    // window hadn't finished yet (e.g. the backtest/EA ended first) rather
    // than silently dropping those rows.
@@ -2254,6 +2537,7 @@ void OnDeinit(const int reason)
          FinalizePendingLog(g_pending[i], false);
    }
    ArrayFree(g_pending);
+   ArrayFree(g_missed);
    ArrayFree(g_openTrades);
    ArrayFree(g_sellWinEpisodes);
    ArrayFree(g_buyWinEpisodes);
@@ -2281,6 +2565,12 @@ void OnDeinit(const int reason)
    {
       FileClose(g_pathHandle);
       g_pathHandle = INVALID_HANDLE;
+   }
+
+   if(g_missedHandle != INVALID_HANDLE)
+   {
+      FileClose(g_missedHandle);
+      g_missedHandle = INVALID_HANDLE;
    }
 }
 
@@ -2318,6 +2608,8 @@ void OnTick()
    UpdateDailyBreakeven(bid, ask);   // move SL to BE when price trades beyond Daily Candle-1
    if(InpEnableTradeLog)
       UpdatePendingExcursions(bid, ask);
+   if(InpLogMissedSetups)
+      ProcessMissedFinalize(false);   // write missed setups whose CC-forward window is complete
 
    // Info panel — skip entirely during optimization (no chart, and the
    // object churn would only slow the agents down).
