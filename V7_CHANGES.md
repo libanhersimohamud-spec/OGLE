@@ -1,6 +1,52 @@
-# LUCC/LDCC Confirmation & Retest EA — V6 changelog
+# LUCC/LDCC Confirmation & Retest EA — V7 changelog
 
-Built on the uploaded **V5_1** baseline (the new official baseline; V1–V4 are ignored).
+## V7 — Second independent trading engine (2W → 2D → 1H)
+
+Two fully independent engines now run side by side, sharing only the execution
+infrastructure and stateless utilities:
+
+- **Engine 0 — `1W-1D`**: the original 1W → 1D → 1H path, behaviour unchanged.
+- **Engine 1 — `2W-2D`**: identical logic, with the higher timeframes doubled
+  (2-Week bias, 2-Day confirmation). Same LUCC/LDCC/CC/RC detection, entry &
+  pending-order logic, min-SL floor, target fixation, partial/BE/target-lock
+  management, stale-entry & Daily-break invalidation, and logging.
+
+**How independence is achieved**
+- A global engine context (`g_curEng`) makes every higher-TF candle accessor
+  (`W*`/`D*`) and every pattern function resolve to that engine's timeframe — the
+  signal code itself is unchanged and shared.
+- All *trading state* is per-engine: `g_bias[2]`, `g_sell[2]`/`g_buy[2]` (setup /
+  LUCC/LDCC / CC / RC / daily counters / doneToday), engine-tagged open trades,
+  pending limits, missed/skipped records, win-episodes, and weekly stats. Neither
+  engine can block, complete, or otherwise affect the other.
+- Trade *management* (BE @1.2R, 50% partial @2R, 82%→50% profit lock, stops,
+  excursions, logging) is shared code that acts on each trade's own frozen
+  parameters, so both engines are managed identically and independently.
+
+**Synthetic higher-timeframe candles (Engine 1)**
+- **2-Day** = non-overlapping consecutive weekday pairs: Mon-Tue, Wed-Thu,
+  Fri-Mon, Tue-Wed, Thu-Fri, … (weekends folded into the Fri→Mon pair; realigns
+  to Mon-Tue every two weeks). Deterministic via a Monday epoch and weekday-index
+  pairing.
+- **2-Week** = discrete non-overlapping 2-week blocks (two consecutive weekly
+  candles per block).
+- Built by aggregating native D1/W1 bars; the forming block updates live intrabar.
+
+**Logging**
+- Every per-trade row, opportunity-cost row, and weekly-stats row carries an
+  **`Engine`** column (`1W-1D` / `2W-2D`) so each engine can be analysed alone or
+  together. CSV files are shared (one dataset, engine-tagged).
+
+**Operational note:** the daily reset cycle (per-day trade limit, `doneToday`,
+pending-expiration at the new Nairobi day) is shared/calendar-based for both
+engines; the *signal* structure (2W bias, 2D confirmation, 2D Daily-C1 levels) is
+fully adapted per engine. `InpMoveToBEOnDailyBreak` remains off by default.
+
+---
+
+## V6 changelog (unchanged, still in effect)
+
+Built on the uploaded **V5_1** baseline (V1–V4 are ignored).
 No signal-detection logic (LUCC/LDCC/CC/RC, weekly bias, daily patterns) was changed —
 only entry/exit management and logging.
 

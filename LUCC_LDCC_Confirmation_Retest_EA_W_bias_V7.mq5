@@ -1,8 +1,27 @@
 //+------------------------------------------------------------------+
-//|              LUCC_LDCC_Confirmation_Retest_EA_V6.mq5             |
+//|              LUCC_LDCC_Confirmation_Retest_EA_V7.mq5             |
 //|                                                                    |
 //| Expert Advisor port of "LUCC / LDCC Confirmation & Retest         |
 //| Indicator" (Pine v6).                                              |
+//|                                                                    |
+//| ==== V7 CHANGES — SECOND INDEPENDENT ENGINE ===================== |
+//| Two fully independent trading engines run side by side, sharing    |
+//| ONLY the execution infrastructure and stateless utilities:         |
+//|   Engine 0: 1W -> 1D -> 1H  (the original path, behaviour unchanged)|
+//|   Engine 1: 2W -> 2D -> 1H  (identical logic, higher TFs doubled)   |
+//| The ONLY difference is the higher-timeframe candle source. A global |
+//| engine context (g_curEng) makes every W*/D* accessor and every      |
+//| pattern function resolve to that engine's timeframe with no change  |
+//| to the signal code. 2-Day candles = non-overlapping consecutive     |
+//| weekday pairs (Mon-Tue / Wed-Thu / Fri-Mon, realigning every 2      |
+//| weeks); 2-Week candles = discrete non-overlapping 2-week blocks.    |
+//| Each engine keeps its OWN bias, setup/LUCC/LDCC/CC/RC state,        |
+//| pending orders, open trades, counters, win-episodes, weekly-stop,   |
+//| and statistics; neither ever blocks or affects the other. Every     |
+//| CSV row carries an Engine column ("1W-1D" / "2W-2D"). Trade         |
+//| MANAGEMENT (BE / partial / lock / stops / logging) is shared code   |
+//| that acts on each trade's own frozen parameters, so both engines    |
+//| are managed identically and independently.                         |
 //|                                                                    |
 //| ==== V6 CHANGES ================================================== |
 //| 1. MIN STOP-LOSS FLOOR (10 pips, already buffered — no extra x1.3): |
@@ -317,8 +336,9 @@ struct SSignalState
    bool     doneToday;   // true once a trade in this direction has won today
 };
 
-SSignalState g_sell;   // SELL side, driven by the Bullish LUCC
-SSignalState g_buy;    // BUY side,  driven by the Bearish LDCC
+// Per-engine signal state: [ENG_1W1D] = 1W->1D->1H, [ENG_2W2D] = 2W->2D->1H.
+SSignalState g_sell[NUM_ENGINES];   // SELL side, driven by the Bullish LUCC (one per engine)
+SSignalState g_buy[NUM_ENGINES];    // BUY side,  driven by the Bearish LDCC (one per engine)
 
 //======================================================================
 // One record per CURRENTLY-OPEN trade. MULTIPLE may be open at once — even
@@ -330,6 +350,7 @@ SSignalState g_buy;    // BUY side,  driven by the Bearish LDCC
 //======================================================================
 struct SOpenTrade
 {
+   int      engine;         // V7: which engine owns this trade (ENG_1W1D / ENG_2W2D)
    bool     isSell;
    long     positionId;
    datetime episode;        // weekly-bias candle time this trade belongs to (bias identity)
@@ -403,58 +424,60 @@ SPendingEntry g_pendingEntries[];
 // Enforces "only one winning trade per weekly-bias instance"; because an
 // episode IS a weekly candle, each new week is automatically a fresh,
 // independent instance and the restriction resets with no lingering state.
-datetime g_sellWinEpisodes[];
-datetime g_buyWinEpisodes[];
+// V7: win episodes are engine-tagged so each engine's "one win per weekly-bias
+// episode" rule is fully independent (a win in one engine never blocks the other).
+struct SWinEpisode { int engine; bool isSell; datetime episode; };
+SWinEpisode g_winEpisodes[];
 
-bool HasOpenTradeForEpisode(bool isSell, datetime episode)
+// All open-trade / pending / win queries are engine-scoped: engine 1 (1W->1D)
+// and engine 2 (2W->2D) are counted separately so neither ever blocks the other.
+bool HasOpenTradeForEpisode(int eng, bool isSell, datetime episode)
 {
    for(int i = 0; i < ArraySize(g_openTrades); i++)
-      if(g_openTrades[i].isSell == isSell && g_openTrades[i].episode == episode)
+      if(g_openTrades[i].engine == eng && g_openTrades[i].isSell == isSell && g_openTrades[i].episode == episode)
          return true;
    return false;
 }
 // V5: a Case-1 limit is not yet in g_openTrades, so also check the pending
 // limits when enforcing "one trade per weekly-bias episode per side".
-bool HasPendingLimitForEpisode(bool isSell, datetime episode)
+bool HasPendingLimitForEpisode(int eng, bool isSell, datetime episode)
 {
    for(int i = 0; i < ArraySize(g_pendingEntries); i++)
-      if(g_pendingEntries[i].snap.isSell == isSell && g_pendingEntries[i].snap.episode == episode)
+      if(g_pendingEntries[i].snap.engine == eng && g_pendingEntries[i].snap.isSell == isSell
+         && g_pendingEntries[i].snap.episode == episode)
          return true;
    return false;
 }
-bool HasOpenTrade(bool isSell)
+bool HasOpenTrade(int eng, bool isSell)
 {
    for(int i = 0; i < ArraySize(g_openTrades); i++)
-      if(g_openTrades[i].isSell == isSell)
+      if(g_openTrades[i].engine == eng && g_openTrades[i].isSell == isSell)
          return true;
    return false;
 }
-int OpenTradeCount(bool isSell)
+int OpenTradeCount(int eng, bool isSell)
 {
    int c = 0;
    for(int i = 0; i < ArraySize(g_openTrades); i++)
-      if(g_openTrades[i].isSell == isSell)
+      if(g_openTrades[i].engine == eng && g_openTrades[i].isSell == isSell)
          c++;
    return c;
 }
-bool HasWinEpisode(bool isSell, datetime episode)
+bool HasWinEpisode(int eng, bool isSell, datetime episode)
 {
    if(episode == 0)
       return false;
-   if(isSell)
-   { for(int i = 0; i < ArraySize(g_sellWinEpisodes); i++) if(g_sellWinEpisodes[i] == episode) return true; }
-   else
-   { for(int i = 0; i < ArraySize(g_buyWinEpisodes); i++) if(g_buyWinEpisodes[i] == episode) return true; }
+   for(int i = 0; i < ArraySize(g_winEpisodes); i++)
+      if(g_winEpisodes[i].engine == eng && g_winEpisodes[i].isSell == isSell && g_winEpisodes[i].episode == episode)
+         return true;
    return false;
 }
-void AddWinEpisode(bool isSell, datetime episode)
+void AddWinEpisode(int eng, bool isSell, datetime episode)
 {
-   if(HasWinEpisode(isSell, episode))
+   if(HasWinEpisode(eng, isSell, episode))
       return;
-   if(isSell)
-   { int n = ArraySize(g_sellWinEpisodes); ArrayResize(g_sellWinEpisodes, n + 1); g_sellWinEpisodes[n] = episode; }
-   else
-   { int n = ArraySize(g_buyWinEpisodes);  ArrayResize(g_buyWinEpisodes, n + 1);  g_buyWinEpisodes[n] = episode; }
+   int n = ArraySize(g_winEpisodes); ArrayResize(g_winEpisodes, n + 1);
+   g_winEpisodes[n].engine = eng; g_winEpisodes[n].isSell = isSell; g_winEpisodes[n].episode = episode;
 }
 
 //======================================================================
@@ -464,6 +487,7 @@ void AddWinEpisode(bool isSell, datetime episode)
 //======================================================================
 struct SPendingLog
 {
+   int      engine;         // V7: owning engine (ENG_1W1D / ENG_2W2D)
    bool     isSell;
    long     posId;
    datetime refTime;
@@ -562,6 +586,7 @@ struct SMissedSetup
    double   hypoTP;         // fixed-RR TP measured from the padded stop
    double   initRiskDist;   // final padded risk distance = |hypoEntry - hypoSL| (the "1R" for the buckets)
    string   reason;         // why it never entered: "RefChanged" / "RefLost" / "DayExpired" / "RunEnded"
+   int      engine;         // V7: owning engine (ENG_1W1D / ENG_2W2D)
    bool     rcLevelTouched; // did price reach the retest level at all while armed (but no entry followed)?
    bool     biasAllowed;    // was the Weekly bias supporting this side at discard? (real entries need this)
    bool     dailyConfirm;   // did the Daily confirmation agree with this side at discard?
@@ -1095,11 +1120,6 @@ void UpdateDailyBreakeven(double bid, double ask)
    if(!InpMoveToBEOnDailyBreak || iBars(_Symbol, PERIOD_D1) < 2)
       return;
 
-   double dC1High = iHigh(_Symbol, PERIOD_D1, 1);
-   double dC1Low  = iLow(_Symbol, PERIOD_D1, 1);
-   double dHiNow  = MathMax(iHigh(_Symbol, PERIOD_D1, 0), ask); // Daily high so far, incl. live tick
-   double dLoNow  = MathMin(iLow(_Symbol, PERIOD_D1, 0), bid);  // Daily low  so far, incl. live tick
-
    double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double minDist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
    int    digits  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
@@ -1108,6 +1128,13 @@ void UpdateDailyBreakeven(double bid, double ask)
    {
       if(g_openTrades[i].beArmed || g_openTrades[i].tgtLockArmed)
          continue; // already at BE, or already advanced to the target-% lock (never loosen it)
+
+      // V7: the "Daily Candle-1" here is THIS trade's engine timeframe (1D or 2D).
+      g_curEng = g_openTrades[i].engine;
+      double dC1High = DHigh(1);
+      double dC1Low  = DLow(1);
+      double dHiNow  = MathMax(DHigh(0), ask); // running (2-)day high so far, incl. live tick
+      double dLoNow  = MathMin(DLow(0),  bid); // running (2-)day low  so far, incl. live tick
 
       bool trigger = g_openTrades[i].isSell ? (dLoNow < dC1Low) : (dHiNow > dC1High);
       if(!trigger)
@@ -1409,25 +1436,33 @@ void CheckDailyReset()
 
    if(today != g_lastResetDay)
    {
-      // Once-a-day progress heartbeat so the funnel is visible DURING the run,
-      // not only at the end — refs/CCs/touches/entries so far, plus the live
-      // Weekly-bias state that is currently gating entries.
+      // Once-a-day progress heartbeat (shared funnel counters) + each engine's bias.
       if(g_lastResetDay != 0)
-         Dbg(StringFormat("DAY %04d.%02d.%02d | funnel refs=%d CCs=%d touches=%d entries=%d | bias dir=%s buy=[%s]%s sell=[%s]%s",
-                          dt.year, dt.mon, dt.day, g_cntRef, g_cntCc, g_cntTouch, g_cntEntries, g_bias.dir,
-                          g_bias.buyText,  g_bias.buyInvalid  ? " INVALID" : "",
-                          g_bias.sellText, g_bias.sellInvalid ? " INVALID" : ""));
+      {
+         Dbg(StringFormat("DAY %04d.%02d.%02d | funnel refs=%d CCs=%d touches=%d entries=%d",
+                          dt.year, dt.mon, dt.day, g_cntRef, g_cntCc, g_cntTouch, g_cntEntries));
+         for(int e = 0; e < NUM_ENGINES; e++)
+            Dbg(StringFormat("   [%s] bias dir=%s buy=[%s]%s sell=[%s]%s", EngineName(e), g_bias[e].dir,
+                             g_bias[e].buyText,  g_bias[e].buyInvalid  ? " INVALID" : "",
+                             g_bias[e].sellText, g_bias[e].sellInvalid ? " INVALID" : ""));
+      }
 
-      // Expire any armed-but-untriggered pending retest — a clean slate each day.
-      ExpirePendingIfArmed(true,  g_sell);
-      ExpirePendingIfArmed(false, g_buy);
+      // V7: expire each engine's armed-but-untriggered retest, and reset each
+      // engine's per-side daily counters. Engines are reset independently.
+      for(int e = 0; e < NUM_ENGINES; e++)
+      {
+         g_curEng = e;
+         RebuildSyntheticFor(e);
+         ExpirePendingIfArmed(true,  g_sell[e]);
+         ExpirePendingIfArmed(false, g_buy[e]);
+         g_sell[e].tradesToday = 0; g_sell[e].doneToday = false;
+         g_buy[e].tradesToday  = 0; g_buy[e].doneToday  = false;
+      }
 
-      // V5: cancel any unfilled Case-1 entry-adjustment limit orders at the new day.
+      // V5/V7: cancel any unfilled Case-1 limits (both engines) at the new day.
       CancelPendingLimits();
 
       g_lastResetDay = today;
-      g_sell.tradesToday = 0; g_sell.doneToday = false;
-      g_buy.tradesToday  = 0; g_buy.doneToday  = false;
    }
 }
 
@@ -1447,10 +1482,114 @@ void CheckDailyReset()
 // The bias only GATES whether a Retest-Candle entry is actionable — it
 // never touches the LUCC/LDCC/CC/RC detection above.
 //======================================================================
-double WOpen(int s)  { return iOpen(_Symbol, PERIOD_W1, s); }
-double WHigh(int s)  { return iHigh(_Symbol, PERIOD_W1, s); }
-double WLow(int s)   { return iLow(_Symbol, PERIOD_W1, s); }
-double WClose(int s) { return iClose(_Symbol, PERIOD_W1, s); }
+//======================================================================
+// V7 — DUAL ENGINE INFRASTRUCTURE
+// Engine 0 = 1W -> 1D -> 1H (the original, unchanged behaviour).
+// Engine 1 = 2W -> 2D -> 1H (synthetic higher timeframes; identical logic).
+// A single global "current engine" context (g_curEng) makes every higher-
+// timeframe candle accessor (W*/D*) and every pattern function resolve to the
+// right timeframe with no change to the pattern code itself. All trading STATE
+// is per-engine (see g_bias[2]/g_sell[2]/g_buy[2], engine-tagged trade records,
+// and the per-engine win-episode store); the two engines never share state.
+//======================================================================
+#define ENG_1W1D 0
+#define ENG_2W2D 1
+#define NUM_ENGINES 2
+int g_curEng = ENG_1W1D;   // engine whose higher-TF candles the accessors resolve to
+string EngineName(int e) { return (e == ENG_2W2D) ? "2W-2D" : "1W-1D"; }
+
+// Monday epoch for deterministic 2-day / 2-week bucketing (2000-01-03 = Monday).
+#define EPOCH_MON  (datetime)946857600   // 2000.01.03 00:00:00 UTC
+
+// 2-DAY bucket id for a bar date: non-overlapping consecutive WEEKDAY pairs,
+// Mon-Tue / Wed-Thu / Fri-Mon / Tue-Wed / Thu-Fri ... (weekends folded into
+// the Friday->Monday pair). Weekday index counts Mon-Fri only from the Monday
+// epoch, so floor(index/2) yields exactly the agreed non-overlapping pairing
+// (realigns to Mon-Tue every two weeks).
+long Bucket2D(datetime t)
+{
+   long calDays = (long)((long)(t - EPOCH_MON) / 86400);
+   long weeks   = calDays / 7;
+   long dow     = calDays - weeks * 7;          // 0 = Mon .. 6 = Sun (epoch is Monday)
+   if(dow < 0) { dow += 7; weeks -= 1; }
+   int  wd      = (dow <= 4) ? (int)dow : 4;    // clamp Sat/Sun into the Fri->Mon pair
+   long wdIndex = weeks * 5 + wd;
+   return wdIndex / 2;
+}
+// 2-WEEK bucket id: discrete, non-overlapping 2-week blocks (two consecutive
+// weekly candles share a block).
+long Bucket2W(datetime weekStart)
+{
+   long weeks = (long)((long)(weekStart - EPOCH_MON) / (7 * 86400));
+   if(weekStart < EPOCH_MON && ((long)(weekStart - EPOCH_MON) % (7 * 86400)) != 0) weeks -= 1;
+   return weeks / 2;
+}
+
+// Synthetic candle caches for Engine 1 (index 0 = current/forming block).
+#define SYN_MAX 20
+double   g_c2wO[], g_c2wH[], g_c2wL[], g_c2wC[]; datetime g_c2wT[]; int g_n2w = 0;
+double   g_c2dO[], g_c2dH[], g_c2dL[], g_c2dC[]; datetime g_c2dT[]; int g_n2d = 0;
+datetime g_c2dBuilt = 0, g_c2wBuilt = 0;
+
+// Aggregate native bars of `tf` into non-overlapping buckets (bucketFn) and
+// store the newest SYN_MAX blocks, index 0 = the block containing the newest
+// (forming) bar. O = open of the oldest bar in the block, C = close of the
+// newest, H/L = extremes, T = oldest bar's time (block start).
+void BuildSynthetic(ENUM_TIMEFRAMES tf, bool isWeek,
+                    double &aO[], double &aH[], double &aL[], double &aC[], datetime &aT[], int &n)
+{
+   int bars = iBars(_Symbol, tf);
+   int need = MathMin(bars, SYN_MAX * 2 + 4);
+   ArrayResize(aO, SYN_MAX); ArrayResize(aH, SYN_MAX); ArrayResize(aL, SYN_MAX);
+   ArrayResize(aC, SYN_MAX); ArrayResize(aT, SYN_MAX);
+   n = 0;
+   long curB = LONG_MIN; int idx = -1;
+   for(int s = 0; s < need && idx < SYN_MAX - 1; s++)
+   {
+      datetime bt = iTime(_Symbol, tf, s);
+      if(bt <= 0) break;
+      long b = isWeek ? Bucket2W(bt) : Bucket2D(bt);
+      double o = iOpen(_Symbol, tf, s), h = iHigh(_Symbol, tf, s),
+             l = iLow(_Symbol, tf, s),  c = iClose(_Symbol, tf, s);
+      if(b != curB)
+      {
+         idx++; curB = b;
+         aC[idx] = c; aH[idx] = h; aL[idx] = l; aO[idx] = o; aT[idx] = bt; // newest bar seeds C
+      }
+      else
+      {
+         aH[idx] = MathMax(aH[idx], h); aL[idx] = MathMin(aL[idx], l);
+         aO[idx] = o; aT[idx] = bt;   // older bar within the block extends O / start time
+      }
+   }
+   n = idx + 1;
+}
+void RebuildSynthetic2D()
+{
+   datetime t0 = iTime(_Symbol, PERIOD_D1, 0);
+   if(t0 != g_c2dBuilt) { BuildSynthetic(PERIOD_D1, false, g_c2dO, g_c2dH, g_c2dL, g_c2dC, g_c2dT, g_n2d); g_c2dBuilt = t0; }
+   if(g_n2d > 0) { g_c2dH[0] = MathMax(g_c2dH[0], iHigh(_Symbol, PERIOD_D1, 0));
+                   g_c2dL[0] = MathMin(g_c2dL[0], iLow(_Symbol, PERIOD_D1, 0));
+                   g_c2dC[0] = iClose(_Symbol, PERIOD_D1, 0); }
+}
+void RebuildSynthetic2W()
+{
+   datetime t0 = iTime(_Symbol, PERIOD_W1, 0);
+   if(t0 != g_c2wBuilt) { BuildSynthetic(PERIOD_W1, true, g_c2wO, g_c2wH, g_c2wL, g_c2wC, g_c2wT, g_n2w); g_c2wBuilt = t0; }
+   if(g_n2w > 0) { g_c2wH[0] = MathMax(g_c2wH[0], iHigh(_Symbol, PERIOD_W1, 0));
+                   g_c2wL[0] = MathMin(g_c2wL[0], iLow(_Symbol, PERIOD_W1, 0));
+                   g_c2wC[0] = iClose(_Symbol, PERIOD_W1, 0); }
+}
+void RebuildSyntheticFor(int eng) { if(eng == ENG_2W2D) { RebuildSynthetic2W(); RebuildSynthetic2D(); } }
+
+// --- Engine-aware WEEKLY (bias TF) accessors: native W1 for engine 0,
+//     synthetic 2W for engine 1. Offset 0 = forming block, 1 = last closed. ---
+double   WOpen(int s)  { if(g_curEng == ENG_1W1D) return iOpen(_Symbol, PERIOD_W1, s);  return (s >= 0 && s < g_n2w) ? g_c2wO[s] : 0.0; }
+double   WHigh(int s)  { if(g_curEng == ENG_1W1D) return iHigh(_Symbol, PERIOD_W1, s);  return (s >= 0 && s < g_n2w) ? g_c2wH[s] : 0.0; }
+double   WLow(int s)   { if(g_curEng == ENG_1W1D) return iLow(_Symbol, PERIOD_W1, s);   return (s >= 0 && s < g_n2w) ? g_c2wL[s] : 0.0; }
+double   WClose(int s) { if(g_curEng == ENG_1W1D) return iClose(_Symbol, PERIOD_W1, s); return (s >= 0 && s < g_n2w) ? g_c2wC[s] : 0.0; }
+datetime WTime(int s)  { if(g_curEng == ENG_1W1D) return iTime(_Symbol, PERIOD_W1, s);  return (s >= 0 && s < g_n2w) ? g_c2wT[s] : 0; }
+int      WBars()       { return (g_curEng == ENG_1W1D) ? iBars(_Symbol, PERIOD_W1) : g_n2w; }
 
 // --- Buy-side patterns ---
 bool Bias_BC_Buy()    { return WClose(1) > WHigh(2); }
@@ -1512,10 +1651,14 @@ string Bias_SellText()
 // a Sell needs >=1 Daily sell pattern). The Daily timeframe does NOT set
 // the bias and does NOT generate entries.
 //======================================================================
-double DOpen(int s)  { return iOpen(_Symbol, PERIOD_D1, s); }
-double DHigh(int s)  { return iHigh(_Symbol, PERIOD_D1, s); }
-double DLow(int s)   { return iLow(_Symbol, PERIOD_D1, s); }
-double DClose(int s) { return iClose(_Symbol, PERIOD_D1, s); }
+// Engine-aware DAILY (confirmation TF) accessors: native D1 for engine 0,
+// synthetic 2D for engine 1. Offset 0 = forming block, 1 = last closed.
+double   DOpen(int s)  { if(g_curEng == ENG_1W1D) return iOpen(_Symbol, PERIOD_D1, s);  return (s >= 0 && s < g_n2d) ? g_c2dO[s] : 0.0; }
+double   DHigh(int s)  { if(g_curEng == ENG_1W1D) return iHigh(_Symbol, PERIOD_D1, s);  return (s >= 0 && s < g_n2d) ? g_c2dH[s] : 0.0; }
+double   DLow(int s)   { if(g_curEng == ENG_1W1D) return iLow(_Symbol, PERIOD_D1, s);   return (s >= 0 && s < g_n2d) ? g_c2dL[s] : 0.0; }
+double   DClose(int s) { if(g_curEng == ENG_1W1D) return iClose(_Symbol, PERIOD_D1, s); return (s >= 0 && s < g_n2d) ? g_c2dC[s] : 0.0; }
+datetime DTime(int s)  { if(g_curEng == ENG_1W1D) return iTime(_Symbol, PERIOD_D1, s);  return (s >= 0 && s < g_n2d) ? g_c2dT[s] : 0; }
+int      DBars()       { return (g_curEng == ENG_1W1D) ? iBars(_Symbol, PERIOD_D1) : g_n2d; }
 
 // --- Daily Buy-side patterns ---
 bool Daily_BC_Buy()    { return DClose(1) > DHigh(2); }
@@ -1573,8 +1716,8 @@ string Daily_SellText()
 
 // At least one Daily pattern agrees with the trade direction? Needs >=4 Daily
 // bars (the DS/N-DS patterns reach shift 3). This is a confirmation filter only.
-bool DailyBuyConfirms()  { return iBars(_Symbol, PERIOD_D1) >= 4 && Daily_BuyText()  != "-"; }
-bool DailySellConfirms() { return iBars(_Symbol, PERIOD_D1) >= 4 && Daily_SellText() != "-"; }
+bool DailyBuyConfirms()  { return DBars() >= 4 && Daily_BuyText()  != "-"; }
+bool DailySellConfirms() { return DBars() >= 4 && Daily_SellText() != "-"; }
 
 struct SBiasState
 {
@@ -1587,7 +1730,7 @@ struct SBiasState
    bool     buyPresent;
    bool     sellPresent;
 };
-SBiasState g_bias;
+SBiasState g_bias[NUM_ENGINES];
 
 // Recompute the Weekly bias every tick: pattern presence/direction (read
 // LIVE, exactly like the reference), plus the price-based invalidation
@@ -1597,32 +1740,32 @@ void ComputeBias(double bid, double ask)
    // A new weekly candle clears both invalidation latches — an invalidation
    // can never carry across weeks, exactly like the indicator resetting its
    // bias invalidation once per new higher-timeframe candle.
-   datetime c1 = iTime(_Symbol, PERIOD_W1, 1);
-   if(c1 != g_bias.c1Time)
+   datetime c1 = WTime(1);
+   if(c1 != g_bias[g_curEng].c1Time)
    {
-      g_bias.c1Time      = c1;
-      g_bias.buyInvalid  = false;
-      g_bias.sellInvalid = false;
+      g_bias[g_curEng].c1Time      = c1;
+      g_bias[g_curEng].buyInvalid  = false;
+      g_bias[g_curEng].sellInvalid = false;
    }
 
    // The DS / N-DS patterns reach back to shift 3, so we need candles 0..3
    // before any bias can be evaluated; until then there is no bias.
-   if(iBars(_Symbol, PERIOD_W1) < 4)
+   if(WBars() < 4)
    {
-      g_bias.buyText     = "-"; g_bias.sellText    = "-";
-      g_bias.buyPresent  = false; g_bias.sellPresent = false;
-      g_bias.dir         = "NONE";
+      g_bias[g_curEng].buyText     = "-"; g_bias[g_curEng].sellText    = "-";
+      g_bias[g_curEng].buyPresent  = false; g_bias[g_curEng].sellPresent = false;
+      g_bias[g_curEng].dir         = "NONE";
       return;
    }
 
-   g_bias.buyText     = Bias_BuyText();
-   g_bias.sellText    = Bias_SellText();
-   g_bias.buyPresent  = (g_bias.buyText  != "-");
-   g_bias.sellPresent = (g_bias.sellText != "-");
-   g_bias.dir =
-       (g_bias.buyPresent && !g_bias.sellPresent) ? "BUY"  :
-       (g_bias.sellPresent && !g_bias.buyPresent) ? "SELL" :
-       (g_bias.buyPresent &&  g_bias.sellPresent) ? "BOTH" : "NONE";
+   g_bias[g_curEng].buyText     = Bias_BuyText();
+   g_bias[g_curEng].sellText    = Bias_SellText();
+   g_bias[g_curEng].buyPresent  = (g_bias[g_curEng].buyText  != "-");
+   g_bias[g_curEng].sellPresent = (g_bias[g_curEng].sellText != "-");
+   g_bias[g_curEng].dir =
+       (g_bias[g_curEng].buyPresent && !g_bias[g_curEng].sellPresent) ? "BUY"  :
+       (g_bias[g_curEng].sellPresent && !g_bias[g_curEng].buyPresent) ? "SELL" :
+       (g_bias[g_curEng].buyPresent &&  g_bias[g_curEng].sellPresent) ? "BOTH" : "NONE";
 
    // Invalidation — price-based and latched for the rest of the Weekly candle.
    // Reference = candle 1 (last closed weekly). BUY dies once this week's price
@@ -1633,8 +1776,8 @@ void ComputeBias(double bid, double ask)
    double c1Low    = WLow(1);
    double weekHigh = MathMax(WHigh(0), ask); // running high so far this week, incl. the live tick
    double weekLow  = MathMin(WLow(0),  bid); // running low  so far this week, incl. the live tick
-   if(weekHigh > c1High) g_bias.buyInvalid  = true;
-   if(weekLow  < c1Low)  g_bias.sellInvalid = true;
+   if(weekHigh > c1High) g_bias[g_curEng].buyInvalid  = true;
+   if(weekLow  < c1Low)  g_bias[g_curEng].sellInvalid = true;
 }
 
 // A direction is tradeable only if a Weekly pattern of that side is present
@@ -1658,8 +1801,8 @@ bool HasExemptPattern(string patterns)
 // A side is tradeable if its Weekly pattern is present AND (the side hasn't been
 // invalidated OR an invalidation-exempt pattern (BC/DC) is present). With the
 // bias filter off the gate is transparent.
-bool BuyBiasAllowed()  { return !InpUseBiasFilter || (g_bias.buyPresent  && (!g_bias.buyInvalid  || HasExemptPattern(g_bias.buyText))); }
-bool SellBiasAllowed() { return !InpUseBiasFilter || (g_bias.sellPresent && (!g_bias.sellInvalid || HasExemptPattern(g_bias.sellText))); }
+bool BuyBiasAllowed()  { return !InpUseBiasFilter || (g_bias[g_curEng].buyPresent  && (!g_bias[g_curEng].buyInvalid  || HasExemptPattern(g_bias[g_curEng].buyText))); }
+bool SellBiasAllowed() { return !InpUseBiasFilter || (g_bias[g_curEng].sellPresent && (!g_bias[g_curEng].sellInvalid || HasExemptPattern(g_bias[g_curEng].sellText))); }
 
 //+------------------------------------------------------------------+
 //| Pattern-text helpers for the research log. A pattern text looks   |
@@ -1781,7 +1924,7 @@ bool TryOpen(bool isSell, SSignalState &st)
    // (earlier) weekly bias may still be open — that does NOT block this one,
    // which is the whole point: overlapping trades are allowed when they come
    // from different weekly biases.
-   if(HasOpenTradeForEpisode(isSell, g_bias.c1Time) || HasPendingLimitForEpisode(isSell, g_bias.c1Time))
+   if(HasOpenTradeForEpisode(g_curEng, isSell, g_bias[g_curEng].c1Time) || HasPendingLimitForEpisode(g_curEng, isSell, g_bias[g_curEng].c1Time))
    { g_rejPosOpen++; Dbg(side + " retest REJECT: a trade (or pending Case-1 limit) for the current weekly-bias episode already exists"); return false; }
    if(st.doneToday)
    { g_rejDoneToday++; LogSkip(isSell, st, "SkipDoneToday"); Dbg(side + " retest REJECT: this side already booked a win today (doneToday)"); return false; }
@@ -1799,9 +1942,9 @@ bool TryOpen(bool isSell, SSignalState &st)
    {
       g_rejBias++;
       LogSkip(isSell, st, "SkipBias");
-      Dbg(StringFormat("%s retest REJECT: bias gate (dir=%s buy=[%s]%s sell=[%s]%s)", side, g_bias.dir,
-                       g_bias.buyText,  g_bias.buyInvalid  ? " INVALID" : "",
-                       g_bias.sellText, g_bias.sellInvalid ? " INVALID" : ""));
+      Dbg(StringFormat("%s retest REJECT: bias gate (dir=%s buy=[%s]%s sell=[%s]%s)", side, g_bias[g_curEng].dir,
+                       g_bias[g_curEng].buyText,  g_bias[g_curEng].buyInvalid  ? " INVALID" : "",
+                       g_bias[g_curEng].sellText, g_bias[g_curEng].sellInvalid ? " INVALID" : ""));
       return false;
    }
 
@@ -1826,10 +1969,10 @@ bool TryOpen(bool isSell, SSignalState &st)
    // EPISODE ONLY. Because episodes are per weekly candle, a new week is a
    // fresh instance with no restriction. Losses do not trigger this. Toggle
    // off for the "unlimited trades per weekly bias" dataset.
-   if(InpStopAfterFirstWin && HasWinEpisode(isSell, g_bias.c1Time))
+   if(InpStopAfterFirstWin && HasWinEpisode(g_curEng, isSell, g_bias[g_curEng].c1Time))
    {
       g_skippedAfterWin++;
-      RecordWeeklySkip(TimeCurrent());
+      RecordWeeklySkip(g_curEng, TimeCurrent());
       LogSkip(isSell, st, "SkipAfterWin");
       Dbg(side + " retest SKIP: a win was already booked in the current weekly-bias episode");
       return false;
@@ -1894,11 +2037,11 @@ bool TryOpen(bool isSell, SSignalState &st)
       // Default target = Weekly Candle-1 High(buy)/Low(sell). For BC/DC only,
       // once price has traded through Weekly C1 (side invalidated) the target
       // responsibility shifts to Daily Candle-1 High(buy)/Low(sell).
-      bool   exempt   = HasExemptPattern(isSell ? g_bias.sellText : g_bias.buyText);
-      bool   thru     = isSell ? g_bias.sellInvalid : g_bias.buyInvalid;
+      bool   exempt   = HasExemptPattern(isSell ? g_bias[g_curEng].sellText : g_bias[g_curEng].buyText);
+      bool   thru     = isSell ? g_bias[g_curEng].sellInvalid : g_bias[g_curEng].buyInvalid;
       bool   useDaily = exempt && thru;
       double wLvl     = isSell ? WLow(1) : WHigh(1);
-      double dLvl     = isSell ? iLow(_Symbol, PERIOD_D1, 1) : iHigh(_Symbol, PERIOD_D1, 1);
+      double dLvl     = isSell ? DLow(1) : DHigh(1);
       double tgt      = useDaily ? dLvl : wLvl;
       tgtSrc          = useDaily ? "DailyC1" : "WeeklyC1";
 
@@ -2036,9 +2179,10 @@ bool TryOpen(bool isSell, SSignalState &st)
    // pushed immediately; for a Case-1 limit it is stored and completed at fill.
    // (positionId / entryPrice / entryTime / initRiskDist are set at fill.)
    SOpenTrade ot;
+   ot.engine          = g_curEng;         // V7: this trade belongs to the current engine
    ot.isSell          = isSell;
    ot.positionId      = 0;
-   ot.episode         = g_bias.c1Time;   // this trade's weekly-bias identity
+   ot.episode         = g_bias[g_curEng].c1Time;   // this trade's weekly-bias identity
    ot.refTime         = st.refTime;  ot.refHigh = st.refHigh;  ot.refLow = st.refLow;
    ot.ccTime          = st.ccTime;   ot.rcTime  = st.rcTime;
    ot.entryTime       = TimeCurrent();
@@ -2049,12 +2193,12 @@ bool TryOpen(bool isSell, SSignalState &st)
    ot.balanceBeforeEntry = balance;   ot.equityBefore = AccountInfoDouble(ACCOUNT_EQUITY);
    ot.bidAtEntry      = bidAtEntry;   ot.askAtEntry = askAtEntry;
    ot.spreadPoints    = spreadPoints; ot.atrH1AtEntry = atrH1AtEntry;
-   ot.biasDir         = g_bias.dir;   ot.biasBuyText = g_bias.buyText;   ot.biasSellText = g_bias.sellText;
-   ot.sideBiasText    = isSell ? g_bias.sellText : g_bias.buyText;
-   ot.biasCandleTime  = g_bias.c1Time;
+   ot.biasDir         = g_bias[g_curEng].dir;   ot.biasBuyText = g_bias[g_curEng].buyText;   ot.biasSellText = g_bias[g_curEng].sellText;
+   ot.sideBiasText    = isSell ? g_bias[g_curEng].sellText : g_bias[g_curEng].buyText;
+   ot.biasCandleTime  = g_bias[g_curEng].c1Time;
    ot.weekO = WOpen(1); ot.weekH = WHigh(1); ot.weekL = WLow(1); ot.weekC = WClose(1);
-   ot.dayO  = iOpen(_Symbol, PERIOD_D1, 1); ot.dayH = iHigh(_Symbol, PERIOD_D1, 1);
-   ot.dayL  = iLow(_Symbol, PERIOD_D1, 1);  ot.dayC = iClose(_Symbol, PERIOD_D1, 1);
+   ot.dayO  = DOpen(1); ot.dayH = DHigh(1);
+   ot.dayL  = DLow(1);  ot.dayC = DClose(1);
    ot.mfePrice = entry; ot.maePrice = entry;
    ot.initRiskDist = MathAbs(entry - sl);   // the trade's own 1R (finalised on fill)
    ot.beArmed      = false;   ot.beLevelPrice = entry;   ot.beArmTime = 0;
@@ -2206,14 +2350,15 @@ void ExpireLimitsOnDailyBreak(double bid, double ask)
    if(!InpCancelLimitOnDailyBreak || ArraySize(g_pendingEntries) == 0 || iBars(_Symbol, PERIOD_D1) < 2)
       return;
 
-   double dHiNow = MathMax(iHigh(_Symbol, PERIOD_D1, 0), MathMax(bid, ask)); // today's high so far, incl. tick
-   double dLoNow = MathMin(iLow(_Symbol, PERIOD_D1, 0), MathMin(bid, ask));  // today's low  so far, incl. tick
-
    for(int i = ArraySize(g_pendingEntries) - 1; i >= 0; i--)
    {
       SOpenTrade snap = g_pendingEntries[i].snap;
-      double c1High = snap.dayH;   // Daily Candle-1 High frozen at placement
-      double c1Low  = snap.dayL;   // Daily Candle-1 Low  frozen at placement
+      // V7: evaluate the Daily-C1 break on THIS pending's engine timeframe.
+      g_curEng = snap.engine;
+      double dHiNow = MathMax(DHigh(0), MathMax(bid, ask)); // running (2-)day high, incl. tick
+      double dLoNow = MathMin(DLow(0),  MathMin(bid, ask)); // running (2-)day low,  incl. tick
+      double c1High = snap.dayH;   // (2-)Daily Candle-1 High frozen at placement
+      double c1Low  = snap.dayL;   // (2-)Daily Candle-1 Low  frozen at placement
       bool   broke  = snap.isSell ? (dLoNow < c1Low) : (dHiNow > c1High);
       if(!broke)
          continue;
@@ -2254,6 +2399,7 @@ void UpdatePendingLimitStale(double bid, double ask)
    double pipv = PipSize();
    for(int i = ArraySize(g_pendingEntries) - 1; i >= 0; i--)
    {
+      g_curEng        = g_pendingEntries[i].snap.engine;   // V7: engine context for the opp-cost capture
       bool   isSell   = g_pendingEntries[i].snap.isSell;
       double limitPx  = g_pendingEntries[i].snap.requestedEntry;
       double slDist   = MathAbs(g_pendingEntries[i].snap.requestedEntry - g_pendingEntries[i].snap.slPrice);
@@ -2301,8 +2447,16 @@ void ProcessNewBar()
 {
    if(GetMaxBack() < 0)
       return;
-   UpdateDirection(true,  g_sell);
-   UpdateDirection(false, g_buy);
+   // V7: run reference/CC detection for BOTH engines on the just-closed H1 bar.
+   // Each engine reads its own higher-TF candles (via g_curEng) and its own
+   // per-side signal state — the H1 detection code is shared and unchanged.
+   for(int eng = 0; eng < NUM_ENGINES; eng++)
+   {
+      g_curEng = eng;
+      RebuildSyntheticFor(eng);
+      UpdateDirection(true,  g_sell[eng]);
+      UpdateDirection(false, g_buy[eng]);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -2473,6 +2627,7 @@ void CaptureSetupOutcome(bool isSell, datetime refTime, double refHigh, double r
                               : hypoEntry + finalRange * InpTakeProfitRMultiple;
 
    SMissedSetup m;
+   m.engine         = g_curEng;
    m.isSell         = isSell;
    m.refTime        = refTime;  m.refHigh = refHigh;  m.refLow = refLow;
    m.ccTime         = ccTime;
@@ -2485,10 +2640,10 @@ void CaptureSetupOutcome(bool isSell, datetime refTime, double refHigh, double r
    m.rcLevelTouched = rcTouched;
    m.biasAllowed    = isSell ? SellBiasAllowed() : BuyBiasAllowed();
    m.dailyConfirm   = !InpUseDailyConfirmation ? true : (isSell ? DailySellConfirms() : DailyBuyConfirms());
-   m.biasDir        = g_bias.dir;
-   m.sideBiasText   = isSell ? g_bias.sellText : g_bias.buyText;
+   m.biasDir        = g_bias[g_curEng].dir;
+   m.sideBiasText   = isSell ? g_bias[g_curEng].sellText : g_bias[g_curEng].buyText;
    m.dailySideText  = isSell ? Daily_SellText() : Daily_BuyText();
-   m.biasCandleTime = g_bias.c1Time;
+   m.biasCandleTime = g_bias[g_curEng].c1Time;
    m.discardTime    = TimeCurrent();
    m.trackUntil     = ccTime + (datetime)((long)InpExcursionTrackingHours * 3600);
 
@@ -2517,7 +2672,7 @@ void WriteMissedHeader()
       "MissID,Direction,EntryPattern,DiscardReason,RCLevelTouched,BiasDirection,TradeSideBiasPatterns,"
       "DailySidePatterns,BiasAllowed,DailyConfirm,BiasCandleTime,RefCandleTime,RefHigh,RefLow,CCTime,DiscardTime,BarsArmed,"
       "HypoEntry,StructuralSL,HypoSL,HypoTP,InitRiskPips,MaxFavR,MaxAdvR,"
-      "Reached1R,Reached2R,Reached3R,Reached4R,ConstrainedOutcome,WouldBeWin,TimeToTP,TimeToSL,BarsScanned,TrackHours");
+      "Reached1R,Reached2R,Reached3R,Reached4R,ConstrainedOutcome,WouldBeWin,TimeToTP,TimeToSL,BarsScanned,TrackHours,Engine");
 }
 
 // Scans the CC's forward H1 path (up to trackUntil) and writes one row:
@@ -2617,7 +2772,8 @@ void FinalizeMissedSetup(const SMissedSetup &m)
       + FmtNairobi(tpTime) + ","
       + FmtNairobi(slTime) + ","
       + (string)barsScanned + ","
-      + (string)InpExcursionTrackingHours;
+      + (string)InpExcursionTrackingHours + ","
+      + EngineName(m.engine);
    FileWrite(g_missedHandle, row);
    FileFlush(g_missedHandle);
 }
@@ -2701,7 +2857,9 @@ void WriteTradeLogHeader()
       "MaxDD_Money", "SecondsInProfit", "SecondsInDrawdown", "PctTimeInProfit",
       "TimeToFirst1R_Min", "TimeToTP_Min", "MinStopLossPips_Cfg",
       // --- V6: away-from-entry (stale-entry 2R measure) ---
-      "MaxAwayBeforeEntry_R", "MaxAwayBeforeEntry_Pips", "MaxAwayR_Cfg"
+      "MaxAwayBeforeEntry_R", "MaxAwayBeforeEntry_Pips", "MaxAwayR_Cfg",
+      // --- V7: which engine produced this trade ---
+      "Engine"
    };
    g_logCols = ArraySize(h);
    WriteCsvRow(h);
@@ -2719,6 +2877,7 @@ void QueuePendingLog(const SOpenTrade &t,
    int n = ArraySize(g_pending);
    ArrayResize(g_pending, n + 1);
 
+   g_pending[n].engine             = t.engine;
    g_pending[n].isSell             = t.isSell;
    g_pending[n].posId              = t.positionId;
    g_pending[n].refTime            = t.refTime;
@@ -2803,6 +2962,7 @@ void QueuePendingLog(const SOpenTrade &t,
 //======================================================================
 struct SWeekStat
 {
+   int      engine;          // V7: which engine this weekly row belongs to
    datetime weekStart;
    int      trades, wins, losses, breakeven;
    double   totalR;
@@ -2817,13 +2977,17 @@ datetime WeekStartOf(datetime t)
    return (sh < 0) ? 0 : iTime(_Symbol, PERIOD_W1, sh);
 }
 
-int WeekBucketIndex(datetime weekStart)
+// V7: weekly buckets are keyed by (engine, weekStart) so each engine keeps its
+// own weekly statistics. Calendar-week bucketing is shared for readability; the
+// authoritative per-engine stats are the per-trade CSV rows (Engine column).
+int WeekBucketIndex(int eng, datetime weekStart)
 {
    for(int i = 0; i < ArraySize(g_weeks); i++)
-      if(g_weeks[i].weekStart == weekStart)
+      if(g_weeks[i].engine == eng && g_weeks[i].weekStart == weekStart)
          return i;
    int idx = ArraySize(g_weeks);
    ArrayResize(g_weeks, idx + 1);
+   g_weeks[idx].engine = eng;
    g_weeks[idx].weekStart = weekStart;
    g_weeks[idx].trades = 0; g_weeks[idx].wins = 0; g_weeks[idx].losses = 0; g_weeks[idx].breakeven = 0;
    g_weeks[idx].totalR = 0; g_weeks[idx].curWin = 0; g_weeks[idx].curLoss = 0;
@@ -2832,16 +2996,16 @@ int WeekBucketIndex(datetime weekStart)
 }
 
 // A setup was skipped by the stop-after-first-win rule — tally it into the
-// week it occurred in, so the weekly CSV shows skip pressure per week.
-void RecordWeeklySkip(datetime whenServerTime)
+// week it occurred in, for the engine that skipped it.
+void RecordWeeklySkip(int eng, datetime whenServerTime)
 {
-   int idx = WeekBucketIndex(WeekStartOf(whenServerTime));
+   int idx = WeekBucketIndex(eng, WeekStartOf(whenServerTime));
    g_weeks[idx].setupsSkipped++;
 }
 
-void UpdateWeeklyStats(datetime entryTime, double rRealized, string outcome)
+void UpdateWeeklyStats(int eng, datetime entryTime, double rRealized, string outcome)
 {
-   int idx = WeekBucketIndex(WeekStartOf(entryTime));
+   int idx = WeekBucketIndex(eng, WeekStartOf(entryTime));
    g_weeks[idx].trades++;
    g_weeks[idx].totalR += rRealized;
    // V4: bucket by the price-based outcome. TP and a target-% LOCK are both
@@ -2881,12 +3045,13 @@ void WriteWeeklyStats()
       PrintFormat("LUCC/LDCC EA: could not open weekly-stats '%s', error=%d", InpWeeklyStatsFileName, GetLastError());
       return;
    }
-   FileWrite(h, "WeekStart,Trades,Wins,Losses,Breakeven,WinRatePct,TotalR,AvgR,MaxConsecWins,MaxConsecLosses,SetupsSkippedAfterWin,StopAfterWinRule");
+   FileWrite(h, "Engine,WeekStart,Trades,Wins,Losses,Breakeven,WinRatePct,TotalR,AvgR,MaxConsecWins,MaxConsecLosses,SetupsSkippedAfterWin,StopAfterWinRule");
    for(int i = 0; i < n; i++)
    {
       double winRate = (g_weeks[i].trades > 0) ? 100.0 * g_weeks[i].wins / g_weeks[i].trades : 0.0;
       double avgR    = (g_weeks[i].trades > 0) ? g_weeks[i].totalR / g_weeks[i].trades : 0.0;
-      FileWrite(h, StringFormat("%s,%d,%d,%d,%d,%.1f,%.3f,%.3f,%d,%d,%d,%s",
+      FileWrite(h, StringFormat("%s,%s,%d,%d,%d,%d,%.1f,%.3f,%.3f,%d,%d,%d,%s",
+                EngineName(g_weeks[i].engine),
                 TimeToString(GetNairobiTime(g_weeks[i].weekStart), TIME_DATE),
                 g_weeks[i].trades, g_weeks[i].wins, g_weeks[i].losses, g_weeks[i].breakeven,
                 winRate, g_weeks[i].totalR, avgR, g_weeks[i].maxWin, g_weeks[i].maxLoss,
@@ -3070,7 +3235,9 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
       DoubleToString(p.maxDDMoney, 2), (string)p.secsInProfit, (string)p.secsInDraw, DoubleToString(pctInProfit, 1),
       DoubleToString(timeTo1RMin, 1), DoubleToString(timeToTPMin, 1), DoubleToString(InpMinStopLossPips, 1),
       // --- V6: away-from-entry (stale-entry 2R measure) ---
-      DoubleToString(awayBeforeR, 3), DoubleToString(awayBeforePips, 1), DoubleToString(InpMaxAwayR, 2)
+      DoubleToString(awayBeforeR, 3), DoubleToString(awayBeforePips, 1), DoubleToString(InpMaxAwayR, 2),
+      // --- V7: engine identity ---
+      EngineName(p.engine)
    };
 
    if(g_logCols > 0 && ArraySize(v) != g_logCols)
@@ -3078,7 +3245,7 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
                   g_logCols, ArraySize(v));
 
    WriteCsvRow(v);
-   UpdateWeeklyStats(p.entryTime, rRealized, p.outcome);
+   UpdateWeeklyStats(p.engine, p.entryTime, rRealized, p.outcome);
 }
 
 // Called every tick: extends MFE/MAE for every trade still in its tracking
@@ -3165,12 +3332,13 @@ void HandleClose(long closedPosId, datetime exitTime, double exitPrice, string e
    bool firstWin = false;
    if(winStop)
    {
-      if(!HasWinEpisode(t.isSell, t.episode))
+      if(!HasWinEpisode(t.engine, t.isSell, t.episode))
       {
          firstWin = true;
-         AddWinEpisode(t.isSell, t.episode);
+         AddWinEpisode(t.engine, t.isSell, t.episode);
       }
-      if(t.isSell) g_sell.doneToday = true; else g_buy.doneToday = true; // daily win-stop
+      // daily win-stop — booked to THIS trade's own engine only
+      if(t.isSell) g_sell[t.engine].doneToday = true; else g_buy[t.engine].doneToday = true;
    }
 
    Dbg(StringFormat("%s CLOSE posId=%d net=%.2f outcome=%s%s%s%s episode=%s (openTrades left=%d)",
@@ -3240,10 +3408,10 @@ void PanelSet(int row, string text, color clr)
    ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
 }
 
-string SideStateText(bool isSell, const SSignalState &st)
+string SideStateText(int eng, bool isSell, const SSignalState &st)
 {
    string tag = isSell ? "LUCC" : "LDCC";
-   int openN = OpenTradeCount(isSell);
+   int openN = OpenTradeCount(eng, isSell);
    string openTag = (openN > 0) ? StringFormat(" [%d open]", openN) : "";
    if(st.refTime == 0) return "scanning - no " + tag + openTag;
    if(st.refTime == st.expiredRefTime) return "pending EXPIRED - awaiting a new " + tag + openTag;
@@ -3259,39 +3427,43 @@ void UpdatePanel()
 
    PanelEnsureBackground();
 
-   PanelSet(0, "LUCC / LDCC  +  1W Bias EA  (V3)", clrDeepSkyBlue);
+   // Panel shows Engine 1 (1W->1D) live state; Engine 2 (2W->2D) runs in parallel
+   // and is captured in the logs (Engine column). Cosmetic only — skipped in optimization.
+   g_curEng = ENG_1W1D;
+
+   PanelSet(0, "LUCC / LDCC dual-engine EA (V7: 1W-1D + 2W-2D)", clrDeepSkyBlue);
 
    MqlDateTime nd; TimeToStruct(GetNairobiTime(TimeCurrent()), nd);
    PanelSet(1, StringFormat("Nairobi %02d:%02d   |   24/5 - no time filter", nd.hour, nd.min), clrLime);
 
-   color dirClr = g_bias.dir == "BUY"  ? clrLime :
-                  g_bias.dir == "SELL" ? clrRed  :
-                  g_bias.dir == "BOTH" ? clrOrange : clrSilver;
-   PanelSet(2, "1W Bias: " + g_bias.dir, dirClr);
+   color dirClr = g_bias[g_curEng].dir == "BUY"  ? clrLime :
+                  g_bias[g_curEng].dir == "SELL" ? clrRed  :
+                  g_bias[g_curEng].dir == "BOTH" ? clrOrange : clrSilver;
+   PanelSet(2, "1W Bias: " + g_bias[g_curEng].dir, dirClr);
 
-   string buyStat  = !g_bias.buyPresent  ? "-" : (g_bias.buyInvalid  ? "INVALIDATED" : "ACTIVE");
-   color  buyClr   = !g_bias.buyPresent  ? clrSilver : (g_bias.buyInvalid  ? clrOrangeRed : clrLime);
-   string sellStat = !g_bias.sellPresent ? "-" : (g_bias.sellInvalid ? "INVALIDATED" : "ACTIVE");
-   color  sellClr  = !g_bias.sellPresent ? clrSilver : (g_bias.sellInvalid ? clrOrangeRed : clrRed);
-   PanelSet(3, StringFormat("Buy  bias: %-10s [%s]", g_bias.buyText,  buyStat),  buyClr);
-   PanelSet(4, StringFormat("Sell bias: %-10s [%s]", g_bias.sellText, sellStat), sellClr);
+   string buyStat  = !g_bias[g_curEng].buyPresent  ? "-" : (g_bias[g_curEng].buyInvalid  ? "INVALIDATED" : "ACTIVE");
+   color  buyClr   = !g_bias[g_curEng].buyPresent  ? clrSilver : (g_bias[g_curEng].buyInvalid  ? clrOrangeRed : clrLime);
+   string sellStat = !g_bias[g_curEng].sellPresent ? "-" : (g_bias[g_curEng].sellInvalid ? "INVALIDATED" : "ACTIVE");
+   color  sellClr  = !g_bias[g_curEng].sellPresent ? clrSilver : (g_bias[g_curEng].sellInvalid ? clrOrangeRed : clrRed);
+   PanelSet(3, StringFormat("Buy  bias: %-10s [%s]", g_bias[g_curEng].buyText,  buyStat),  buyClr);
+   PanelSet(4, StringFormat("Sell bias: %-10s [%s]", g_bias[g_curEng].sellText, sellStat), sellClr);
 
    PanelSet(5, InpUseBiasFilter ? "Bias gate: ENFORCED" : "Bias gate: OFF (all entries)",
             InpUseBiasFilter ? clrGold : clrSilver);
 
-   PanelSet(6, "SELL (LUCC): " + SideStateText(true, g_sell),
-            HasOpenTrade(true) ? clrRed : clrGainsboro);
-   bool sellWinLock = InpStopAfterFirstWin && HasWinEpisode(true, g_bias.c1Time);
+   PanelSet(6, "SELL (LUCC): " + SideStateText(ENG_1W1D, true, g_sell[ENG_1W1D]),
+            HasOpenTrade(ENG_1W1D, true) ? clrRed : clrGainsboro);
+   bool sellWinLock = InpStopAfterFirstWin && HasWinEpisode(ENG_1W1D, true, g_bias[g_curEng].c1Time);
    PanelSet(7, StringFormat("   trades today %d/2%s   bias %s%s",
-            g_sell.tradesToday, g_sell.doneToday ? " (done)" : "",
+            g_sell[ENG_1W1D].tradesToday, g_sell[ENG_1W1D].doneToday ? " (done)" : "",
             SellBiasAllowed() ? "OK" : "blocked", sellWinLock ? "  [WK-WIN-LOCK]" : ""),
             sellWinLock ? clrGold : (SellBiasAllowed() ? clrGainsboro : clrGray));
 
-   PanelSet(8, "BUY (LDCC): " + SideStateText(false, g_buy),
-            HasOpenTrade(false) ? clrLime : clrGainsboro);
-   bool buyWinLock = InpStopAfterFirstWin && HasWinEpisode(false, g_bias.c1Time);
+   PanelSet(8, "BUY (LDCC): " + SideStateText(ENG_1W1D, false, g_buy[ENG_1W1D]),
+            HasOpenTrade(ENG_1W1D, false) ? clrLime : clrGainsboro);
+   bool buyWinLock = InpStopAfterFirstWin && HasWinEpisode(ENG_1W1D, false, g_bias[g_curEng].c1Time);
    PanelSet(9, StringFormat("   trades today %d/2%s   bias %s%s",
-            g_buy.tradesToday, g_buy.doneToday ? " (done)" : "",
+            g_buy[ENG_1W1D].tradesToday, g_buy[ENG_1W1D].doneToday ? " (done)" : "",
             BuyBiasAllowed() ? "OK" : "blocked", buyWinLock ? "  [WK-WIN-LOCK]" : ""),
             buyWinLock ? clrGold : (BuyBiasAllowed() ? clrGainsboro : clrGray));
 
@@ -3340,14 +3512,18 @@ int OnInit()
    g_prevMid      = 0.0;
    g_havePrevMid  = false;
 
-   g_bias.c1Time      = 0;
-   g_bias.buyInvalid  = false;
-   g_bias.sellInvalid = false;
-   g_bias.dir         = "NONE";
-   g_bias.buyText     = "-";
-   g_bias.sellText    = "-";
-   g_bias.buyPresent  = false;
-   g_bias.sellPresent = false;
+   // V7: initialise BOTH engines' bias state.
+   for(int e = 0; e < NUM_ENGINES; e++)
+   {
+      g_bias[e].c1Time      = 0;
+      g_bias[e].buyInvalid  = false;
+      g_bias[e].sellInvalid = false;
+      g_bias[e].dir         = "NONE";
+      g_bias[e].buyText     = "-";
+      g_bias[e].sellText    = "-";
+      g_bias[e].buyPresent  = false;
+      g_bias[e].sellPresent = false;
+   }
 
    // Freeze the risk-sizing reference balance once, here, so it can never
    // drift with wins/losses (no compounding). InpFixedRiskBalance = 0 means
@@ -3445,10 +3621,15 @@ void OnDeinit(const int reason)
    // missed setup — capture it before flushing so its opportunity cost is logged.
    if(InpLogMissedSetups || InpLogSkippedSetups)
    {
-      if(g_sell.refTime != 0 && g_sell.ccTime != 0 && g_sell.rcTime == 0)
-         CaptureMissedSetup(true,  g_sell, "RunEnded");
-      if(g_buy.refTime != 0 && g_buy.ccTime != 0 && g_buy.rcTime == 0)
-         CaptureMissedSetup(false, g_buy,  "RunEnded");
+      for(int e = 0; e < NUM_ENGINES; e++)
+      {
+         g_curEng = e;
+         RebuildSyntheticFor(e);
+         if(g_sell[e].refTime != 0 && g_sell[e].ccTime != 0 && g_sell[e].rcTime == 0)
+            CaptureMissedSetup(true,  g_sell[e], "RunEnded");
+         if(g_buy[e].refTime != 0 && g_buy[e].ccTime != 0 && g_buy[e].rcTime == 0)
+            CaptureMissedSetup(false, g_buy[e],  "RunEnded");
+      }
       ProcessMissedFinalize(true);   // force-write all queued missed/skipped setups (partial windows included)
       PrintFormat("LUCC/LDCC EA OPP-COST: captured=%d wouldWin(hypoTP)=%d (armed CC that never became a real entry)",
                   g_missedCaptured, g_missedWouldWin);
@@ -3466,8 +3647,7 @@ void OnDeinit(const int reason)
    ArrayFree(g_missed);
    ArrayFree(g_pendingEntries);
    ArrayFree(g_openTrades);
-   ArrayFree(g_sellWinEpisodes);
-   ArrayFree(g_buyWinEpisodes);
+   ArrayFree(g_winEpisodes);
 
    // Weekly summary CSV — written after all trades (incl. the just-flushed
    // pending ones) have been folded into the weekly aggregator.
@@ -3524,14 +3704,26 @@ void OnTick()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mid = (bid + ask) / 2.0;
 
-   // Refresh the Weekly bias (direction + invalidation latches) before the
-   // retest gate reads it this tick.
-   ComputeBias(bid, ask);
-
+   // V7: pending-limit invalidation (engine-agnostic — each pending carries its
+   // own engine context, set inside these loops). Run before the per-engine retest
+   // so a cancelled limit frees its episode immediately.
    ExpireLimitsOnDailyBreak(bid, ask);  // V6: kill an unfilled Case-1 limit once Daily-C1 is traded through
    UpdatePendingLimitStale(bid, ask);   // V6: kill an unfilled Case-1 limit that ran > InpMaxAwayR away first
-   MonitorRetest(true,  g_sell, bid, ask, mid);
-   MonitorRetest(false, g_buy,  bid, ask, mid);
+
+   // V7: run BOTH engines independently. Each refreshes its own higher-TF candles,
+   // its own bias, and hunts its own retest entries — no shared setup state.
+   for(int eng = 0; eng < NUM_ENGINES; eng++)
+   {
+      g_curEng = eng;
+      RebuildSyntheticFor(eng);      // engine 1 builds its synthetic 2W/2D candles (engine 0 no-op)
+      ComputeBias(bid, ask);         // this engine's bias (direction + invalidation latches)
+      MonitorRetest(true,  g_sell[eng], bid, ask, mid);
+      MonitorRetest(false, g_buy[eng],  bid, ask, mid);
+   }
+
+   // Trade management below is engine-agnostic: it iterates every open trade / queued
+   // record and acts on that record's OWN frozen parameters, so both engines' trades
+   // are managed identically and independently.
    UpdateOpenExcursions(bid, ask);   // MFE/MAE + time-in-profit/DD + maxDD for every open trade
    UpdateBreakeven(bid, ask);        // V6: move SL to breakeven once the +1.2R trigger is reached
    UpdatePartialClose(bid, ask);     // V6: take 50% off at +2R (the remainder runs to the target)
