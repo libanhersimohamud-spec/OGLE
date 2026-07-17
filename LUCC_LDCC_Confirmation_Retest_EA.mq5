@@ -101,6 +101,11 @@ input bool   InpFilesToCommonFolder  = true;  // Write CSVs to the shared Common
                                                // The exact full path is printed to the Experts log.
 input bool   InpEnableExcursionTracking = true;  // Keep watching price past the actual exit for true MFE/MAE
 input int    InpExcursionTrackingHours  = 120;   // Hours from ENTRY to keep tracking (uncapped by SL/TP)
+input bool            InpEnablePathLog   = true;                        // Per-trade bar-by-bar PATH log (enables
+                                                                        // offline replay of trailing/BE/RR exits)
+input string          InpPathLogFileName = "LUCC_LDCC_PathLog.csv";     // Path-log CSV file
+input ENUM_TIMEFRAMES InpPathLogTimeframe = PERIOD_H1;                  // Granularity of the path log (H1 = entry
+                                                                        // TF; set M15/M5 for a finer path)
 
 input group "1W Bias Filter"
 input bool   InpUseBiasFilter        = true;  // Gate entries on the Weekly (1W) directional bias
@@ -327,6 +332,8 @@ double   g_prevMid      = 0.0;   // previous tick's mid price, for level-crossin
 bool     g_havePrevMid  = false;
 int      g_logHandle    = INVALID_HANDLE;
 int      g_logCols      = 0;                // column count from the header — row-width sanity guard
+int      g_pathHandle   = INVALID_HANDLE;   // per-trade bar-by-bar path log
+datetime g_lastPathBar  = 0;                // last path-TF bar already logged
 int      g_atrHandle    = INVALID_HANDLE;   // H1 ATR(14) — logged as volatility context at entry
 double   g_riskBalance  = 0.0;   // frozen once in OnInit; every trade's risk% is % of THIS, not of
                                   // the live/current balance, so wins/losses never change position size
@@ -1505,6 +1512,78 @@ void WriteCsvRow(const string &fields[])
    FileFlush(g_logHandle);
 }
 
+//======================================================================
+// Per-trade PATH log — one row per path-TF bar per tracked trade, with the
+// bar OHLC plus favorable/adverse excursion in R at that bar. This is what
+// makes trailing-stop / breakeven / RR exit rules EXACTLY replayable offline
+// (no rerun): join to the trade log on TradeID and walk the bars in order.
+// Phase = OPEN (position live) or EXTENDED (closed but still inside the
+// excursion-tracking window, so you can also test exits that hold longer
+// than the current SL/TP).
+//======================================================================
+void WritePathHeader()
+{
+   FileWrite(g_pathHandle,
+      "TradeID,Direction,EntryPattern,Phase,BarTime,Open,High,Low,Close,"
+      "EntryPrice,InitSL,TP,InitRiskPips,BarFavR,BarAdvR,BarsSinceEntry");
+}
+
+void WritePathRow(long tradeId, bool isSell, string phase, datetime barTime,
+                  double o, double h, double l, double c,
+                  double entry, double sl, double tp, double riskDist, datetime entryTime)
+{
+   if(g_pathHandle == INVALID_HANDLE)
+      return;
+   double risk = (riskDist > 0.0) ? riskDist : MathAbs(entry - sl);
+   double favR = 0.0, advR = 0.0;   // this bar's best-favorable / worst-adverse excursion, in R
+   if(risk > 0.0)
+   {
+      if(isSell) { favR = (entry - l) / risk; advR = (entry - h) / risk; }
+      else       { favR = (h - entry) / risk; advR = (l - entry) / risk; }
+   }
+   double pip       = PipSize();
+   int    secs      = PeriodSeconds(InpPathLogTimeframe); if(secs <= 0) secs = 3600;
+   int    barsSince = (int)((long)(barTime - entryTime) / secs);
+   string entryPat  = isSell ? "LUCC" : "LDCC";
+   string line = (string)tradeId + "," + (isSell ? "SELL" : "BUY") + "," + entryPat + "," + phase + ","
+      + FmtNairobi(barTime) + "," + DoubleToString(o, _Digits) + "," + DoubleToString(h, _Digits) + ","
+      + DoubleToString(l, _Digits) + "," + DoubleToString(c, _Digits) + "," + DoubleToString(entry, _Digits) + ","
+      + DoubleToString(sl, _Digits) + "," + DoubleToString(tp, _Digits) + "," + DoubleToString(pip > 0 ? risk / pip : 0.0, 1) + ","
+      + DoubleToString(favR, 3) + "," + DoubleToString(advR, 3) + "," + (string)barsSince;
+   FileWrite(g_pathHandle, line);
+}
+
+// On each new path-TF bar, append the just-closed bar for every tracked trade
+// (open positions + trades still in the excursion window). Self-guards so it
+// runs once per path bar regardless of how often OnTick fires.
+void WritePathBars()
+{
+   if(!InpEnablePathLog || g_pathHandle == INVALID_HANDLE)
+      return;
+   ENUM_TIMEFRAMES tf = InpPathLogTimeframe;
+   datetime cur = iTime(_Symbol, tf, 0);
+   if(cur == 0 || cur == g_lastPathBar)
+      return;
+   g_lastPathBar = cur;
+
+   datetime bt = iTime(_Symbol, tf, 1);   // the just-closed path bar
+   if(bt == 0)
+      return;
+   double o = iOpen(_Symbol, tf, 1), h = iHigh(_Symbol, tf, 1), l = iLow(_Symbol, tf, 1), c = iClose(_Symbol, tf, 1);
+
+   for(int i = 0; i < ArraySize(g_openTrades); i++)
+      WritePathRow(g_openTrades[i].positionId, g_openTrades[i].isSell, "OPEN", bt, o, h, l, c,
+                   g_openTrades[i].entryPrice, g_openTrades[i].slPrice, g_openTrades[i].tpPrice,
+                   g_openTrades[i].initRiskDist, g_openTrades[i].entryTime);
+
+   for(int i = 0; i < ArraySize(g_pending); i++)
+      WritePathRow(g_pending[i].posId, g_pending[i].isSell, "EXTENDED", bt, o, h, l, c,
+                   g_pending[i].entryPrice, g_pending[i].slPrice, g_pending[i].tpPrice,
+                   g_pending[i].initRiskDist, g_pending[i].entryTime);
+
+   FileFlush(g_pathHandle);
+}
+
 // The single source of truth for the column layout. FinalizePendingLog()
 // builds its value array in this exact order.
 void WriteTradeLogHeader()
@@ -1548,7 +1627,9 @@ void WriteTradeLogHeader()
       "EntryServerTime", "EntryUTCTime",
       "FirstWinOfBias", "StopAfterWinRule",
       // --- v4 breakeven additions ---
-      "BEArmed", "BETriggerR", "BELockR", "BELevel"
+      "BEArmed", "BETriggerR", "BELockR", "BELevel",
+      // --- drawdown % additions ---
+      "MAE_Pct", "MaxDD_PctBalance"
    };
    g_logCols = ArraySize(h);
    WriteCsvRow(h);
@@ -1844,7 +1925,10 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
       p.firstWinOfBias ? "true" : "false", InpStopAfterFirstWin ? "ON" : "OFF",
       // --- v4 breakeven additions ---
       p.beArmed ? "true" : "false", DoubleToString(InpBreakevenTriggerR, 2),
-      DoubleToString(InpBreakevenLockR, 2), DoubleToString(p.beLevelPrice, _Digits)
+      DoubleToString(InpBreakevenLockR, 2), DoubleToString(p.beLevelPrice, _Digits),
+      // --- drawdown % additions ---
+      DoubleToString(p.entryPrice > 0 ? maePipsInTrade * pip / p.entryPrice * 100.0 : 0.0, 3),
+      DoubleToString(p.balanceBeforeEntry > 0 ? floatDrawdownMoney / p.balanceBeforeEntry * 100.0 : 0.0, 3)
    };
 
    if(g_logCols > 0 && ArraySize(v) != g_logCols)
@@ -2112,6 +2196,18 @@ int OnInit()
          Print("LUCC/LDCC EA: TRADE LOG -> ", FullFilePath(InpTradeLogFileName));
          Print("LUCC/LDCC EA: WEEKLY STATS -> ", FullFilePath(InpWeeklyStatsFileName), "  (written at end of run)");
       }
+
+      if(InpEnablePathLog)
+      {
+         g_pathHandle = FileOpen(InpPathLogFileName, FileFlagsCsv(), ',');
+         if(g_pathHandle == INVALID_HANDLE)
+            PrintFormat("LUCC/LDCC EA: could not open path log '%s', error=%d", InpPathLogFileName, GetLastError());
+         else
+         {
+            WritePathHeader();
+            Print("LUCC/LDCC EA: PATH LOG -> ", FullFilePath(InpPathLogFileName));
+         }
+      }
    }
 
    // One-shot config snapshot so the current filter setup is always visible at
@@ -2180,6 +2276,12 @@ void OnDeinit(const int reason)
       FileClose(g_logHandle);
       g_logHandle = INVALID_HANDLE;
    }
+
+   if(g_pathHandle != INVALID_HANDLE)
+   {
+      FileClose(g_pathHandle);
+      g_pathHandle = INVALID_HANDLE;
+   }
 }
 
 void OnTick()
@@ -2194,6 +2296,10 @@ void OnTick()
       g_lastBarTime = curBarTime;
       ProcessNewBar();
    }
+
+   // Per-trade path log — append the just-closed path-TF bar for every tracked
+   // trade (self-guards to once per path bar).
+   WritePathBars();
 
    // Tick-by-tick part: RC detection/execution, plus MFE/MAE tracking on
    // whichever direction currently has an open position.
