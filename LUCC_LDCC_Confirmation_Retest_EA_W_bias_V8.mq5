@@ -1,8 +1,19 @@
 //+------------------------------------------------------------------+
-//|              LUCC_LDCC_Confirmation_Retest_EA_V7.mq5             |
+//|              LUCC_LDCC_Confirmation_Retest_EA_V8.mq5             |
 //|                                                                    |
 //| Expert Advisor port of "LUCC / LDCC Confirmation & Retest         |
 //| Indicator" (Pine v6).                                              |
+//|                                                                    |
+//| ==== V8 CHANGE — ENTRY TIMEFRAME 1H -> 2H ======================= |
+//| The ONLY change from V7: the entry timeframe is now 2H (PERIOD_H2) |
+//| instead of 1H. All entry-signal detection (LUCC/LDCC, CC, RC), the |
+//| new-bar trigger, pending-order & entry-expiration logic, and every |
+//| entry-candle count now run on 2H, via the single ENTRY_TF constant.|
+//| Both engines still use this same entry TF; only their higher       |
+//| timeframes differ (Engine 0: 1W/1D, Engine 1: 2W/2D). Everything   |
+//| else — bias, confirmation, trade management, targets, stops,       |
+//| partial/BE/lock, CSV structure, statistics, research — is          |
+//| byte-for-byte identical to V7.                                     |
 //|                                                                    |
 //| ==== V7 CHANGES — SECOND INDEPENDENT ENGINE ===================== |
 //| Two fully independent trading engines run side by side, sharing    |
@@ -312,6 +323,17 @@ input color  InpPanelBackColor       = C'18,18,22';  // Panel background color
 #define NUM_ENGINES 2
 int g_curEng = ENG_1W1D;   // engine whose higher-TF candles the accessors resolve to
 string EngineName(int e) { return (e == ENG_2W2D) ? "2W-2D" : "1W-1D"; }
+
+//======================================================================
+// V8 — ENTRY TIMEFRAME. All entry-signal detection (LUCC/LDCC, CC, RC),
+// the new-bar trigger, pending-order / expiration logic, and every
+// entry-candle count run on this timeframe. V8 raises it from H1 to H2.
+// Nothing else (Weekly/2W bias, Daily/2D confirmation, trade management,
+// targets, stops, partial/BE/lock, CSV structure, stats) changes.
+// ENTRY_TF_SECS mirrors ENTRY_TF in seconds for entry-candle bar counts.
+//======================================================================
+#define ENTRY_TF       PERIOD_H2
+#define ENTRY_TF_SECS  7200
 
 //======================================================================
 // Per-direction signal + trade-management state
@@ -682,11 +704,11 @@ string FullFilePath(const string name)
 //======================================================================
 // Candle helpers — off is the "just-closed bar" offset described above
 //======================================================================
-double BarOpen(int off)  { return iOpen(_Symbol, PERIOD_H1, off + 1); }
-double BarClose(int off) { return iClose(_Symbol, PERIOD_H1, off + 1); }
-double BarHigh(int off)  { return iHigh(_Symbol, PERIOD_H1, off + 1); }
-double BarLow(int off)   { return iLow(_Symbol, PERIOD_H1, off + 1); }
-datetime BarTime(int off){ return iTime(_Symbol, PERIOD_H1, off + 1); }
+double BarOpen(int off)  { return iOpen(_Symbol, ENTRY_TF, off + 1); }
+double BarClose(int off) { return iClose(_Symbol, ENTRY_TF, off + 1); }
+double BarHigh(int off)  { return iHigh(_Symbol, ENTRY_TF, off + 1); }
+double BarLow(int off)   { return iLow(_Symbol, ENTRY_TF, off + 1); }
+datetime BarTime(int off){ return iTime(_Symbol, ENTRY_TF, off + 1); }
 
 bool   IsBullish(int off) { return BarClose(off) > BarOpen(off); }
 bool   IsBearish(int off) { return BarClose(off) < BarOpen(off); }
@@ -701,7 +723,7 @@ double BodyLow(int off)   { return MathMin(BarOpen(off), BarClose(off)); }
 //+------------------------------------------------------------------+
 int GetMaxBack()
 {
-   int totalBars = iBars(_Symbol, PERIOD_H1);
+   int totalBars = iBars(_Symbol, ENTRY_TF);
    int maxShift   = totalBars - 1;      // highest valid shift index
    int cap        = maxShift - 2;       // leave room for the i+1 breakout reference
    int maxBack    = MathMin(LOOKBACK - 1, cap);
@@ -823,7 +845,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
          // Stop Loss Level — highest high (sell) / lowest low (buy) from the
          // reference candle through the CC, inclusive. Same span the
          // indicator draws its orange dashed line across.
-         int refShift    = iBarShift(_Symbol, PERIOD_H1, st.refTime, true);
+         int refShift    = iBarShift(_Symbol, ENTRY_TF, st.refTime, true);
          int refOffsetNow = refShift - 1;
          double extreme = isSell ? BarHigh(0) : BarLow(0);
          for(int j = 0; j <= refOffsetNow; j++)
@@ -907,7 +929,7 @@ void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double
 
    // Throttle to one entry attempt per H1 bar per side, so a sustained
    // straddle doesn't spam TryOpen (and the Experts log) every tick.
-   datetime curBar = iTime(_Symbol, PERIOD_H1, 0);
+   datetime curBar = iTime(_Symbol, ENTRY_TF, 0);
    st.rcLevelTouched = true;   // the retest level WAS reached (for missed-setup analysis)
    if(st.lastAttemptBar == curBar)
       return;
@@ -2612,10 +2634,10 @@ void CaptureSetupOutcome(bool isSell, datetime refTime, double refHigh, double r
 
    // Hypothetical entry = the CC close (the first moment a real trade could
    // have been taken had the retest requirement not existed).
-   int ccShift = iBarShift(_Symbol, PERIOD_H1, ccTime, true);
+   int ccShift = iBarShift(_Symbol, ENTRY_TF, ccTime, true);
    if(ccShift < 0)
       return;
-   double hypoEntry = iClose(_Symbol, PERIOD_H1, ccShift);
+   double hypoEntry = iClose(_Symbol, ENTRY_TF, ccShift);
    if(hypoEntry <= 0.0)
       return;
 
@@ -2698,20 +2720,20 @@ void FinalizeMissedSetup(const SMissedSetup &m)
    datetime tpTime = 0, slTime = 0;
    int barsScanned = 0;
 
-   int ccShift = iBarShift(_Symbol, PERIOD_H1, m.ccTime, true);
+   int ccShift = iBarShift(_Symbol, ENTRY_TF, m.ccTime, true);
    if(ccShift < 0)
       ccShift = 0;
    // Walk bars strictly AFTER the CC bar, newest shift last. shift 0 is the
    // live bar; the bt>ccTime / bt<=trackUntil guards keep the scan in-window.
    for(int sh = ccShift - 1; sh >= 0; sh--)
    {
-      datetime bt = iTime(_Symbol, PERIOD_H1, sh);
+      datetime bt = iTime(_Symbol, ENTRY_TF, sh);
       if(bt == 0 || bt <= m.ccTime)
          continue;
       if(bt > m.trackUntil)
          break;
-      double hi = iHigh(_Symbol, PERIOD_H1, sh);
-      double lo = iLow(_Symbol, PERIOD_H1, sh);
+      double hi = iHigh(_Symbol, ENTRY_TF, sh);
+      double lo = iLow(_Symbol, ENTRY_TF, sh);
       if(hi <= 0.0 || lo <= 0.0)
          continue;
       barsScanned++;
@@ -2738,7 +2760,7 @@ void FinalizeMissedSetup(const SMissedSetup &m)
 
    // How many H1 bars the setup stayed armed (CC close -> discard) before it was
    // abandoned for never producing an RC — i.e. how long the retest never came.
-   int barsArmed = (m.discardTime > m.ccTime) ? (int)((long)(m.discardTime - m.ccTime) / 3600) : 0;
+   int barsArmed = (m.discardTime > m.ccTime) ? (int)((long)(m.discardTime - m.ccTime) / ENTRY_TF_SECS) : 0;
 
    // Build the row explicitly (stable column order = WriteMissedHeader()).
    // MissID = CC bar time + side, a stable unique key per missed setup.
@@ -3131,13 +3153,13 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
 
    // --- v2 additions: timing, result, and context ---
    double   holdingHours  = holdingMinutes / 60.0;
-   int      barsRefToCC   = (p.refTime > 0 && p.ccTime > 0) ? (int)MathRound((double)(p.ccTime - p.refTime) / 3600.0) : 0;
-   int      barsCcToRc    = (p.ccTime > 0 && p.rcTime > 0)  ? (int)MathRound((double)(p.rcTime - p.ccTime) / 3600.0) : 0;
-   int      barsRcToEntry = (p.rcTime > 0) ? (int)MathRound((double)(p.entryTime - p.rcTime) / 3600.0) : 0;
+   int      barsRefToCC   = (p.refTime > 0 && p.ccTime > 0) ? (int)MathRound((double)(p.ccTime - p.refTime) / (double)ENTRY_TF_SECS) : 0;
+   int      barsCcToRc    = (p.ccTime > 0 && p.rcTime > 0)  ? (int)MathRound((double)(p.rcTime - p.ccTime) / (double)ENTRY_TF_SECS) : 0;
+   int      barsRcToEntry = (p.rcTime > 0) ? (int)MathRound((double)(p.entryTime - p.rcTime) / (double)ENTRY_TF_SECS) : 0;
    // "IMMEDIATE" = retest on the first bar after the CC; "WAITED" = it took longer.
    string   triggerTiming = (barsCcToRc <= 1) ? "IMMEDIATE" : "WAITED";
-   int      entryShift    = iBarShift(_Symbol, PERIOD_H1, p.entryTime, false);
-   datetime entryCandle   = (entryShift < 0) ? p.entryTime : iTime(_Symbol, PERIOD_H1, entryShift);
+   int      entryShift    = iBarShift(_Symbol, ENTRY_TF, p.entryTime, false);
+   datetime entryCandle   = (entryShift < 0) ? p.entryTime : iTime(_Symbol, ENTRY_TF, entryShift);
    // V4: Result comes from the price-based outcome — TP is the only WIN; a BE
    // stop is BE (not a win) even if a +swap left netProfit slightly positive.
    // V4: Result is the price-based outcome. A full TP is WIN; a target-% lock exit
@@ -3158,11 +3180,11 @@ void FinalizePendingLog(const SPendingLog &p, bool windowComplete)
    string dailyCombo    = ComboKey(p.dailySideText);
    string wdCombo       = ComboKey(p.sideBiasText) + "|" + dailyCombo;   // Weekly x Daily combination key
    int    limitWaitBars = (p.limitPlacedTime > 0 && p.entryTime > p.limitPlacedTime)
-                          ? (int)((long)(p.entryTime - p.limitPlacedTime) / 3600) : 0;
+                          ? (int)((long)(p.entryTime - p.limitPlacedTime) / ENTRY_TF_SECS) : 0;
    int    barsToBE      = (p.beArmTime > 0 && p.beArmTime > p.entryTime)
-                          ? (int)((long)(p.beArmTime - p.entryTime) / 3600) : -1;
+                          ? (int)((long)(p.beArmTime - p.entryTime) / ENTRY_TF_SECS) : -1;
    int    barsToPartial = (p.partialDone && p.partialTime > p.entryTime)
-                          ? (int)((long)(p.partialTime - p.entryTime) / 3600) : -1;
+                          ? (int)((long)(p.partialTime - p.entryTime) / ENTRY_TF_SECS) : -1;
    long   secsLive      = p.secsInProfit + p.secsInDraw;
    double pctInProfit   = (secsLive > 0) ? (double)p.secsInProfit / (double)secsLive * 100.0 : 0.0;
    double timeTo1RMin   = (p.firstFavRTime > 0 && p.firstFavRTime >= p.entryTime)
@@ -3691,7 +3713,7 @@ void OnTick()
    CheckDailyReset();
 
    // Closed-bar part: reference-candle (re)selection and CC detection.
-   datetime curBarTime = iTime(_Symbol, PERIOD_H1, 0);
+   datetime curBarTime = iTime(_Symbol, ENTRY_TF, 0);
    if(curBarTime != g_lastBarTime)
    {
       g_lastBarTime = curBarTime;
