@@ -1564,20 +1564,23 @@ void CheckDailyReset()
 #define EPOCH_MON  (datetime)946857600   // 2000.01.03 00:00:00 UTC
 
 // N-WEEKDAY bucket id: non-overlapping consecutive blocks of N trading days
-// (Mon-Fri), weekends folded into the preceding Friday. The weekday index
-// counts Mon-Fri only from the Monday epoch, so floor(index/N) gives:
-//   N=2  -> 2-Day  (Mon-Tue / Wed-Thu / Fri-Mon ... realigns every 2 weeks)
-//   N=5  -> 5-Day  (one Mon-Fri trading week per block)
-//   N=10 -> 10-Day (two trading weeks per block)
-long BucketWeekday(datetime t, int N)
+// (Mon-Fri), weekends never counted (Sat/Sun fold into the preceding Friday).
+// `anchor` is the trading-day-index phase at which a block begins, measured
+// from the Monday epoch (Mon=0,Tue=1,Wed=2,Thu=3,Fri=4). So:
+//   N=2,  anchor=0 -> 2-Day  (Mon-Tue / Wed-Thu / Fri-Mon ...; realigns every 2 wks)
+//   N=5,  anchor=3 -> 5-Day  (each block STARTS on Thursday: Thu-Fri-Mon-Tue-Wed)
+//   N=10, anchor=3 -> 10-Day (two consecutive Thursday-anchored 5-Day blocks)
+long BucketWeekday(datetime t, int N, int anchor)
 {
    long calDays = (long)((long)(t - EPOCH_MON) / 86400);
    long weeks   = calDays / 7;
    long dow     = calDays - weeks * 7;          // 0 = Mon .. 6 = Sun (epoch is Monday)
    if(dow < 0) { dow += 7; weeks -= 1; }
    int  wd      = (dow <= 4) ? (int)dow : 4;    // clamp Sat/Sun into the Friday block
-   long wdIndex = weeks * 5 + wd;
-   return wdIndex / N;
+   long wdIndex = weeks * 5 + wd - anchor;      // shift so a block begins at `anchor`
+   long q       = wdIndex / N;                  // floor division (handle negatives too)
+   if(wdIndex < 0 && (wdIndex % N) != 0) q--;
+   return q;
 }
 // N-WEEK bucket id: discrete, non-overlapping blocks of N calendar weeks
 // (N=2 -> two consecutive weekly candles share a block).
@@ -1606,7 +1609,7 @@ datetime g_c2wBuilt = 0, g_c5dBuilt = 0, g_c10dBuilt = 0, g_c2dBuilt = 0;
 // newest SYN_MAX blocks, index 0 = the block containing the newest (forming)
 // bar. O = open of the oldest bar in the block, C = close of the newest, H/L =
 // extremes, T = oldest bar's time (block start).
-void BuildSynthetic(ENUM_TIMEFRAMES tf, bool byWeek, int groupN,
+void BuildSynthetic(ENUM_TIMEFRAMES tf, bool byWeek, int groupN, int anchor,
                     double &aO[], double &aH[], double &aL[], double &aC[], datetime &aT[], int &n)
 {
    int bars = iBars(_Symbol, tf);
@@ -1619,7 +1622,7 @@ void BuildSynthetic(ENUM_TIMEFRAMES tf, bool byWeek, int groupN,
    {
       datetime bt = iTime(_Symbol, tf, s);
       if(bt == 0) break;
-      long b = byWeek ? BucketWeek(bt, groupN) : BucketWeekday(bt, groupN);
+      long b = byWeek ? BucketWeek(bt, groupN) : BucketWeekday(bt, groupN, anchor);
       double o = iOpen(_Symbol, tf, s), h = iHigh(_Symbol, tf, s),
              l = iLow(_Symbol, tf, s),  c = iClose(_Symbol, tf, s);
       if(b != curB)
@@ -1637,21 +1640,22 @@ void BuildSynthetic(ENUM_TIMEFRAMES tf, bool byWeek, int groupN,
 }
 // Each rebuild is dirty-checked on its source TF's newest bar (cheap to call
 // every tick) and then refreshes the forming block [0] with the live bar.
-void RebuildSynDaily(int groupN, double &aO[], double &aH[], double &aL[], double &aC[], datetime &aT[], int &n, datetime &built)
+void RebuildSynDaily(int groupN, int anchor, double &aO[], double &aH[], double &aL[], double &aC[], datetime &aT[], int &n, datetime &built)
 {
    datetime t0 = iTime(_Symbol, PERIOD_D1, 0);
-   if(t0 != built) { BuildSynthetic(PERIOD_D1, false, groupN, aO, aH, aL, aC, aT, n); built = t0; }
+   if(t0 != built) { BuildSynthetic(PERIOD_D1, false, groupN, anchor, aO, aH, aL, aC, aT, n); built = t0; }
    if(n > 0) { aH[0] = MathMax(aH[0], iHigh(_Symbol, PERIOD_D1, 0));
                aL[0] = MathMin(aL[0], iLow(_Symbol, PERIOD_D1, 0));
                aC[0] = iClose(_Symbol, PERIOD_D1, 0); }
 }
-void RebuildSynthetic2D()  { RebuildSynDaily(2,  g_c2dO,  g_c2dH,  g_c2dL,  g_c2dC,  g_c2dT,  g_n2d,  g_c2dBuilt);  }
-void RebuildSynthetic5D()  { RebuildSynDaily(5,  g_c5dO,  g_c5dH,  g_c5dL,  g_c5dC,  g_c5dT,  g_n5d,  g_c5dBuilt);  }
-void RebuildSynthetic10D() { RebuildSynDaily(10, g_c10dO, g_c10dH, g_c10dL, g_c10dC, g_c10dT, g_n10d, g_c10dBuilt); }
+// 2D: Monday-anchored pairs.  5D/10D: Thursday-anchored (anchor=3), 10D = 2x5D.
+void RebuildSynthetic2D()  { RebuildSynDaily(2,  0, g_c2dO,  g_c2dH,  g_c2dL,  g_c2dC,  g_c2dT,  g_n2d,  g_c2dBuilt);  }
+void RebuildSynthetic5D()  { RebuildSynDaily(5,  3, g_c5dO,  g_c5dH,  g_c5dL,  g_c5dC,  g_c5dT,  g_n5d,  g_c5dBuilt);  }
+void RebuildSynthetic10D() { RebuildSynDaily(10, 3, g_c10dO, g_c10dH, g_c10dL, g_c10dC, g_c10dT, g_n10d, g_c10dBuilt); }
 void RebuildSynthetic2W()
 {
    datetime t0 = iTime(_Symbol, PERIOD_W1, 0);
-   if(t0 != g_c2wBuilt) { BuildSynthetic(PERIOD_W1, true, 2, g_c2wO, g_c2wH, g_c2wL, g_c2wC, g_c2wT, g_n2w); g_c2wBuilt = t0; }
+   if(t0 != g_c2wBuilt) { BuildSynthetic(PERIOD_W1, true, 2, 0, g_c2wO, g_c2wH, g_c2wL, g_c2wC, g_c2wT, g_n2w); g_c2wBuilt = t0; }
    if(g_n2w > 0) { g_c2wH[0] = MathMax(g_c2wH[0], iHigh(_Symbol, PERIOD_W1, 0));
                    g_c2wL[0] = MathMin(g_c2wL[0], iLow(_Symbol, PERIOD_W1, 0));
                    g_c2wC[0] = iClose(_Symbol, PERIOD_W1, 0); }
