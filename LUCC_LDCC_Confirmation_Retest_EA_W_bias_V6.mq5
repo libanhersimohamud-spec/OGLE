@@ -15,12 +15,16 @@
 //|    pending, if price trades beyond Daily C1 (buy: above C1 High,    |
 //|    sell: below C1 Low) the limit is deleted immediately, the setup  |
 //|    is marked expired, and the EA hunts a brand-new setup.           |
-//| 3. TRADE MANAGEMENT (replaces the V4 target-lock defaults):         |
-//|      - Move the SL to breakeven at +1.2R.                           |
-//|      - Take 50% of the position off at +2R (partial close); the     |
-//|        remaining 50% runs to the final target.                      |
+//| 3. TRADE MANAGEMENT — a three-stage ladder on each trade:           |
+//|      - Stage 1: move the SL to breakeven at +1.2R.                  |
+//|      - Stage 2: take 50% off at +2R (partial); the remaining 50%    |
+//|        runs on.                                                     |
+//|      - Stage 3: at 82% of the total target, move the runner's SL to |
+//|        50% of the total target (percentage-based profit lock that   |
+//|        scales to any RR). Only ever tightens into profit.           |
 //|      - A remaining position stopped at BE is a BREAKEVEN trade, not |
-//|        a win; the Weekly bias is completed ONLY on a full TP.       |
+//|        a win; a runner stopped at the lock is a LOCK exit; the      |
+//|        Weekly bias is completed ONLY on a full TP.                  |
 //| 4. RESEARCH PLATFORM LOGGING: actual Daily patterns at entry,       |
 //|    Weekly x Daily combos, entry type / limit wait candles / fill /  |
 //|    expiry, partial-close geometry, BE-arm timing, time in profit vs |
@@ -123,19 +127,20 @@ input double InpBreakevenLockR       = 0.0;   // Where to park the SL when armed
 
 input group "Partial Profit (V6: take 50% off at +2R)"
 input bool   InpUsePartialClose      = true;  // V6: close part of the position at InpPartialCloseR and let the rest
-                                               // run to the final target. Combined with BE@1.2R this replaces the
-                                               // old target-% profit lock as the default trade-management scheme.
+                                               // run to the final target. Stage 2 of the trade-management ladder
+                                               // (BE @1.2R -> partial 50% @2R -> target-% profit lock @82%).
 input double InpPartialCloseR        = 2.0;   // Arm the partial close when floating profit reaches this many R.
 input double InpPartialClosePct      = 50.0;  // Percent of the ORIGINAL position volume to close at that point
                                                // (the remainder runs to the final TP). 50 = take half off.
 
-input group "Target-% Profit Lock (V4 — OFF by default in V6, replaced by partial+BE)"
-input bool   InpUseTargetLock        = false; // V6: OFF by default — superseded by BE@1.2R + partial@2R. Kept for
-                                               // A/B research. Once price reaches InpTargetLockTriggerPct of the TOTAL target
-                                               // distance, move the SL to InpTargetLockSLPct of the target (a profit
-                                               // lock). Both levels are % of the CURRENT target, so this scales to
-                                               // ANY RR (3R/4R/5R...) with no code change. Supersedes the R-based /
-                                               // Daily breakeven (it parks the SL further into profit).
+input group "Target-% Profit Lock (V6: 82% -> 50% profit lock on the runner)"
+input bool   InpUseTargetLock        = true;  // Stage 3 of the ladder: once price reaches InpTargetLockTriggerPct of
+                                               // the TOTAL target distance, move the remaining 50% runner's SL to
+                                               // InpTargetLockSLPct of the target (locked profit). Percentage-based,
+                                               // so it scales to ANY RR (3R -> arm 2.46R, lock 1.50R; 4R -> arm 3.28R,
+                                               // lock 2.00R) with no code change. Only ever tightens the stop further
+                                               // into profit — it runs after BE@1.2R and the +2R partial and
+                                               // supersedes them (parks the SL deeper in profit).
 input double InpTargetLockTriggerPct = 82.0;  // Arm when floating profit reaches this % of the target distance
                                                // (e.g. 82% of a 3R target = 2.46R; of a 4R target = 3.28R).
 input double InpTargetLockSLPct      = 50.0;   // Move the SL to this % of the target distance, in profit
@@ -3530,8 +3535,8 @@ void OnTick()
    UpdateOpenExcursions(bid, ask);   // MFE/MAE + time-in-profit/DD + maxDD for every open trade
    UpdateBreakeven(bid, ask);        // V6: move SL to breakeven once the +1.2R trigger is reached
    UpdatePartialClose(bid, ask);     // V6: take 50% off at +2R (the remainder runs to the target)
-   UpdateDailyBreakeven(bid, ask);   // move SL to BE when price trades beyond Daily Candle-1
-   UpdateTargetLock(bid, ask);       // V4 (OFF by default in V6): target-% profit lock
+   UpdateDailyBreakeven(bid, ask);   // move SL to BE when price trades beyond Daily Candle-1 (opt-in)
+   UpdateTargetLock(bid, ask);       // V6 stage 3: at 82% of target, lock the runner's SL at 50% of target
    if(InpEnableTradeLog)
       UpdatePendingExcursions(bid, ask);
    if(InpLogMissedSetups || InpLogSkippedSetups)
