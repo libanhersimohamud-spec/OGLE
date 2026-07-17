@@ -1,8 +1,25 @@
 //+------------------------------------------------------------------+
-//|              LUCC_LDCC_Confirmation_Retest_EA_V8.mq5             |
+//|              LUCC_LDCC_Confirmation_Retest_EA_V9.mq5             |
 //|                                                                    |
 //| Expert Advisor port of "LUCC / LDCC Confirmation & Retest         |
 //| Indicator" (Pine v6).                                              |
+//|                                                                    |
+//| ==== V9 CHANGE — SIX INDEPENDENT ENGINES ======================== |
+//| Four more fully independent engines are added (six total), each    |
+//| differing ONLY in its higher-timeframe hierarchy; all share the    |
+//| same 2H entry TF and identical entry / management / logging logic: |
+//|   Engine 0: 1W  -> 1D -> 2H     Engine 3: 5D  -> 1D -> 2H          |
+//|   Engine 1: 2W  -> 2D -> 2H     Engine 4: 5D  -> 2D -> 2H          |
+//|   Engine 2: 10D -> 2D -> 2H     Engine 5: 1W  -> 2D -> 2H          |
+//| Per engine, the bias/confirmation accessors resolve to that        |
+//| engine's timeframe via g_engBias[]/g_engConf[] "kinds" (native W1/ |
+//| D1, or synthetic 2W / 5D / 10D / 2D blocks). Synthetic blocks:      |
+//|   2W  = 2 calendar weeks (from W1);                                 |
+//|   5D  = one Mon-Fri trading week, 10D = two trading weeks,          |
+//|   2D  = Mon-Tue/Wed-Thu/Fri-Mon pairs (all from D1, weekday-index).|
+//| Every engine keeps its OWN bias, setup/LUCC/LDCC/CC/RC state,      |
+//| pending orders, open trades, counters, win-episodes and stats; no  |
+//| engine can affect another. Each CSV row carries the Engine column. |
 //|                                                                    |
 //| ==== V8 CHANGE — ENTRY TIMEFRAME 1H -> 2H ======================= |
 //| The ONLY change from V7: the entry timeframe is now 2H (PERIOD_H2) |
@@ -315,14 +332,33 @@ input color  InpPanelBackColor       = C'18,18,22';  // Panel background color
 #define LOOKBACK 120   // rolling window: only the latest 120 closed candles are ever searched
 
 //======================================================================
-// V7 — dual-engine constants (must precede all per-engine state below).
-// Engine 0 = 1W -> 1D -> 1H (original path); Engine 1 = 2W -> 2D -> 1H.
+// V7/V9 — multi-engine constants (must precede all per-engine state below).
+// Six fully independent engines, differing ONLY in the higher-timeframe
+// hierarchy (bias TF -> confirmation TF); all share the 2H entry TF (V8):
+//   Engine 0: 1W  -> 1D -> 2H
+//   Engine 1: 2W  -> 2D -> 2H
+//   Engine 2: 10D -> 2D -> 2H
+//   Engine 3: 5D  -> 1D -> 2H
+//   Engine 4: 5D  -> 2D -> 2H
+//   Engine 5: 1W  -> 2D -> 2H
 //======================================================================
-#define ENG_1W1D    0
-#define ENG_2W2D    1
-#define NUM_ENGINES 2
-int g_curEng = ENG_1W1D;   // engine whose higher-TF candles the accessors resolve to
-string EngineName(int e) { return (e == ENG_2W2D) ? "2W-2D" : "1W-1D"; }
+#define ENG_1W1D    0          // kept for the info panel's default engine
+#define NUM_ENGINES 6
+
+// Bias-timeframe "kind" (how W* accessors resolve) and confirmation-timeframe
+// "kind" (how D* accessors resolve) for each engine.
+#define BK_W1   0
+#define BK_2W   1
+#define BK_5D   2
+#define BK_10D  3
+#define CK_D1   0
+#define CK_2D   1
+
+int    g_curEng = ENG_1W1D;   // engine whose higher-TF candles the accessors resolve to
+int    g_engBias[NUM_ENGINES] = { BK_W1, BK_2W, BK_10D, BK_5D,  BK_5D, BK_W1 };
+int    g_engConf[NUM_ENGINES] = { CK_D1, CK_2D, CK_2D,  CK_D1,  CK_2D, CK_2D };
+string g_engName[NUM_ENGINES] = { "1W-1D","2W-2D","10D-2D","5D-1D","5D-2D","1W-2D" };
+string EngineName(int e) { return (e >= 0 && e < NUM_ENGINES) ? g_engName[e] : "?"; }
 
 //======================================================================
 // V8 — ENTRY TIMEFRAME. All entry-signal detection (LUCC/LDCC, CC, RC),
@@ -1524,48 +1560,57 @@ void CheckDailyReset()
 // and the per-engine win-episode store); the two engines never share state.
 //======================================================================
 
-// Monday epoch for deterministic 2-day / 2-week bucketing (2000-01-03 = Monday).
+// Monday epoch for deterministic day/week bucketing (2000-01-03 = Monday).
 #define EPOCH_MON  (datetime)946857600   // 2000.01.03 00:00:00 UTC
 
-// 2-DAY bucket id for a bar date: non-overlapping consecutive WEEKDAY pairs,
-// Mon-Tue / Wed-Thu / Fri-Mon / Tue-Wed / Thu-Fri ... (weekends folded into
-// the Friday->Monday pair). Weekday index counts Mon-Fri only from the Monday
-// epoch, so floor(index/2) yields exactly the agreed non-overlapping pairing
-// (realigns to Mon-Tue every two weeks).
-long Bucket2D(datetime t)
+// N-WEEKDAY bucket id: non-overlapping consecutive blocks of N trading days
+// (Mon-Fri), weekends folded into the preceding Friday. The weekday index
+// counts Mon-Fri only from the Monday epoch, so floor(index/N) gives:
+//   N=2  -> 2-Day  (Mon-Tue / Wed-Thu / Fri-Mon ... realigns every 2 weeks)
+//   N=5  -> 5-Day  (one Mon-Fri trading week per block)
+//   N=10 -> 10-Day (two trading weeks per block)
+long BucketWeekday(datetime t, int N)
 {
    long calDays = (long)((long)(t - EPOCH_MON) / 86400);
    long weeks   = calDays / 7;
    long dow     = calDays - weeks * 7;          // 0 = Mon .. 6 = Sun (epoch is Monday)
    if(dow < 0) { dow += 7; weeks -= 1; }
-   int  wd      = (dow <= 4) ? (int)dow : 4;    // clamp Sat/Sun into the Fri->Mon pair
+   int  wd      = (dow <= 4) ? (int)dow : 4;    // clamp Sat/Sun into the Friday block
    long wdIndex = weeks * 5 + wd;
-   return wdIndex / 2;
+   return wdIndex / N;
 }
-// 2-WEEK bucket id: discrete, non-overlapping 2-week blocks (two consecutive
-// weekly candles share a block).
-long Bucket2W(datetime weekStart)
+// N-WEEK bucket id: discrete, non-overlapping blocks of N calendar weeks
+// (N=2 -> two consecutive weekly candles share a block).
+long BucketWeek(datetime weekStart, int N)
 {
    long weeks = (long)((long)(weekStart - EPOCH_MON) / (7 * 86400));
    if(weekStart < EPOCH_MON && ((long)(weekStart - EPOCH_MON) % (7 * 86400)) != 0) weeks -= 1;
-   return weeks / 2;
+   return weeks / N;
 }
 
-// Synthetic candle caches for Engine 1 (index 0 = current/forming block).
+// Synthetic candle caches (index 0 = current/forming block). Four distinct
+// higher-timeframe constructions are needed across the six engines:
+//   2W  (from W1, 2 weeks)   -> bias for Engine 2
+//   5D  (from D1, 5 weekdays)-> bias for Engines 4 & 5
+//   10D (from D1,10 weekdays)-> bias for Engine 3
+//   2D  (from D1, 2 weekdays)-> confirmation for Engines 2/3/5/6
 #define SYN_MAX 20
-double   g_c2wO[], g_c2wH[], g_c2wL[], g_c2wC[]; datetime g_c2wT[]; int g_n2w = 0;
-double   g_c2dO[], g_c2dH[], g_c2dL[], g_c2dC[]; datetime g_c2dT[]; int g_n2d = 0;
-datetime g_c2dBuilt = 0, g_c2wBuilt = 0;
+double   g_c2wO[],  g_c2wH[],  g_c2wL[],  g_c2wC[];  datetime g_c2wT[];  int g_n2w  = 0;
+double   g_c5dO[],  g_c5dH[],  g_c5dL[],  g_c5dC[];  datetime g_c5dT[];  int g_n5d  = 0;
+double   g_c10dO[], g_c10dH[], g_c10dL[], g_c10dC[]; datetime g_c10dT[]; int g_n10d = 0;
+double   g_c2dO[],  g_c2dH[],  g_c2dL[],  g_c2dC[];  datetime g_c2dT[];  int g_n2d  = 0;
+datetime g_c2wBuilt = 0, g_c5dBuilt = 0, g_c10dBuilt = 0, g_c2dBuilt = 0;
 
-// Aggregate native bars of `tf` into non-overlapping buckets (bucketFn) and
-// store the newest SYN_MAX blocks, index 0 = the block containing the newest
-// (forming) bar. O = open of the oldest bar in the block, C = close of the
-// newest, H/L = extremes, T = oldest bar's time (block start).
-void BuildSynthetic(ENUM_TIMEFRAMES tf, bool isWeek,
+// Aggregate native bars of `tf` into non-overlapping blocks (byWeek chooses the
+// week-index vs weekday-index bucketing; groupN = block size) and store the
+// newest SYN_MAX blocks, index 0 = the block containing the newest (forming)
+// bar. O = open of the oldest bar in the block, C = close of the newest, H/L =
+// extremes, T = oldest bar's time (block start).
+void BuildSynthetic(ENUM_TIMEFRAMES tf, bool byWeek, int groupN,
                     double &aO[], double &aH[], double &aL[], double &aC[], datetime &aT[], int &n)
 {
    int bars = iBars(_Symbol, tf);
-   int need = MathMin(bars, SYN_MAX * 2 + 4);
+   int need = MathMin(bars, SYN_MAX * groupN + groupN + 4);
    ArrayResize(aO, SYN_MAX); ArrayResize(aH, SYN_MAX); ArrayResize(aL, SYN_MAX);
    ArrayResize(aC, SYN_MAX); ArrayResize(aT, SYN_MAX);
    n = 0;
@@ -1574,7 +1619,7 @@ void BuildSynthetic(ENUM_TIMEFRAMES tf, bool isWeek,
    {
       datetime bt = iTime(_Symbol, tf, s);
       if(bt == 0) break;
-      long b = isWeek ? Bucket2W(bt) : Bucket2D(bt);
+      long b = byWeek ? BucketWeek(bt, groupN) : BucketWeekday(bt, groupN);
       double o = iOpen(_Symbol, tf, s), h = iHigh(_Symbol, tf, s),
              l = iLow(_Symbol, tf, s),  c = iClose(_Symbol, tf, s);
       if(b != curB)
@@ -1590,32 +1635,101 @@ void BuildSynthetic(ENUM_TIMEFRAMES tf, bool isWeek,
    }
    n = idx + 1;
 }
-void RebuildSynthetic2D()
+// Each rebuild is dirty-checked on its source TF's newest bar (cheap to call
+// every tick) and then refreshes the forming block [0] with the live bar.
+void RebuildSynDaily(int groupN, double &aO[], double &aH[], double &aL[], double &aC[], datetime &aT[], int &n, datetime &built)
 {
    datetime t0 = iTime(_Symbol, PERIOD_D1, 0);
-   if(t0 != g_c2dBuilt) { BuildSynthetic(PERIOD_D1, false, g_c2dO, g_c2dH, g_c2dL, g_c2dC, g_c2dT, g_n2d); g_c2dBuilt = t0; }
-   if(g_n2d > 0) { g_c2dH[0] = MathMax(g_c2dH[0], iHigh(_Symbol, PERIOD_D1, 0));
-                   g_c2dL[0] = MathMin(g_c2dL[0], iLow(_Symbol, PERIOD_D1, 0));
-                   g_c2dC[0] = iClose(_Symbol, PERIOD_D1, 0); }
+   if(t0 != built) { BuildSynthetic(PERIOD_D1, false, groupN, aO, aH, aL, aC, aT, n); built = t0; }
+   if(n > 0) { aH[0] = MathMax(aH[0], iHigh(_Symbol, PERIOD_D1, 0));
+               aL[0] = MathMin(aL[0], iLow(_Symbol, PERIOD_D1, 0));
+               aC[0] = iClose(_Symbol, PERIOD_D1, 0); }
 }
+void RebuildSynthetic2D()  { RebuildSynDaily(2,  g_c2dO,  g_c2dH,  g_c2dL,  g_c2dC,  g_c2dT,  g_n2d,  g_c2dBuilt);  }
+void RebuildSynthetic5D()  { RebuildSynDaily(5,  g_c5dO,  g_c5dH,  g_c5dL,  g_c5dC,  g_c5dT,  g_n5d,  g_c5dBuilt);  }
+void RebuildSynthetic10D() { RebuildSynDaily(10, g_c10dO, g_c10dH, g_c10dL, g_c10dC, g_c10dT, g_n10d, g_c10dBuilt); }
 void RebuildSynthetic2W()
 {
    datetime t0 = iTime(_Symbol, PERIOD_W1, 0);
-   if(t0 != g_c2wBuilt) { BuildSynthetic(PERIOD_W1, true, g_c2wO, g_c2wH, g_c2wL, g_c2wC, g_c2wT, g_n2w); g_c2wBuilt = t0; }
+   if(t0 != g_c2wBuilt) { BuildSynthetic(PERIOD_W1, true, 2, g_c2wO, g_c2wH, g_c2wL, g_c2wC, g_c2wT, g_n2w); g_c2wBuilt = t0; }
    if(g_n2w > 0) { g_c2wH[0] = MathMax(g_c2wH[0], iHigh(_Symbol, PERIOD_W1, 0));
                    g_c2wL[0] = MathMin(g_c2wL[0], iLow(_Symbol, PERIOD_W1, 0));
                    g_c2wC[0] = iClose(_Symbol, PERIOD_W1, 0); }
 }
-void RebuildSyntheticFor(int eng) { if(eng == ENG_2W2D) { RebuildSynthetic2W(); RebuildSynthetic2D(); } }
+// Rebuild exactly the synthetic caches this engine's bias/confirmation need
+// (native W1/D1 need no cache). Shared caches are dirty-checked, so a repeat
+// call the same tick is a no-op.
+void RebuildSyntheticFor(int eng)
+{
+   int bk = g_engBias[eng], ck = g_engConf[eng];
+   if(bk == BK_2W)  RebuildSynthetic2W();
+   if(bk == BK_5D)  RebuildSynthetic5D();
+   if(bk == BK_10D) RebuildSynthetic10D();
+   if(ck == CK_2D)  RebuildSynthetic2D();
+}
 
-// --- Engine-aware WEEKLY (bias TF) accessors: native W1 for engine 0,
-//     synthetic 2W for engine 1. Offset 0 = forming block, 1 = last closed. ---
-double   WOpen(int s)  { if(g_curEng == ENG_1W1D) return iOpen(_Symbol, PERIOD_W1, s);  return (s >= 0 && s < g_n2w) ? g_c2wO[s] : 0.0; }
-double   WHigh(int s)  { if(g_curEng == ENG_1W1D) return iHigh(_Symbol, PERIOD_W1, s);  return (s >= 0 && s < g_n2w) ? g_c2wH[s] : 0.0; }
-double   WLow(int s)   { if(g_curEng == ENG_1W1D) return iLow(_Symbol, PERIOD_W1, s);   return (s >= 0 && s < g_n2w) ? g_c2wL[s] : 0.0; }
-double   WClose(int s) { if(g_curEng == ENG_1W1D) return iClose(_Symbol, PERIOD_W1, s); return (s >= 0 && s < g_n2w) ? g_c2wC[s] : 0.0; }
-datetime WTime(int s)  { if(g_curEng == ENG_1W1D) return iTime(_Symbol, PERIOD_W1, s);  return (s >= 0 && s < g_n2w) ? g_c2wT[s] : 0; }
-int      WBars()       { return (g_curEng == ENG_1W1D) ? iBars(_Symbol, PERIOD_W1) : g_n2w; }
+// --- Engine-aware WEEKLY (bias TF) accessors. Offset 0 = forming block,
+//     1 = last closed. Resolve to the current engine's bias construction. ---
+double   WOpen(int s)
+{
+   switch(g_engBias[g_curEng])
+   {
+      case BK_2W:  return (s >= 0 && s < g_n2w)  ? g_c2wO[s]  : 0.0;
+      case BK_5D:  return (s >= 0 && s < g_n5d)  ? g_c5dO[s]  : 0.0;
+      case BK_10D: return (s >= 0 && s < g_n10d) ? g_c10dO[s] : 0.0;
+      default:     return iOpen(_Symbol, PERIOD_W1, s);   // BK_W1
+   }
+}
+double   WHigh(int s)
+{
+   switch(g_engBias[g_curEng])
+   {
+      case BK_2W:  return (s >= 0 && s < g_n2w)  ? g_c2wH[s]  : 0.0;
+      case BK_5D:  return (s >= 0 && s < g_n5d)  ? g_c5dH[s]  : 0.0;
+      case BK_10D: return (s >= 0 && s < g_n10d) ? g_c10dH[s] : 0.0;
+      default:     return iHigh(_Symbol, PERIOD_W1, s);
+   }
+}
+double   WLow(int s)
+{
+   switch(g_engBias[g_curEng])
+   {
+      case BK_2W:  return (s >= 0 && s < g_n2w)  ? g_c2wL[s]  : 0.0;
+      case BK_5D:  return (s >= 0 && s < g_n5d)  ? g_c5dL[s]  : 0.0;
+      case BK_10D: return (s >= 0 && s < g_n10d) ? g_c10dL[s] : 0.0;
+      default:     return iLow(_Symbol, PERIOD_W1, s);
+   }
+}
+double   WClose(int s)
+{
+   switch(g_engBias[g_curEng])
+   {
+      case BK_2W:  return (s >= 0 && s < g_n2w)  ? g_c2wC[s]  : 0.0;
+      case BK_5D:  return (s >= 0 && s < g_n5d)  ? g_c5dC[s]  : 0.0;
+      case BK_10D: return (s >= 0 && s < g_n10d) ? g_c10dC[s] : 0.0;
+      default:     return iClose(_Symbol, PERIOD_W1, s);
+   }
+}
+datetime WTime(int s)
+{
+   switch(g_engBias[g_curEng])
+   {
+      case BK_2W:  return (s >= 0 && s < g_n2w)  ? g_c2wT[s]  : 0;
+      case BK_5D:  return (s >= 0 && s < g_n5d)  ? g_c5dT[s]  : 0;
+      case BK_10D: return (s >= 0 && s < g_n10d) ? g_c10dT[s] : 0;
+      default:     return iTime(_Symbol, PERIOD_W1, s);
+   }
+}
+int      WBars()
+{
+   switch(g_engBias[g_curEng])
+   {
+      case BK_2W:  return g_n2w;
+      case BK_5D:  return g_n5d;
+      case BK_10D: return g_n10d;
+      default:     return iBars(_Symbol, PERIOD_W1);
+   }
+}
 
 // --- Buy-side patterns ---
 bool Bias_BC_Buy()    { return WClose(1) > WHigh(2); }
@@ -1679,12 +1793,14 @@ string Bias_SellText()
 //======================================================================
 // Engine-aware DAILY (confirmation TF) accessors: native D1 for engine 0,
 // synthetic 2D for engine 1. Offset 0 = forming block, 1 = last closed.
-double   DOpen(int s)  { if(g_curEng == ENG_1W1D) return iOpen(_Symbol, PERIOD_D1, s);  return (s >= 0 && s < g_n2d) ? g_c2dO[s] : 0.0; }
-double   DHigh(int s)  { if(g_curEng == ENG_1W1D) return iHigh(_Symbol, PERIOD_D1, s);  return (s >= 0 && s < g_n2d) ? g_c2dH[s] : 0.0; }
-double   DLow(int s)   { if(g_curEng == ENG_1W1D) return iLow(_Symbol, PERIOD_D1, s);   return (s >= 0 && s < g_n2d) ? g_c2dL[s] : 0.0; }
-double   DClose(int s) { if(g_curEng == ENG_1W1D) return iClose(_Symbol, PERIOD_D1, s); return (s >= 0 && s < g_n2d) ? g_c2dC[s] : 0.0; }
-datetime DTime(int s)  { if(g_curEng == ENG_1W1D) return iTime(_Symbol, PERIOD_D1, s);  return (s >= 0 && s < g_n2d) ? g_c2dT[s] : 0; }
-int      DBars()       { return (g_curEng == ENG_1W1D) ? iBars(_Symbol, PERIOD_D1) : g_n2d; }
+// Engine-aware DAILY (confirmation TF) accessors: native D1 (CK_D1) or
+// synthetic 2D (CK_2D). Offset 0 = forming block, 1 = last closed.
+double   DOpen(int s)  { if(g_engConf[g_curEng] == CK_2D) return (s >= 0 && s < g_n2d) ? g_c2dO[s] : 0.0; return iOpen(_Symbol, PERIOD_D1, s); }
+double   DHigh(int s)  { if(g_engConf[g_curEng] == CK_2D) return (s >= 0 && s < g_n2d) ? g_c2dH[s] : 0.0; return iHigh(_Symbol, PERIOD_D1, s); }
+double   DLow(int s)   { if(g_engConf[g_curEng] == CK_2D) return (s >= 0 && s < g_n2d) ? g_c2dL[s] : 0.0; return iLow(_Symbol, PERIOD_D1, s); }
+double   DClose(int s) { if(g_engConf[g_curEng] == CK_2D) return (s >= 0 && s < g_n2d) ? g_c2dC[s] : 0.0; return iClose(_Symbol, PERIOD_D1, s); }
+datetime DTime(int s)  { if(g_engConf[g_curEng] == CK_2D) return (s >= 0 && s < g_n2d) ? g_c2dT[s] : 0;   return iTime(_Symbol, PERIOD_D1, s); }
+int      DBars()       { return (g_engConf[g_curEng] == CK_2D) ? g_n2d : iBars(_Symbol, PERIOD_D1); }
 
 // --- Daily Buy-side patterns ---
 bool Daily_BC_Buy()    { return DClose(1) > DHigh(2); }
