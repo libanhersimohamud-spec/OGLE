@@ -304,6 +304,16 @@ input color  InpPanelBackColor       = C'18,18,22';  // Panel background color
 #define LOOKBACK 120   // rolling window: only the latest 120 closed candles are ever searched
 
 //======================================================================
+// V7 — dual-engine constants (must precede all per-engine state below).
+// Engine 0 = 1W -> 1D -> 1H (original path); Engine 1 = 2W -> 2D -> 1H.
+//======================================================================
+#define ENG_1W1D    0
+#define ENG_2W2D    1
+#define NUM_ENGINES 2
+int g_curEng = ENG_1W1D;   // engine whose higher-TF candles the accessors resolve to
+string EngineName(int e) { return (e == ENG_2W2D) ? "2W-2D" : "1W-1D"; }
+
+//======================================================================
 // Per-direction signal + trade-management state
 // (one instance for SELL/LUCC, one for BUY/LDCC — fully independent,
 // exactly as in the indicator and as required by the daily trade rules)
@@ -1348,7 +1358,7 @@ bool IsBrokerDstActive(datetime serverTime)
 {
    if(!InpBrokerUsesDst)
       return false;
-   datetime approxUtc = serverTime - (long)(g_brokerStdOffsetHours * 3600);
+   datetime approxUtc = (datetime)(serverTime - (long)(g_brokerStdOffsetHours * 3600));
    return IsEuDstUtc(approxUtc);
 }
 
@@ -1362,7 +1372,7 @@ datetime GetNairobiTime(datetime serverTime)
    if(IsBrokerDstActive(serverTime))
       offsetHours += 1.0;
 
-   datetime utcTime = serverTime - (long)(offsetHours * 3600);
+   datetime utcTime = (datetime)(serverTime - (long)(offsetHours * 3600));
    return utcTime + 3 * 3600; // Nairobi = UTC+3, year-round
 }
 
@@ -1483,20 +1493,14 @@ void CheckDailyReset()
 // never touches the LUCC/LDCC/CC/RC detection above.
 //======================================================================
 //======================================================================
-// V7 — DUAL ENGINE INFRASTRUCTURE
-// Engine 0 = 1W -> 1D -> 1H (the original, unchanged behaviour).
-// Engine 1 = 2W -> 2D -> 1H (synthetic higher timeframes; identical logic).
+// V7 — DUAL ENGINE INFRASTRUCTURE (constants defined near the top of the
+// file, before any per-engine state uses them; see g_curEng / NUM_ENGINES).
 // A single global "current engine" context (g_curEng) makes every higher-
 // timeframe candle accessor (W*/D*) and every pattern function resolve to the
 // right timeframe with no change to the pattern code itself. All trading STATE
 // is per-engine (see g_bias[2]/g_sell[2]/g_buy[2], engine-tagged trade records,
 // and the per-engine win-episode store); the two engines never share state.
 //======================================================================
-#define ENG_1W1D 0
-#define ENG_2W2D 1
-#define NUM_ENGINES 2
-int g_curEng = ENG_1W1D;   // engine whose higher-TF candles the accessors resolve to
-string EngineName(int e) { return (e == ENG_2W2D) ? "2W-2D" : "1W-1D"; }
 
 // Monday epoch for deterministic 2-day / 2-week bucketing (2000-01-03 = Monday).
 #define EPOCH_MON  (datetime)946857600   // 2000.01.03 00:00:00 UTC
@@ -1547,7 +1551,7 @@ void BuildSynthetic(ENUM_TIMEFRAMES tf, bool isWeek,
    for(int s = 0; s < need && idx < SYN_MAX - 1; s++)
    {
       datetime bt = iTime(_Symbol, tf, s);
-      if(bt <= 0) break;
+      if(bt == 0) break;
       long b = isWeek ? Bucket2W(bt) : Bucket2D(bt);
       double o = iOpen(_Symbol, tf, s), h = iHigh(_Symbol, tf, s),
              l = iLow(_Symbol, tf, s),  c = iClose(_Symbol, tf, s);
