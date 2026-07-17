@@ -221,11 +221,13 @@ input bool   InpUseBiasFilter        = true;  // Gate entries on the Weekly (1W)
 // existing reference keeps enforcing it and can never be bypassed in any run.
 const bool   InpUseDailyConfirmation = true;
 
-input group "Daily-Level Breakeven (move SL to BE on Daily-C1 break)"
-input bool   InpMoveToBEOnDailyBreak = true;  // While a trade is open, if price trades beyond Daily Candle-1
-                                               // (BUY: above Daily-C1 High; SELL: below Daily-C1 Low) move the
-                                               // SL to breakeven (entry). Independent of the R-based breakeven
-                                               // and of TP/SL; whichever moves the SL to BE first wins.
+input group "Daily-Level Breakeven (V4 — OFF by default in V6)"
+input bool   InpMoveToBEOnDailyBreak = false; // V6: OFF by default so the V6 management (BE @ +1.2R + partial @
+                                               // +2R) is the single, unambiguous scheme — this V4 rule could
+                                               // otherwise move the SL to BE before +1.2R and conflict with it.
+                                               // Kept for A/B research: while a trade is open, if price trades
+                                               // beyond Daily Candle-1 (BUY: above C1 High; SELL: below C1 Low)
+                                               // move the SL to breakeven. (Whichever BE rule fires first wins.)
 
 input group "Weekly-Bias Trade Rule (A/B toggle)"
 input bool   InpStopAfterFirstWin    = true;  // ON  = after a WIN in the current weekly bias direction,
@@ -890,7 +892,7 @@ void UpdateOpenExcursions(double bid, double ask)
 
    for(int i = 0; i < ArraySize(g_openTrades); i++)
    {
-      double favPx, floatMove; // floatMove = signed price move in our favor (profit>0, drawdown<0)
+      double favPx = 0.0, floatMove = 0.0; // floatMove = signed price move in our favor (profit>0, drawdown<0)
       if(g_openTrades[i].isSell)
       {
          g_openTrades[i].mfePrice = MathMin(g_openTrades[i].mfePrice, bid); // lower = favorable for a sell
@@ -2439,7 +2441,7 @@ void CaptureSetupOutcome(bool isSell, datetime refTime, double refHigh, double r
    // A "skip" reason (a rule blocked a ready setup, or a limit was cancelled on a
    // Daily break) is gated by InpLogSkippedSetups; a "missed" reason (the RC never
    // formed / day-expired / run-ended) by InpLogMissedSetups.
-   bool isSkip = (StringFind(reason, "Skip") == 0) || (reason == "LimitDailyBreak");
+   bool isSkip = (StringFind(reason, "Skip") == 0) || (StringFind(reason, "Limit") == 0);
    if(isSkip  && !InpLogSkippedSetups) return;
    if(!isSkip && !InpLogMissedSetups)  return;
    if(refTime == 0 || ccTime == 0)   // only armed setups (a CC formed) qualify
