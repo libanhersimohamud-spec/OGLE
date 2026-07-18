@@ -27,7 +27,8 @@ showLegLines = input.bool(true,  "Leg High / Leg Low",        group = grpDisp)
 showFibs     = input.bool(true,  "Fibonacci Levels",          group = grpDisp)
 showZone     = input.bool(true,  "Premium / Discount Zone",   group = grpDisp)
 showFVG      = input.bool(true,  "Fair Value Gap",            group = grpDisp)
-showBOS      = input.bool(true,  "BOS Markers",               group = grpDisp)
+showBOS      = input.bool(true,  "Major BOS Markers",         group = grpDisp)
+showSwings   = input.bool(true,  "Swing Structure Points",    group = grpDisp)
 
 grpInit = "Initialization"
 // On load the engine does NOT rebuild structure forward from the oldest candle.
@@ -64,14 +65,13 @@ confirmed = barstate.isconfirmed
 inWindow = bar_index > last_bar_index - initLookback
 
 // -----------------------------------------------------------------------------
-// 1. Confirmed market structure (alternating highs & lows)
+// 1. INTERNAL (minor) structure — confirmed 5-fractals
 //
 // ta.pivothigh/low(5, 5) only return a value once the full 11-candle fractal has
-// completed, so a confirmed high/low is stamped 5 bars back. We always keep the
-// newest confirmed high and the newest confirmed low: when several highs form
-// before the next low (or several lows before the next high) the newest simply
-// overwrites the previous one, which is exactly the "keep only the newest of a
-// consecutive run" rule, leaving the latest valid alternating structure.
+// completed, so a confirmed high/low is stamped 5 bars back. These are the
+// INTERNAL (minor) swings. We keep the newest confirmed minor high and newest
+// confirmed minor low; a run of same-type pivots collapses to the newest. The
+// Major Leg is NOT built from these directly — they feed the swing layer below.
 // -----------------------------------------------------------------------------
 ph = ta.pivothigh(LEFT, RIGHT)
 pl = ta.pivotlow(LEFT, RIGHT)
@@ -89,11 +89,12 @@ if inWindow and not na(pl)
     confLowBar := bar_index - RIGHT
 
 // -----------------------------------------------------------------------------
-// 2. Break of Structure (close-based, one event per confirmed level)
+// 2. INTERNAL breaks (close-based, one event per minor pivot)
 //
-// Bearish BOS: a candle closes below the latest Confirmed Low.
-// Bullish BOS: a candle closes above the latest Confirmed High.
-// A fresh confirmed level re-arms its side so each level can fire only once.
+// An internal break is a candle CLOSE beyond the latest confirmed minor pivot.
+// These do not create Major Legs — they are the operator that confirms the
+// higher-order SWING structure in section 3. A fresh minor pivot re-arms its
+// side so each minor level triggers at most one internal break.
 // -----------------------------------------------------------------------------
 var bool lowArmed  = false
 var bool highArmed = false
@@ -102,20 +103,91 @@ if inWindow and not na(pl)
 if inWindow and not na(ph)
     highArmed := true
 
-bearBOS = inWindow and confirmed and not na(confLow)  and lowArmed  and close < confLow
-bullBOS = inWindow and confirmed and not na(confHigh) and highArmed and close > confHigh
-if bearBOS
+intBearBreak = inWindow and confirmed and not na(confLow)  and lowArmed  and close < confLow
+intBullBreak = inWindow and confirmed and not na(confHigh) and highArmed and close > confHigh
+if intBearBreak
     lowArmed := false
-if bullBOS
+if intBullBreak
     highArmed := false
+
+// -----------------------------------------------------------------------------
+// 2b. SWING (major) structure — the same close-break operator, one level up
+//
+// Deterministic two-tier hierarchy, no thresholds:
+//   * runHigh / runLow accumulate the extreme confirmed MINOR pivot since the
+//     last promotion of that side.
+//   * An INTERNAL BEARISH break confirms the highest minor high of the branch
+//     as a MAJOR SWING HIGH (then runHigh resets).
+//   * An INTERNAL BULLISH break confirms the lowest minor low of the branch as
+//     a MAJOR SWING LOW (then runLow resets).
+// In an uptrend, repeated bullish internal breaks stamp a rising series of
+// swing lows while runHigh keeps climbing until the first bearish internal
+// break stamps the swing high — and mirror for a downtrend. This is exactly
+// the "internal vs swing structure" nesting, produced by recursion of the
+// fractal/close-break rule rather than any magnitude filter.
+// -----------------------------------------------------------------------------
+var float runHigh      = na
+var int   runHighBar   = na
+var float runLow       = na
+var int   runLowBar    = na
+var float swingHigh    = na
+var int   swingHighBar = na
+var float swingLow     = na
+var int   swingLowBar  = na
+var bool  majHighArmed = false
+var bool  majLowArmed  = false
+
+// Accumulate branch extremes from confirmed minor pivots.
+if inWindow and not na(ph) and (na(runHigh) or ph > runHigh)
+    runHigh    := ph
+    runHighBar := bar_index - RIGHT
+if inWindow and not na(pl) and (na(runLow) or pl < runLow)
+    runLow    := pl
+    runLowBar := bar_index - RIGHT
+
+newSwingHigh = false
+newSwingLow  = false
+// A bearish internal break promotes the branch's highest minor high to a swing high.
+if intBearBreak and not na(runHigh)
+    swingHigh    := runHigh
+    swingHighBar := runHighBar
+    majHighArmed := true       // re-arm major bullish BOS against the new swing high
+    runHigh      := na         // start a fresh search for the next swing high
+    newSwingHigh := true
+// A bullish internal break promotes the branch's lowest minor low to a swing low.
+if intBullBreak and not na(runLow)
+    swingLow    := runLow
+    swingLowBar := runLowBar
+    majLowArmed := true        // re-arm major bearish BOS against the new swing low
+    runLow      := na
+    newSwingLow := true
+
+// -----------------------------------------------------------------------------
+// 2c. MAJOR Break of Structure — close beyond a confirmed SWING point
+//
+// Bearish Major BOS: close below the latest Major Swing Low.
+// Bullish Major BOS: close above the latest Major Swing High.
+// One event per swing point (re-armed when a new swing point is confirmed).
+// Only these events create a Major Leg.
+// -----------------------------------------------------------------------------
+majBearBOS = inWindow and confirmed and not na(swingLow)  and majLowArmed  and close < swingLow
+majBullBOS = inWindow and confirmed and not na(swingHigh) and majHighArmed and close > swingHigh
+if majBearBOS
+    majLowArmed := false
+if majBullBOS
+    majHighArmed := false
 
 // -----------------------------------------------------------------------------
 // 3. Major Leg state
 //
+// The leg is created from SWING points on a MAJOR BOS. Once active:
 // Bearish leg: Leg High is FIXED at creation, Leg Low is DYNAMIC (lower lows).
 // Bullish leg: Leg Low  is FIXED at creation, Leg High is DYNAMIC (higher highs).
-// Only the first BOS (while no leg exists) creates a leg; same-direction BOS
-// during an active leg is ignored — only the dynamic boundary keeps updating.
+// The dynamic boundary tracks new confirmed MINOR extremes so the leg extends to
+// the true high/low of the move. Only the first major BOS (while no leg exists)
+// creates a leg; further same-direction major BOS are ignored — only the dynamic
+// boundary keeps updating. Invalidation = close beyond the fixed boundary, which
+// for the fixed swing high/low is itself the opposite-direction major BOS.
 // -----------------------------------------------------------------------------
 var int   legDir     = 0     // 0 = none, -1 = bearish, 1 = bullish
 var float legHigh    = na
@@ -137,21 +209,21 @@ if confirmed and inWindow
         legDir := 0
         legInvalidated := true
 
-    // --- Creation (only when no leg is active) ------------------------------
+    // --- Creation (only when no leg is active) — built from SWING points -----
     if legDir == 0
-        if bearBOS and not na(confHigh)
+        if majBearBOS and not na(swingHigh)
             legDir      := -1
-            legHigh     := confHigh                       // fixed
-            legLow      := confLow                        // dynamic (level just broken)
-            legLeftBar  := math.min(confHighBar, confLowBar)
+            legHigh     := swingHigh                      // fixed (major swing high)
+            legLow      := swingLow                       // dynamic (major swing low just broken)
+            legLeftBar  := math.min(swingHighBar, swingLowBar)
             touched     := false
             frozenRight := na
             legCreatedBear := true
-        else if bullBOS and not na(confLow)
+        else if majBullBOS and not na(swingLow)
             legDir      := 1
-            legLow      := confLow                        // fixed
-            legHigh     := confHigh                       // dynamic (level just broken)
-            legLeftBar  := math.min(confHighBar, confLowBar)
+            legLow      := swingLow                       // fixed (major swing low)
+            legHigh     := swingHigh                      // dynamic (major swing high just broken)
+            legLeftBar  := math.min(swingHighBar, swingLowBar)
             touched     := false
             frozenRight := na
             legCreatedBull := true
@@ -307,16 +379,22 @@ if legDir != 0
         bxFVG := box.new(legLeftBar, bestTop, rEdge, bestBot, border_color = color.new(legCol, 20), bgcolor = fvgCol)
 
 // -----------------------------------------------------------------------------
-// 7. BOS markers
+// 7. Markers — major BOS (triangles) and confirmed swing structure points
 // -----------------------------------------------------------------------------
-plotshape(showBOS and bearBOS, title = "Bearish BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.tiny, text = "BOS")
-plotshape(showBOS and bullBOS, title = "Bullish BOS", style = shape.triangleup,   location = location.belowbar, color = bullCol, size = size.tiny, text = "BOS")
+plotshape(showBOS and majBearBOS, title = "Bearish Major BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.tiny, text = "BOS")
+plotshape(showBOS and majBullBOS, title = "Bullish Major BOS", style = shape.triangleup,   location = location.belowbar, color = bullCol, size = size.tiny, text = "BOS")
+
+// A confirmed swing point is stamped at its own pivot bar (runHighBar/runLowBar).
+if showSwings and newSwingHigh
+    label.new(swingHighBar, swingHigh, "SH", style = label.style_label_down, color = color.new(bearCol, 20), textcolor = color.white, size = size.tiny)
+if showSwings and newSwingLow
+    label.new(swingLowBar, swingLow, "SL", style = label.style_label_up, color = color.new(bullCol, 20), textcolor = color.white, size = size.tiny)
 
 // -----------------------------------------------------------------------------
 // 8. Alerts — only fire after all confirmation rules are satisfied.
 // -----------------------------------------------------------------------------
-alertcondition(bearBOS,        title = "Bearish BOS",           message = "Bearish Break of Structure confirmed")
-alertcondition(bullBOS,        title = "Bullish BOS",           message = "Bullish Break of Structure confirmed")
+alertcondition(majBearBOS,     title = "Bearish Major BOS",     message = "Bearish Major Break of Structure confirmed")
+alertcondition(majBullBOS,     title = "Bullish Major BOS",     message = "Bullish Major Break of Structure confirmed")
 alertcondition(legCreatedBear, title = "Bearish Major Leg",     message = "Bearish Major Leg created")
 alertcondition(legCreatedBull, title = "Bullish Major Leg",     message = "Bullish Major Leg created")
 alertcondition(legInvalidated, title = "Major Leg Invalidated", message = "Major Leg invalidated")
