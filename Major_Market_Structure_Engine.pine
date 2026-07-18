@@ -1,27 +1,32 @@
 //@version=6
 // =============================================================================
-// Major Market Structure Engine (Bullish & Bearish)
+// Major Market Structure Engine (Bullish & Bearish) — H4 fixed timeframe
 //
-// Identifies, maintains and analyses the current major market structure in both
-// bullish and bearish markets. The engine continuously detects confirmed market
-// structure, identifies valid Breaks of Structure (BOS), builds a Major Leg,
-// keeps that leg updated while it stays valid, and derives every trading
-// component (Fibonacci levels, Premium/Discount Zone and the qualifying Fair
-// Value Gap) from that single active Major Leg. Both directions use identical,
-// fully mirrored logic.
+// Builds and maintains ONE Major Market Structure from a single, fixed structure
+// timeframe (default H4 / 240m) no matter which chart timeframe it is applied
+// to. The whole engine — confirmed 5-fractals, the N-tier hierarchy, the Major
+// Leg, its Fibonacci, Premium/Discount zone and qualifying Fair Value Gap — is
+// computed natively at the structure timeframe via request.security() and drawn
+// on the chart with time-anchored objects, so you can drop to a lower timeframe
+// for entries while the H4 Major Leg stays fixed and clean on screen.
 //
-// Confirmation model (non-repainting): market structure is built exclusively
-// from confirmed swings. A swing is confirmed only after an 11-candle fractal
-// completes — five candles to the left of the pivot, the pivot itself, and five
-// candles to the right (ta.pivothigh/low(5, 5)). All BOS / invalidation events
-// and every state mutation are committed on bar close only; wicks never confirm
-// a BOS or an invalidation. Only one Major Leg may be active at a time.
+// Only the structure timeframe is analysed; no other timeframe is calculated or
+// displayed. Only the latest active Major Leg is ever shown. All logic is
+// close-based and non-repainting at the structure timeframe (wicks never confirm
+// a break or an invalidation), and lookahead is off so nothing is read from the
+// future.
 // =============================================================================
-indicator("Major Market Structure Engine (Bullish & Bearish)", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+indicator("Major Market Structure Engine (H4)", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
 
 // -----------------------------------------------------------------------------
 // Inputs
 // -----------------------------------------------------------------------------
+grpTF = "Structure Timeframe"
+// The engine analyses THIS timeframe only. Default H4. Everything is computed at
+// this resolution regardless of the chart timeframe; no other timeframe is
+// calculated or displayed. Best viewed on the structure timeframe or lower.
+structureTF = input.timeframe("240", "Structure Timeframe", group = grpTF, tooltip = "The single timeframe the entire Major Structure is built from. Default 240 (H4). The chart may be lower (e.g. for entries); the H4 structure stays fixed. Using a chart timeframe ABOVE this is not supported.")
+
 grpDisp = "Display"
 showLegLines = input.bool(true,  "Leg High / Leg Low",        group = grpDisp)
 showFibs     = input.bool(true,  "Fibonacci Levels",          group = grpDisp)
@@ -31,16 +36,10 @@ showBOS      = input.bool(true,  "Major BOS Markers",         group = grpDisp)
 showSwings   = input.bool(true,  "Swing Structure Points",    group = grpDisp)
 
 grpInit = "Initialization"
-// On load the engine does NOT rebuild structure forward from the oldest candle.
-// Instead it reconstructs only the currently-active Major Leg from a bounded
-// window of the most recent bars (ending at the current candle). Pine executes
-// strictly forward bar-by-bar, so the "scan backwards to reconstruct the active
-// structure" requirement is realised as a bounded recent-window forward replay:
-// replaying only the last `initLookback` bars naturally creates and discards any
-// already-invalidated legs and leaves the engine anchored to the leg that is
-// still active now — while never touching years of obsolete history. Raise this
-// if an active leg legitimately began further back than the default window.
-initLookback = input.int(2000, "Reconstruction Window (bars)", minval = 100, maxval = 20000, group = grpInit, tooltip = "How many recent bars to replay when reconstructing the active Major Leg on load. Larger = safer for long-lived legs, smaller = faster startup.")
+// The engine reconstructs only the currently-active Major Leg from a bounded
+// window of the most recent structure-timeframe bars (a forward replay of the
+// recent window), so it never anchors to obsolete history and starts up fast.
+initLookback = input.int(2000, "Reconstruction Window (bars)", minval = 100, maxval = 20000, group = grpInit, tooltip = "How many recent structure-timeframe bars to replay when reconstructing the active Major Leg on load. Larger = safer for long-lived legs, smaller = faster startup.")
 
 grpStruct = "Major Structure"
 // Deterministic Major/Minor separation. The Major Leg is anchored to tier
@@ -65,281 +64,254 @@ RIGHT = 5
 MAX_FVG = 300     // hard cap on stored FVGs per active leg (memory guard)
 MAX_DEPTH = 6     // hierarchy tier capacity (must be >= the Structure Depth input max)
 
-confirmed = barstate.isconfirmed
-
-// Reconstruction window: the engine only acts on bars inside the most recent
-// `initLookback` bars. Bars older than the window are skipped entirely — their
-// pivots are ignored, no legs are built from them, and nothing is drawn — so the
-// engine never anchors to obsolete historical structure and startup stays fast.
-// ta.pivothigh/low are still evaluated every bar (below) so their series stay
-// consistent; only the ACTING on those values is gated by this window.
-inWindow = bar_index > last_bar_index - initLookback
-
 // -----------------------------------------------------------------------------
 // Structure helpers — set a confirmed pivot at a hierarchy tier and roll the
-// running branch-extreme that will be promoted to the next tier up.
+// running branch-extreme that will be promoted to the next tier up. The "b"
+// value stored per pivot is its bar TIME (ms), used later for time anchoring.
 // -----------------------------------------------------------------------------
-setPivotHigh(pvArr, barArr, armArr, runArr, runBarArr, k, val, b) =>
+setPivotHigh(pvArr, tArr, armArr, runArr, runTArr, k, val, b) =>
     array.set(pvArr, k, val)
-    array.set(barArr, k, b)
+    array.set(tArr, k, b)
     array.set(armArr, k, true)
     r = array.get(runArr, k)
     if na(r) or val > r
         array.set(runArr, k, val)
-        array.set(runBarArr, k, b)
+        array.set(runTArr, k, b)
 
-setPivotLow(pvArr, barArr, armArr, runArr, runBarArr, k, val, b) =>
+setPivotLow(pvArr, tArr, armArr, runArr, runTArr, k, val, b) =>
     array.set(pvArr, k, val)
-    array.set(barArr, k, b)
+    array.set(tArr, k, b)
     array.set(armArr, k, true)
     r = array.get(runArr, k)
     if na(r) or val < r
         array.set(runArr, k, val)
-        array.set(runBarArr, k, b)
+        array.set(runTArr, k, b)
 
 // -----------------------------------------------------------------------------
-// 1-2. N-TIER FRACTAL HIERARCHY (deterministic Major/Minor separation)
+// msEngine — the WHOLE structure/leg/fib/zone/fvg engine, evaluated natively at
+// the structure timeframe (called inside request.security below). It draws
+// nothing; it returns the scalar values the chart side needs, with pivot bar
+// TIMES so the drawings can be time-anchored onto any chart timeframe.
 //
-// One operator, applied recursively. Tier 0 = confirmed 5-fractals (minor). For
-// every tier j, a candle CLOSE beyond that tier's latest pivot is a "break". A
-// break promotes the tier's running extreme to become a pivot of tier j+1:
-//   * bearish break of tier j -> highest tier-j high becomes a tier j+1 HIGH
-//   * bullish break of tier j -> lowest  tier-j low  becomes a tier j+1 LOW
-// Each tier therefore requires the market to break the previous tier's confirmed
-// structure, so the Major tier (depth-1) can only form after `depth` nested
-// breaks — a genuinely dominant move, with no magnitude filter. The Major Leg is
-// created only on a break of the Major tier (section 3), gated by displacement.
+// N-tier fractal hierarchy: one close-break operator applied recursively. Tier 0
+// = confirmed 5-fractals. A close beyond tier j's latest pivot is a "break" that
+// promotes that tier's running extreme into a pivot of tier j+1. The Major tier
+// (depth-1) therefore forms only after `depth` nested breaks, and its break
+// (gated by displacement) creates the Major Leg.
 // -----------------------------------------------------------------------------
-var array<float> pvHigh     = array.new_float(MAX_DEPTH, na)
-var array<int>   pvHighBar  = array.new_int(MAX_DEPTH, na)
-var array<float> pvLow      = array.new_float(MAX_DEPTH, na)
-var array<int>   pvLowBar   = array.new_int(MAX_DEPTH, na)
-var array<bool>  armHigh    = array.new_bool(MAX_DEPTH, false)
-var array<bool>  armLow     = array.new_bool(MAX_DEPTH, false)
-var array<float> runHigh    = array.new_float(MAX_DEPTH, na)
-var array<int>   runHighBar = array.new_int(MAX_DEPTH, na)
-var array<float> runLow     = array.new_float(MAX_DEPTH, na)
-var array<int>   runLowBar  = array.new_int(MAX_DEPTH, na)
+msEngine() =>
+    confirmed = barstate.isconfirmed
+    inWindow  = bar_index > last_bar_index - initLookback
+    top       = depth - 1
 
-top = depth - 1
+    var array<float> pvHigh     = array.new_float(MAX_DEPTH, na)
+    var array<int>   pvHighT    = array.new_int(MAX_DEPTH, na)
+    var array<float> pvLow      = array.new_float(MAX_DEPTH, na)
+    var array<int>   pvLowT     = array.new_int(MAX_DEPTH, na)
+    var array<bool>  armHigh    = array.new_bool(MAX_DEPTH, false)
+    var array<bool>  armLow     = array.new_bool(MAX_DEPTH, false)
+    var array<float> runHigh    = array.new_float(MAX_DEPTH, na)
+    var array<int>   runHighT   = array.new_int(MAX_DEPTH, na)
+    var array<float> runLow     = array.new_float(MAX_DEPTH, na)
+    var array<int>   runLowT    = array.new_int(MAX_DEPTH, na)
 
-// Tier 0 input — confirmed 5-fractals feed the base of the hierarchy.
-ph = ta.pivothigh(LEFT, RIGHT)
-pl = ta.pivotlow(LEFT, RIGHT)
-if inWindow and not na(ph)
-    setPivotHigh(pvHigh, pvHighBar, armHigh, runHigh, runHighBar, 0, ph, bar_index - RIGHT)
-if inWindow and not na(pl)
-    setPivotLow(pvLow, pvLowBar, armLow, runLow, runLowBar, 0, pl, bar_index - RIGHT)
+    // Tier 0 input — confirmed 5-fractals feed the base of the hierarchy.
+    ph = ta.pivothigh(LEFT, RIGHT)
+    pl = ta.pivotlow(LEFT, RIGHT)
+    if inWindow and not na(ph)
+        setPivotHigh(pvHigh, pvHighT, armHigh, runHigh, runHighT, 0, ph, time[RIGHT])
+    if inWindow and not na(pl)
+        setPivotLow(pvLow, pvLowT, armLow, runLow, runLowT, 0, pl, time[RIGHT])
 
-// Displacement — is there a same-direction 3-candle Fair Value Gap in the
-// impulse around this bar? A break carrying displacement is an institutional
-// move; a break without it is slow drift and is rejected for the Major tier.
-bearDisp = false
-bullDisp = false
-if useDisplacement
-    for k = 0 to 10
-        if k > dispLookback
-            break
-        if high[k] < low[k + 2]
-            bearDisp := true
-        if low[k] > high[k + 2]
-            bullDisp := true
+    // Displacement — same-direction 3-candle FVG in the impulse around this bar.
+    bearDisp = false
+    bullDisp = false
+    if useDisplacement
+        for k = 0 to 10
+            if k > dispLookback
+                break
+            if high[k] < low[k + 2]
+                bearDisp := true
+            if low[k] > high[k + 2]
+                bullDisp := true
 
-// Cascade the break operator up the tiers (lowest first, so one strong candle
-// can break several nested tiers on the same bar).
-majBearBOS = false
-majBullBOS = false
-newMajSH   = false
-newMajSL   = false
-if inWindow and confirmed
-    for j = 0 to MAX_DEPTH - 1
-        if j > top
-            break
-        pvLoj = array.get(pvLow, j)
-        pvHij = array.get(pvHigh, j)
-        bBear = not na(pvLoj) and array.get(armLow, j)  and close < pvLoj
-        bBull = not na(pvHij) and array.get(armHigh, j) and close > pvHij
-        if j < top
-            // Internal tier: a break promotes the branch extreme one level up.
-            if bBear
-                array.set(armLow, j, false)
-                rh = array.get(runHigh, j)
-                if not na(rh)
-                    setPivotHigh(pvHigh, pvHighBar, armHigh, runHigh, runHighBar, j + 1, rh, array.get(runHighBar, j))
-                    array.set(runHigh, j, na)
-                    newMajSH := j + 1 == top ? true : newMajSH
-            if bBull
-                array.set(armHigh, j, false)
-                rl = array.get(runLow, j)
-                if not na(rl)
-                    setPivotLow(pvLow, pvLowBar, armLow, runLow, runLowBar, j + 1, rl, array.get(runLowBar, j))
-                    array.set(runLow, j, na)
-                    newMajSL := j + 1 == top ? true : newMajSL
+    // Cascade the break operator up the tiers (lowest first).
+    majBearBOS = false
+    majBullBOS = false
+    newMajSH   = false
+    newMajSL   = false
+    if inWindow and confirmed
+        for j = 0 to MAX_DEPTH - 1
+            if j > top
+                break
+            pvLoj = array.get(pvLow, j)
+            pvHij = array.get(pvHigh, j)
+            bBear = not na(pvLoj) and array.get(armLow, j)  and close < pvLoj
+            bBull = not na(pvHij) and array.get(armHigh, j) and close > pvHij
+            if j < top
+                if bBear
+                    array.set(armLow, j, false)
+                    rh = array.get(runHigh, j)
+                    if not na(rh)
+                        setPivotHigh(pvHigh, pvHighT, armHigh, runHigh, runHighT, j + 1, rh, array.get(runHighT, j))
+                        array.set(runHigh, j, na)
+                        newMajSH := j + 1 == top ? true : newMajSH
+                if bBull
+                    array.set(armHigh, j, false)
+                    rl = array.get(runLow, j)
+                    if not na(rl)
+                        setPivotLow(pvLow, pvLowT, armLow, runLow, runLowT, j + 1, rl, array.get(runLowT, j))
+                        array.set(runLow, j, na)
+                        newMajSL := j + 1 == top ? true : newMajSL
+            else
+                if bBear and (not useDisplacement or bearDisp)
+                    array.set(armLow, j, false)
+                    majBearBOS := true
+                if bBull and (not useDisplacement or bullDisp)
+                    array.set(armHigh, j, false)
+                    majBullBOS := true
+
+    // --- Major Leg state (created from the Major tier, gated by displacement) --
+    var int   legDir      = 0
+    var float legHigh     = na
+    var float legLow      = na
+    var int   legLeftTime = na
+    var bool  touched     = false
+    var int   frozenTime  = na
+
+    legCreatedBear = false
+    legCreatedBull = false
+    legInvalidated = false
+
+    if confirmed and inWindow
+        // Invalidation: close beyond the FIXED boundary.
+        if legDir == -1 and close > legHigh
+            legDir := 0
+            legInvalidated := true
+        else if legDir == 1 and close < legLow
+            legDir := 0
+            legInvalidated := true
+
+        // Creation: only when no leg is active, anchored to the Major tier.
+        if legDir == 0
+            majHi  = array.get(pvHigh, top)
+            majLo  = array.get(pvLow, top)
+            majHiT = array.get(pvHighT, top)
+            majLoT = array.get(pvLowT, top)
+            if majBearBOS and not na(majHi) and not na(majLo)
+                legDir      := -1
+                legHigh     := majHi
+                legLow      := majLo
+                legLeftTime := majHiT < majLoT ? majHiT : majLoT
+                touched     := false
+                frozenTime  := na
+                legCreatedBear := true
+            else if majBullBOS and not na(majHi) and not na(majLo)
+                legDir      := 1
+                legLow      := majLo
+                legHigh     := majHi
+                legLeftTime := majHiT < majLoT ? majHiT : majLoT
+                touched     := false
+                frozenTime  := na
+                legCreatedBull := true
+
+        // Dynamic boundary tracks new confirmed MINOR (tier-0) extremes.
+        if legDir == -1 and not na(pl) and pl < legLow
+            legLow := pl
+        if legDir == 1 and not na(ph) and ph > legHigh
+            legHigh := ph
+
+    // --- Fibonacci + zone (0.00 = Leg Low, 1.00 = Leg High) -------------------
+    float f000 = na
+    float f025 = na
+    float f050 = na
+    float f075 = na
+    float f100 = na
+    float entry   = na
+    float zoneTop = na
+    float zoneBot = na
+    if legDir != 0
+        rng  = legHigh - legLow
+        f000 := legLow
+        f025 := legLow + rng * 0.25
+        f050 := legLow + rng * 0.50
+        f075 := legLow + rng * 0.75
+        f100 := legHigh
+        if legDir == -1
+            entry   := f075
+            zoneTop := f100
+            zoneBot := f075
         else
-            // Major tier: a break here is a Major BOS, gated by displacement. It
-            // stays armed until a displacement-confirmed break, so a slow drift
-            // through the level does not consume it — the impulse does.
-            if bBear and (not useDisplacement or bearDisp)
-                array.set(armLow, j, false)
-                majBearBOS := true
-            if bBull and (not useDisplacement or bullDisp)
-                array.set(armHigh, j, false)
-                majBullBOS := true
+            entry   := f025
+            zoneTop := f025
+            zoneBot := f000
+
+    // First-touch of the entry Fib freezes the drawing's right edge (by time).
+    if confirmed and inWindow and legDir != 0 and not touched
+        if (legDir == -1 and high >= entry) or (legDir == 1 and low <= entry)
+            touched    := true
+            frozenTime := time
+
+    // --- Fair Value Gaps inside the active leg, largest fully inside the zone --
+    var array<float> fvgTop = array.new_float()
+    var array<float> fvgBot = array.new_float()
+    var array<int>   fvgTyp = array.new_int()
+    if legCreatedBear or legCreatedBull
+        array.clear(fvgTop)
+        array.clear(fvgBot)
+        array.clear(fvgTyp)
+    if confirmed and inWindow and legDir != 0
+        bullFVG = low > high[2]
+        bearFVG = high < low[2]
+        if bullFVG
+            array.push(fvgTop, low)
+            array.push(fvgBot, high[2])
+            array.push(fvgTyp, 1)
+        if bearFVG
+            array.push(fvgTop, low[2])
+            array.push(fvgBot, high)
+            array.push(fvgTyp, -1)
+        while array.size(fvgTyp) > MAX_FVG
+            array.shift(fvgTop)
+            array.shift(fvgBot)
+            array.shift(fvgTyp)
+
+    float bestTop = na
+    float bestBot = na
+    if legDir != 0 and array.size(fvgTyp) > 0
+        bestSize = -1.0
+        for i = 0 to array.size(fvgTyp) - 1
+            if array.get(fvgTyp, i) == legDir
+                t = array.get(fvgTop, i)
+                b = array.get(fvgBot, i)
+                if b >= zoneBot and t <= zoneTop
+                    sz = t - b
+                    if sz > bestSize
+                        bestSize := sz
+                        bestTop  := t
+                        bestBot  := b
+
+    // Major-tier swing points (for optional SH/SL markers).
+    shT = array.get(pvHighT, top)
+    shP = array.get(pvHigh, top)
+    slT = array.get(pvLowT, top)
+    slP = array.get(pvLow, top)
+
+    [legDir, legHigh, legLow, f000, f025, f050, f075, f100, zoneTop, zoneBot, bestTop, bestBot, legLeftTime, frozenTime, majBearBOS, majBullBOS, legCreatedBear, legCreatedBull, legInvalidated, newMajSH, newMajSL, shT, shP, slT, slP]
 
 // -----------------------------------------------------------------------------
-// 3. Major Leg state
-//
-// The leg is created from SWING points on a MAJOR BOS. Once active:
-// Bearish leg: Leg High is FIXED at creation, Leg Low is DYNAMIC (lower lows).
-// Bullish leg: Leg Low  is FIXED at creation, Leg High is DYNAMIC (higher highs).
-// The dynamic boundary tracks new confirmed MINOR extremes so the leg extends to
-// the true high/low of the move. Only the first major BOS (while no leg exists)
-// creates a leg; further same-direction major BOS are ignored — only the dynamic
-// boundary keeps updating. Invalidation = close beyond the fixed boundary, which
-// for the fixed swing high/low is itself the opposite-direction major BOS.
+// Evaluate the engine at the structure timeframe (lookahead OFF = no future leak).
 // -----------------------------------------------------------------------------
-var int   legDir     = 0     // 0 = none, -1 = bearish, 1 = bullish
-var float legHigh    = na
-var float legLow     = na
-var int   legLeftBar = na
-var bool  touched    = false // has price first reached the entry Fib level?
-var int   frozenRight = na   // right edge captured at first touch
+[legDir, legHigh, legLow, f000, f025, f050, f075, f100, zoneTop, zoneBot, bestTop, bestBot, legLeftTime, frozenTime, evBearBOS, evBullBOS, evLegBear, evLegBull, evInval, evNewSH, evNewSL, shT, shP, slT, slP] = request.security(syminfo.tickerid, structureTF, msEngine(), lookahead = barmerge.lookahead_off)
 
-legCreatedBear = false
-legCreatedBull = false
-legInvalidated = false
-
-if confirmed and inWindow
-    // --- Invalidation (close beyond the FIXED boundary) ---------------------
-    if legDir == -1 and close > legHigh
-        legDir := 0
-        legInvalidated := true
-    else if legDir == 1 and close < legLow
-        legDir := 0
-        legInvalidated := true
-
-    // --- Creation (only when no leg is active) — anchored to the MAJOR tier --
-    if legDir == 0
-        majHi    = array.get(pvHigh, top)
-        majLo    = array.get(pvLow, top)
-        majHiBar = array.get(pvHighBar, top)
-        majLoBar = array.get(pvLowBar, top)
-        if majBearBOS and not na(majHi) and not na(majLo)
-            legDir      := -1
-            legHigh     := majHi                          // fixed (major swing high)
-            legLow      := majLo                          // dynamic (major swing low just broken)
-            legLeftBar  := math.min(majHiBar, majLoBar)
-            touched     := false
-            frozenRight := na
-            legCreatedBear := true
-        else if majBullBOS and not na(majHi) and not na(majLo)
-            legDir      := 1
-            legLow      := majLo                          // fixed (major swing low)
-            legHigh     := majHi                          // dynamic (major swing high just broken)
-            legLeftBar  := math.min(majHiBar, majLoBar)
-            touched     := false
-            frozenRight := na
-            legCreatedBull := true
-
-    // --- Dynamic boundary update -------------------------------------------
-    if legDir == -1 and not na(pl) and pl < legLow
-        legLow := pl
-    if legDir == 1 and not na(ph) and ph > legHigh
-        legHigh := ph
+// True only on the first chart bar of each new structure-timeframe bar, so
+// structure-timeframe events fire exactly once even on a lower chart timeframe.
+isNewHTF = ta.change(time(structureTF)) != 0
 
 // -----------------------------------------------------------------------------
-// 4. Fibonacci levels, Premium / Discount Zone and entry level
-//
-// 0.00 anchors the Leg Low, 1.00 anchors the Leg High.
-//   Bearish: Premium Zone = 0.75 → 1.00, entry Fib = 0.75.
-//   Bullish: Discount Zone = 0.00 → 0.25, entry Fib = 0.25.
-// -----------------------------------------------------------------------------
-float f000 = na
-float f025 = na
-float f050 = na
-float f075 = na
-float f100 = na
-float entry   = na
-float zoneTop = na
-float zoneBot = na
-
-if legDir != 0
-    rng  = legHigh - legLow
-    f000 := legLow
-    f025 := legLow + rng * 0.25
-    f050 := legLow + rng * 0.50
-    f075 := legLow + rng * 0.75
-    f100 := legHigh
-    if legDir == -1
-        entry   := f075
-        zoneTop := f100
-        zoneBot := f075
-    else
-        entry   := f025
-        zoneTop := f025
-        zoneBot := f000
-
-// First-touch detection — extension stops once price reaches the entry Fib.
-if confirmed and inWindow and legDir != 0 and not touched
-    if (legDir == -1 and high >= entry) or (legDir == 1 and low <= entry)
-        touched     := true
-        frozenRight := bar_index
-
-// -----------------------------------------------------------------------------
-// 5. Fair Value Gaps inside the active leg
-//
-// A 3-candle FVG completes on the current bar:
-//   Bullish FVG: low > high[2]  → gap [high[2] .. low].
-//   Bearish FVG: high < low[2]  → gap [high .. low[2]].
-// While a leg is active we collect same-direction FVGs, then each bar keep the
-// single LARGEST one that sits COMPLETELY inside the current zone. Arrays are
-// reset whenever a new leg is created so only the active leg is ever scanned.
-// -----------------------------------------------------------------------------
-var array<float> fvgTop = array.new_float()
-var array<float> fvgBot = array.new_float()
-var array<int>   fvgTyp = array.new_int()
-
-if legCreatedBear or legCreatedBull
-    array.clear(fvgTop)
-    array.clear(fvgBot)
-    array.clear(fvgTyp)
-
-if confirmed and inWindow and legDir != 0
-    bullFVG = low > high[2]
-    bearFVG = high < low[2]
-    if bullFVG
-        array.push(fvgTop, low)
-        array.push(fvgBot, high[2])
-        array.push(fvgTyp, 1)
-    if bearFVG
-        array.push(fvgTop, low[2])
-        array.push(fvgBot, high)
-        array.push(fvgTyp, -1)
-    while array.size(fvgTyp) > MAX_FVG
-        array.shift(fvgTop)
-        array.shift(fvgBot)
-        array.shift(fvgTyp)
-
-// Select the largest same-direction FVG fully contained in the zone.
-float bestTop = na
-float bestBot = na
-if legDir != 0 and array.size(fvgTyp) > 0
-    bestSize = -1.0
-    for i = 0 to array.size(fvgTyp) - 1
-        if array.get(fvgTyp, i) == legDir
-            t = array.get(fvgTop, i)
-            b = array.get(fvgBot, i)
-            if b >= zoneBot and t <= zoneTop
-                sz = t - b
-                if sz > bestSize
-                    bestSize := sz
-                    bestTop  := t
-                    bestBot  := b
-
-// -----------------------------------------------------------------------------
-// 6. Drawing — objects extend right until first touch, then freeze; all objects
-//    are removed on invalidation. Handles are deleted and rebuilt each bar so
-//    the extend-until-touch behaviour needs no per-object bookkeeping.
+// Drawing — one active leg, time-anchored so it maps onto any chart timeframe.
+// Objects extend right until first touch (frozenTime), then stay fixed. Handles
+// are deleted and rebuilt each bar; all are removed when no leg is active.
 // -----------------------------------------------------------------------------
 var line  lnHigh = na
 var line  lnLow  = na
@@ -370,44 +342,44 @@ if not na(bxZone)
 if not na(bxFVG)
     box.delete(bxFVG)
 
-if legDir != 0
+if legDir != 0 and not na(legLeftTime)
     legCol = legDir == -1 ? bearCol : bullCol
-    rEdge  = touched ? frozenRight : bar_index
+    rEdge  = na(frozenTime) ? time : frozenTime
 
     if showZone
-        bxZone := box.new(legLeftBar, zoneTop, rEdge, zoneBot, border_color = color.new(legCol, 40), bgcolor = zoneCol)
+        bxZone := box.new(legLeftTime, zoneTop, rEdge, zoneBot, xloc = xloc.bar_time, border_color = color.new(legCol, 40), bgcolor = zoneCol)
 
     if showFibs
-        ln100 := line.new(legLeftBar, f100, rEdge, f100, color = fibCol, style = line.style_dotted)
-        ln075 := line.new(legLeftBar, f075, rEdge, f075, color = fibCol, style = line.style_dotted)
-        ln050 := line.new(legLeftBar, f050, rEdge, f050, color = fibCol, style = line.style_dotted)
-        ln025 := line.new(legLeftBar, f025, rEdge, f025, color = fibCol, style = line.style_dotted)
-        ln000 := line.new(legLeftBar, f000, rEdge, f000, color = fibCol, style = line.style_dotted)
+        ln100 := line.new(legLeftTime, f100, rEdge, f100, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln075 := line.new(legLeftTime, f075, rEdge, f075, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln050 := line.new(legLeftTime, f050, rEdge, f050, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln025 := line.new(legLeftTime, f025, rEdge, f025, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln000 := line.new(legLeftTime, f000, rEdge, f000, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
 
     if showLegLines
-        lnHigh := line.new(legLeftBar, legHigh, rEdge, legHigh, color = legCol, width = 2)
-        lnLow  := line.new(legLeftBar, legLow,  rEdge, legLow,  color = legCol, width = 2)
+        lnHigh := line.new(legLeftTime, legHigh, rEdge, legHigh, xloc = xloc.bar_time, color = legCol, width = 2)
+        lnLow  := line.new(legLeftTime, legLow,  rEdge, legLow,  xloc = xloc.bar_time, color = legCol, width = 2)
 
     if showFVG and not na(bestTop)
-        bxFVG := box.new(legLeftBar, bestTop, rEdge, bestBot, border_color = color.new(legCol, 20), bgcolor = fvgCol)
+        bxFVG := box.new(legLeftTime, bestTop, rEdge, bestBot, xloc = xloc.bar_time, border_color = color.new(legCol, 20), bgcolor = fvgCol)
 
 // -----------------------------------------------------------------------------
-// 7. Markers — major BOS (triangles) and confirmed swing structure points
+// Markers — major BOS (triangles) and confirmed Major-tier swing points. Gated
+// by isNewHTF so each structure-timeframe event is marked exactly once.
 // -----------------------------------------------------------------------------
-plotshape(showBOS and majBearBOS, title = "Bearish Major BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.tiny, text = "BOS")
-plotshape(showBOS and majBullBOS, title = "Bullish Major BOS", style = shape.triangleup,   location = location.belowbar, color = bullCol, size = size.tiny, text = "BOS")
+plotshape(showBOS and evBearBOS and isNewHTF, title = "Bearish Major BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.tiny, text = "BOS")
+plotshape(showBOS and evBullBOS and isNewHTF, title = "Bullish Major BOS", style = shape.triangleup,   location = location.belowbar, color = bullCol, size = size.tiny, text = "BOS")
 
-// A confirmed MAJOR-tier swing point is stamped at its own pivot bar.
-if showSwings and newMajSH
-    label.new(array.get(pvHighBar, top), array.get(pvHigh, top), "SH", style = label.style_label_down, color = color.new(bearCol, 20), textcolor = color.white, size = size.tiny)
-if showSwings and newMajSL
-    label.new(array.get(pvLowBar, top), array.get(pvLow, top), "SL", style = label.style_label_up, color = color.new(bullCol, 20), textcolor = color.white, size = size.tiny)
+if showSwings and evNewSH and isNewHTF and not na(shT)
+    label.new(shT, shP, "SH", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(bearCol, 20), textcolor = color.white, size = size.tiny)
+if showSwings and evNewSL and isNewHTF and not na(slT)
+    label.new(slT, slP, "SL", xloc = xloc.bar_time, style = label.style_label_up, color = color.new(bullCol, 20), textcolor = color.white, size = size.tiny)
 
 // -----------------------------------------------------------------------------
-// 8. Alerts — only fire after all confirmation rules are satisfied.
+// Alerts — fire once per confirmed structure-timeframe event.
 // -----------------------------------------------------------------------------
-alertcondition(majBearBOS,     title = "Bearish Major BOS",     message = "Bearish Major Break of Structure confirmed")
-alertcondition(majBullBOS,     title = "Bullish Major BOS",     message = "Bullish Major Break of Structure confirmed")
-alertcondition(legCreatedBear, title = "Bearish Major Leg",     message = "Bearish Major Leg created")
-alertcondition(legCreatedBull, title = "Bullish Major Leg",     message = "Bullish Major Leg created")
-alertcondition(legInvalidated, title = "Major Leg Invalidated", message = "Major Leg invalidated")
+alertcondition(evBearBOS and isNewHTF, title = "Bearish Major BOS",     message = "H4 Bearish Major Break of Structure confirmed")
+alertcondition(evBullBOS and isNewHTF, title = "Bullish Major BOS",     message = "H4 Bullish Major Break of Structure confirmed")
+alertcondition(evLegBear  and isNewHTF, title = "Bearish Major Leg",     message = "H4 Bearish Major Leg created")
+alertcondition(evLegBull  and isNewHTF, title = "Bullish Major Leg",     message = "H4 Bullish Major Leg created")
+alertcondition(evInval    and isNewHTF, title = "Major Leg Invalidated", message = "H4 Major Leg invalidated")
