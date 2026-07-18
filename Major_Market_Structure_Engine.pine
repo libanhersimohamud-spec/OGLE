@@ -32,6 +32,7 @@ showZone     = input.bool(true,  "Premium / Discount Zone",   group = grpDisp)
 showFVG      = input.bool(true,  "Fair Value Gap",            group = grpDisp)
 showBOS      = input.bool(true,  "Major BOS Markers",         group = grpDisp)
 showSwings   = input.bool(true,  "Major Swing Points (SH/SL)",group = grpDisp)
+showTrade    = input.bool(true,  "Trade Framing (Entry/SL/TP + R)", group = grpDisp)
 
 grpDebug = "Debug / Validation"
 showDebug    = input.bool(true, "Enable Debug Hierarchy Visuals", group = grpDebug, tooltip = "Master switch for the validation layer. Turn OFF to show only the Major Leg and its Fibonacci.")
@@ -46,6 +47,7 @@ grpStruct = "Major Structure"
 depth = input.int(3, "Structure Depth (tiers)", minval = 1, maxval = 6, group = grpStruct, tooltip = "1 = raw 5-fractals, 2 = swing structure, 3 = major (recommended). 4-5 = HTF-only anchors. Each tier needs one more nested break, filtering minor/internal legs.")
 useDisplacement = input.bool(true, "Require Displacement (FVG) on Major BOS", group = grpStruct, tooltip = "A Major BOS only creates a leg if the breaking impulse leaves a Fair Value Gap — an objective footprint of institutional intent. Filters slow, drifty breaks.")
 dispLookback    = input.int(3, "Displacement Window (bars)", minval = 1, maxval = 10, group = grpStruct, tooltip = "Bars around the break scanned for a same-direction FVG (the impulse span). Structural, not a magnitude threshold.")
+entryFib        = input.float(0.71, "Entry Retracement (0.71 = 2.45R)", minval = 0.5, maxval = 0.95, step = 0.005, group = grpStruct, tooltip = "Retracement level for entry, measured from the impulse extreme back toward the fixed boundary. SL sits at the fixed boundary (100%), TP at the impulse boundary (0%). 0.71 gives R = 0.71/0.29 = 2.45. Backtest 0.62 / 0.705 / 0.786 if desired.")
 
 grpCol = "Colors"
 bearCol     = input.color(color.red,                    "Major Bearish (bold)", group = grpCol)
@@ -57,6 +59,9 @@ fracHiCol   = input.color(color.orange,                 "Fractal High",         
 fracLoCol   = input.color(color.aqua,                   "Fractal Low",          group = grpCol)
 minorCol    = input.color(color.new(color.gray, 35),    "Minor Legs (light)",   group = grpCol)
 minorBosCol = input.color(color.fuchsia,                "Minor BOS",            group = grpCol)
+entryLnCol  = input.color(color.yellow,                 "Entry line",           group = grpCol)
+slLnCol     = input.color(color.new(color.red, 0),      "Stop Loss line",       group = grpCol)
+tpLnCol     = input.color(color.new(color.green, 0),    "Take Profit line",     group = grpCol)
 
 // Fractal geometry — 5 left, pivot, 5 right = the 11-candle confirmation window.
 LEFT  = 5
@@ -244,12 +249,12 @@ msEngine() =>
         f075 := legLow + rng * 0.75
         f100 := legHigh
         if legDir == -1
-            entry   := f075
+            entry   := legLow + rng * entryFib           // 71% up from the impulse low = premium entry
             zoneTop := f100
-            zoneBot := f075
+            zoneBot := entry
         else
-            entry   := f025
-            zoneTop := f025
+            entry   := legLow + rng * (1.0 - entryFib)    // mirror: 71% down from the impulse high = discount entry
+            zoneTop := entry
             zoneBot := f000
 
     // First-touch of the entry Fib freezes the drawing's right edge (by time).
@@ -357,7 +362,19 @@ var line  ln075  = na
 var line  ln100  = na
 var box   bxZone = na
 var box   bxFVG  = na
+var line  lnEntry = na
+var line  lnSL    = na
+var line  lnTP    = na
+var label lbTrade = na
 
+if not na(lnEntry)
+    line.delete(lnEntry)
+if not na(lnSL)
+    line.delete(lnSL)
+if not na(lnTP)
+    line.delete(lnTP)
+if not na(lbTrade)
+    label.delete(lbTrade)
 if not na(lnHigh)
     line.delete(lnHigh)
 if not na(lnLow)
@@ -397,6 +414,19 @@ if legDir != 0 and not na(legFixedTime)
 
     if showFVG and not na(bestTop)
         bxFVG := box.new(legFixedTime, bestTop, rEdge, bestBot, xloc = xloc.bar_time, border_color = color.new(legCol, 20), bgcolor = fvgCol)
+
+    // Trade framing: entry = retracement (default 71%), SL = fixed boundary
+    // (100%), TP = impulse boundary (0%). R is constant for a given entry level.
+    if showTrade
+        rng2   = legHigh - legLow
+        entryP = legDir == -1 ? legLow + rng2 * entryFib : legLow + rng2 * (1.0 - entryFib)
+        slP    = legDir == -1 ? legHigh : legLow
+        tpP    = legDir == -1 ? legLow  : legHigh
+        rr     = entryFib / (1.0 - entryFib)
+        lnEntry := line.new(legFixedTime, entryP, rEdge, entryP, xloc = xloc.bar_time, color = entryLnCol, style = line.style_dashed, width = 2)
+        lnSL    := line.new(legFixedTime, slP,    rEdge, slP,    xloc = xloc.bar_time, color = slLnCol,    width = 1)
+        lnTP    := line.new(legFixedTime, tpP,    rEdge, tpP,    xloc = xloc.bar_time, color = tpLnCol,    width = 1)
+        lbTrade := label.new(rEdge, entryP, (legDir == -1 ? "SHORT" : "LONG") + "  R " + str.tostring(rr, "#.##") + "\nEntry " + str.tostring(entryP, format.mintick) + "\nSL " + str.tostring(slP, format.mintick) + "   TP " + str.tostring(tpP, format.mintick), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.gray, 15), textcolor = color.white, size = size.small)
 
 // Major BOS markers (bold) and Major-tier swing points (prominent).
 plotshape(showBOS and evBearBOS and isNewHTF, title = "Bearish Major BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.small, text = "BOS")
