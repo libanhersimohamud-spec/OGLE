@@ -42,6 +42,16 @@ grpInit = "Initialization"
 // if an active leg legitimately began further back than the default window.
 initLookback = input.int(2000, "Reconstruction Window (bars)", minval = 100, maxval = 20000, group = grpInit, tooltip = "How many recent bars to replay when reconstructing the active Major Leg on load. Larger = safer for long-lived legs, smaller = faster startup.")
 
+grpStruct = "Major Structure"
+// Deterministic Major/Minor separation. The Major Leg is anchored to tier
+// (depth-1) of a recursive fractal hierarchy: each tier requires the market to
+// break the previous tier's confirmed structure, so higher depth = fewer, more
+// dominant legs. This is the ONLY selectivity knob and it is structural, not a
+// magnitude threshold.
+depth = input.int(3, "Structure Depth (tiers)", minval = 1, maxval = 6, group = grpStruct, tooltip = "1 = raw 5-fractals, 2 = swing structure, 3 = major (recommended). 4-5 = HTF-only anchors. Each tier needs one more nested break, filtering minor/internal legs.")
+useDisplacement = input.bool(true, "Require Displacement (FVG) on Major BOS", group = grpStruct, tooltip = "A Major BOS only creates a leg if the breaking impulse leaves a Fair Value Gap — an objective footprint of institutional intent. Filters slow, drifty breaks.")
+dispLookback    = input.int(3, "Displacement Window (bars)", minval = 1, maxval = 10, group = grpStruct, tooltip = "Bars around the break scanned for a same-direction FVG (the impulse span). Structural, not a magnitude threshold.")
+
 grpCol = "Colors"
 bearCol  = input.color(color.red,                       "Bearish",   group = grpCol)
 bullCol  = input.color(color.teal,                      "Bullish",   group = grpCol)
@@ -52,7 +62,8 @@ fvgCol   = input.color(color.new(color.blue, 72),       "FVG Fill",  group = grp
 // Fractal geometry — 5 left, pivot, 5 right = the 11-candle confirmation window.
 LEFT  = 5
 RIGHT = 5
-MAX_FVG = 300   // hard cap on stored FVGs per active leg (memory guard)
+MAX_FVG = 300     // hard cap on stored FVGs per active leg (memory guard)
+MAX_DEPTH = 6     // hierarchy tier capacity (must be >= the Structure Depth input max)
 
 confirmed = barstate.isconfirmed
 
@@ -65,117 +76,115 @@ confirmed = barstate.isconfirmed
 inWindow = bar_index > last_bar_index - initLookback
 
 // -----------------------------------------------------------------------------
-// 1. INTERNAL (minor) structure — confirmed 5-fractals
-//
-// ta.pivothigh/low(5, 5) only return a value once the full 11-candle fractal has
-// completed, so a confirmed high/low is stamped 5 bars back. These are the
-// INTERNAL (minor) swings. We keep the newest confirmed minor high and newest
-// confirmed minor low; a run of same-type pivots collapses to the newest. The
-// Major Leg is NOT built from these directly — they feed the swing layer below.
+// Structure helpers — set a confirmed pivot at a hierarchy tier and roll the
+// running branch-extreme that will be promoted to the next tier up.
 // -----------------------------------------------------------------------------
+setPivotHigh(pvArr, barArr, armArr, runArr, runBarArr, k, val, b) =>
+    array.set(pvArr, k, val)
+    array.set(barArr, k, b)
+    array.set(armArr, k, true)
+    r = array.get(runArr, k)
+    if na(r) or val > r
+        array.set(runArr, k, val)
+        array.set(runBarArr, k, b)
+
+setPivotLow(pvArr, barArr, armArr, runArr, runBarArr, k, val, b) =>
+    array.set(pvArr, k, val)
+    array.set(barArr, k, b)
+    array.set(armArr, k, true)
+    r = array.get(runArr, k)
+    if na(r) or val < r
+        array.set(runArr, k, val)
+        array.set(runBarArr, k, b)
+
+// -----------------------------------------------------------------------------
+// 1-2. N-TIER FRACTAL HIERARCHY (deterministic Major/Minor separation)
+//
+// One operator, applied recursively. Tier 0 = confirmed 5-fractals (minor). For
+// every tier j, a candle CLOSE beyond that tier's latest pivot is a "break". A
+// break promotes the tier's running extreme to become a pivot of tier j+1:
+//   * bearish break of tier j -> highest tier-j high becomes a tier j+1 HIGH
+//   * bullish break of tier j -> lowest  tier-j low  becomes a tier j+1 LOW
+// Each tier therefore requires the market to break the previous tier's confirmed
+// structure, so the Major tier (depth-1) can only form after `depth` nested
+// breaks — a genuinely dominant move, with no magnitude filter. The Major Leg is
+// created only on a break of the Major tier (section 3), gated by displacement.
+// -----------------------------------------------------------------------------
+var array<float> pvHigh     = array.new_float(MAX_DEPTH, na)
+var array<int>   pvHighBar  = array.new_int(MAX_DEPTH, na)
+var array<float> pvLow      = array.new_float(MAX_DEPTH, na)
+var array<int>   pvLowBar   = array.new_int(MAX_DEPTH, na)
+var array<bool>  armHigh    = array.new_bool(MAX_DEPTH, false)
+var array<bool>  armLow     = array.new_bool(MAX_DEPTH, false)
+var array<float> runHigh    = array.new_float(MAX_DEPTH, na)
+var array<int>   runHighBar = array.new_int(MAX_DEPTH, na)
+var array<float> runLow     = array.new_float(MAX_DEPTH, na)
+var array<int>   runLowBar  = array.new_int(MAX_DEPTH, na)
+
+top = depth - 1
+
+// Tier 0 input — confirmed 5-fractals feed the base of the hierarchy.
 ph = ta.pivothigh(LEFT, RIGHT)
 pl = ta.pivotlow(LEFT, RIGHT)
-
-var float confHigh    = na
-var int   confHighBar = na
-var float confLow     = na
-var int   confLowBar  = na
-
 if inWindow and not na(ph)
-    confHigh    := ph
-    confHighBar := bar_index - RIGHT
+    setPivotHigh(pvHigh, pvHighBar, armHigh, runHigh, runHighBar, 0, ph, bar_index - RIGHT)
 if inWindow and not na(pl)
-    confLow    := pl
-    confLowBar := bar_index - RIGHT
+    setPivotLow(pvLow, pvLowBar, armLow, runLow, runLowBar, 0, pl, bar_index - RIGHT)
 
-// -----------------------------------------------------------------------------
-// 2. INTERNAL breaks (close-based, one event per minor pivot)
-//
-// An internal break is a candle CLOSE beyond the latest confirmed minor pivot.
-// These do not create Major Legs — they are the operator that confirms the
-// higher-order SWING structure in section 3. A fresh minor pivot re-arms its
-// side so each minor level triggers at most one internal break.
-// -----------------------------------------------------------------------------
-var bool lowArmed  = false
-var bool highArmed = false
-if inWindow and not na(pl)
-    lowArmed := true
-if inWindow and not na(ph)
-    highArmed := true
+// Displacement — is there a same-direction 3-candle Fair Value Gap in the
+// impulse around this bar? A break carrying displacement is an institutional
+// move; a break without it is slow drift and is rejected for the Major tier.
+bearDisp = false
+bullDisp = false
+if useDisplacement
+    for k = 0 to 10
+        if k > dispLookback
+            break
+        if high[k] < low[k + 2]
+            bearDisp := true
+        if low[k] > high[k + 2]
+            bullDisp := true
 
-intBearBreak = inWindow and confirmed and not na(confLow)  and lowArmed  and close < confLow
-intBullBreak = inWindow and confirmed and not na(confHigh) and highArmed and close > confHigh
-if intBearBreak
-    lowArmed := false
-if intBullBreak
-    highArmed := false
-
-// -----------------------------------------------------------------------------
-// 2b. SWING (major) structure — the same close-break operator, one level up
-//
-// Deterministic two-tier hierarchy, no thresholds:
-//   * runHigh / runLow accumulate the extreme confirmed MINOR pivot since the
-//     last promotion of that side.
-//   * An INTERNAL BEARISH break confirms the highest minor high of the branch
-//     as a MAJOR SWING HIGH (then runHigh resets).
-//   * An INTERNAL BULLISH break confirms the lowest minor low of the branch as
-//     a MAJOR SWING LOW (then runLow resets).
-// In an uptrend, repeated bullish internal breaks stamp a rising series of
-// swing lows while runHigh keeps climbing until the first bearish internal
-// break stamps the swing high — and mirror for a downtrend. This is exactly
-// the "internal vs swing structure" nesting, produced by recursion of the
-// fractal/close-break rule rather than any magnitude filter.
-// -----------------------------------------------------------------------------
-var float runHigh      = na
-var int   runHighBar   = na
-var float runLow       = na
-var int   runLowBar    = na
-var float swingHigh    = na
-var int   swingHighBar = na
-var float swingLow     = na
-var int   swingLowBar  = na
-var bool  majHighArmed = false
-var bool  majLowArmed  = false
-
-// Accumulate branch extremes from confirmed minor pivots.
-if inWindow and not na(ph) and (na(runHigh) or ph > runHigh)
-    runHigh    := ph
-    runHighBar := bar_index - RIGHT
-if inWindow and not na(pl) and (na(runLow) or pl < runLow)
-    runLow    := pl
-    runLowBar := bar_index - RIGHT
-
-newSwingHigh = false
-newSwingLow  = false
-// A bearish internal break promotes the branch's highest minor high to a swing high.
-if intBearBreak and not na(runHigh)
-    swingHigh    := runHigh
-    swingHighBar := runHighBar
-    majHighArmed := true       // re-arm major bullish BOS against the new swing high
-    runHigh      := na         // start a fresh search for the next swing high
-    newSwingHigh := true
-// A bullish internal break promotes the branch's lowest minor low to a swing low.
-if intBullBreak and not na(runLow)
-    swingLow    := runLow
-    swingLowBar := runLowBar
-    majLowArmed := true        // re-arm major bearish BOS against the new swing low
-    runLow      := na
-    newSwingLow := true
-
-// -----------------------------------------------------------------------------
-// 2c. MAJOR Break of Structure — close beyond a confirmed SWING point
-//
-// Bearish Major BOS: close below the latest Major Swing Low.
-// Bullish Major BOS: close above the latest Major Swing High.
-// One event per swing point (re-armed when a new swing point is confirmed).
-// Only these events create a Major Leg.
-// -----------------------------------------------------------------------------
-majBearBOS = inWindow and confirmed and not na(swingLow)  and majLowArmed  and close < swingLow
-majBullBOS = inWindow and confirmed and not na(swingHigh) and majHighArmed and close > swingHigh
-if majBearBOS
-    majLowArmed := false
-if majBullBOS
-    majHighArmed := false
+// Cascade the break operator up the tiers (lowest first, so one strong candle
+// can break several nested tiers on the same bar).
+majBearBOS = false
+majBullBOS = false
+newMajSH   = false
+newMajSL   = false
+if inWindow and confirmed
+    for j = 0 to MAX_DEPTH - 1
+        if j > top
+            break
+        pvLoj = array.get(pvLow, j)
+        pvHij = array.get(pvHigh, j)
+        bBear = not na(pvLoj) and array.get(armLow, j)  and close < pvLoj
+        bBull = not na(pvHij) and array.get(armHigh, j) and close > pvHij
+        if j < top
+            // Internal tier: a break promotes the branch extreme one level up.
+            if bBear
+                array.set(armLow, j, false)
+                rh = array.get(runHigh, j)
+                if not na(rh)
+                    setPivotHigh(pvHigh, pvHighBar, armHigh, runHigh, runHighBar, j + 1, rh, array.get(runHighBar, j))
+                    array.set(runHigh, j, na)
+                    newMajSH := j + 1 == top ? true : newMajSH
+            if bBull
+                array.set(armHigh, j, false)
+                rl = array.get(runLow, j)
+                if not na(rl)
+                    setPivotLow(pvLow, pvLowBar, armLow, runLow, runLowBar, j + 1, rl, array.get(runLowBar, j))
+                    array.set(runLow, j, na)
+                    newMajSL := j + 1 == top ? true : newMajSL
+        else
+            // Major tier: a break here is a Major BOS, gated by displacement. It
+            // stays armed until a displacement-confirmed break, so a slow drift
+            // through the level does not consume it — the impulse does.
+            if bBear and (not useDisplacement or bearDisp)
+                array.set(armLow, j, false)
+                majBearBOS := true
+            if bBull and (not useDisplacement or bullDisp)
+                array.set(armHigh, j, false)
+                majBullBOS := true
 
 // -----------------------------------------------------------------------------
 // 3. Major Leg state
@@ -209,21 +218,25 @@ if confirmed and inWindow
         legDir := 0
         legInvalidated := true
 
-    // --- Creation (only when no leg is active) — built from SWING points -----
+    // --- Creation (only when no leg is active) — anchored to the MAJOR tier --
     if legDir == 0
-        if majBearBOS and not na(swingHigh)
+        majHi    = array.get(pvHigh, top)
+        majLo    = array.get(pvLow, top)
+        majHiBar = array.get(pvHighBar, top)
+        majLoBar = array.get(pvLowBar, top)
+        if majBearBOS and not na(majHi) and not na(majLo)
             legDir      := -1
-            legHigh     := swingHigh                      // fixed (major swing high)
-            legLow      := swingLow                       // dynamic (major swing low just broken)
-            legLeftBar  := math.min(swingHighBar, swingLowBar)
+            legHigh     := majHi                          // fixed (major swing high)
+            legLow      := majLo                          // dynamic (major swing low just broken)
+            legLeftBar  := math.min(majHiBar, majLoBar)
             touched     := false
             frozenRight := na
             legCreatedBear := true
-        else if majBullBOS and not na(swingLow)
+        else if majBullBOS and not na(majHi) and not na(majLo)
             legDir      := 1
-            legLow      := swingLow                       // fixed (major swing low)
-            legHigh     := swingHigh                      // dynamic (major swing high just broken)
-            legLeftBar  := math.min(swingHighBar, swingLowBar)
+            legLow      := majLo                          // fixed (major swing low)
+            legHigh     := majHi                          // dynamic (major swing high just broken)
+            legLeftBar  := math.min(majHiBar, majLoBar)
             touched     := false
             frozenRight := na
             legCreatedBull := true
@@ -384,11 +397,11 @@ if legDir != 0
 plotshape(showBOS and majBearBOS, title = "Bearish Major BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.tiny, text = "BOS")
 plotshape(showBOS and majBullBOS, title = "Bullish Major BOS", style = shape.triangleup,   location = location.belowbar, color = bullCol, size = size.tiny, text = "BOS")
 
-// A confirmed swing point is stamped at its own pivot bar (runHighBar/runLowBar).
-if showSwings and newSwingHigh
-    label.new(swingHighBar, swingHigh, "SH", style = label.style_label_down, color = color.new(bearCol, 20), textcolor = color.white, size = size.tiny)
-if showSwings and newSwingLow
-    label.new(swingLowBar, swingLow, "SL", style = label.style_label_up, color = color.new(bullCol, 20), textcolor = color.white, size = size.tiny)
+// A confirmed MAJOR-tier swing point is stamped at its own pivot bar.
+if showSwings and newMajSH
+    label.new(array.get(pvHighBar, top), array.get(pvHigh, top), "SH", style = label.style_label_down, color = color.new(bearCol, 20), textcolor = color.white, size = size.tiny)
+if showSwings and newMajSL
+    label.new(array.get(pvLowBar, top), array.get(pvLow, top), "SL", style = label.style_label_up, color = color.new(bullCol, 20), textcolor = color.white, size = size.tiny)
 
 // -----------------------------------------------------------------------------
 // 8. Alerts — only fire after all confirmation rules are satisfied.
