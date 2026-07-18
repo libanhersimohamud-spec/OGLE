@@ -26,7 +26,7 @@ grpTF = "Structure Timeframe"
 structureTF = input.timeframe("240", "Structure Timeframe", group = grpTF, tooltip = "The single timeframe the entire Major Structure is built from. Default 240 (H4). The chart may be lower (e.g. for entries); the H4 structure stays fixed. Using a chart timeframe ABOVE this is not supported.")
 
 grpDisp = "Display (Major output)"
-showLegLines = input.bool(true,  "Leg High / Leg Low",        group = grpDisp)
+showLegLines = input.bool(false, "Leg High / Leg Low",        group = grpDisp)
 showFibs     = input.bool(true,  "Fibonacci Levels",          group = grpDisp)
 showZone     = input.bool(true,  "Premium / Discount Zone",   group = grpDisp)
 showFVG      = input.bool(true,  "Fair Value Gap",            group = grpDisp)
@@ -47,7 +47,8 @@ grpStruct = "Major Structure"
 depth = input.int(3, "Structure Depth (tiers)", minval = 1, maxval = 6, group = grpStruct, tooltip = "1 = raw 5-fractals, 2 = swing structure, 3 = major (recommended). 4-5 = HTF-only anchors. Each tier needs one more nested break, filtering minor/internal legs.")
 useDisplacement = input.bool(true, "Require Displacement (FVG) on Major BOS", group = grpStruct, tooltip = "A Major BOS only creates a leg if the breaking impulse leaves a Fair Value Gap — an objective footprint of institutional intent. Filters slow, drifty breaks.")
 dispLookback    = input.int(3, "Displacement Window (bars)", minval = 1, maxval = 10, group = grpStruct, tooltip = "Bars around the break scanned for a same-direction FVG (the impulse span). Structural, not a magnitude threshold.")
-entryFib        = input.float(0.71, "Entry Retracement (0.71 = 2.45R)", minval = 0.5, maxval = 0.95, step = 0.005, group = grpStruct, tooltip = "Retracement level for entry, measured from the impulse extreme back toward the fixed boundary. SL sits at the fixed boundary (100%), TP at the impulse boundary (0%). 0.71 gives R = 0.71/0.29 = 2.45. Backtest 0.62 / 0.705 / 0.786 if desired.")
+entryFib        = input.float(0.71, "Entry level 1 (0.71 = 2.45R)", minval = 0.5, maxval = 0.95, step = 0.005, group = grpStruct, tooltip = "Primary entry retracement, 100% at the fixed boundary (SL) and 0% at the impulse extreme (TP). 0.71 gives R = 0.71/0.29 = 2.45. This level also defines the FVG confluence zone.")
+entryFib2       = input.float(0.79, "Entry level 2 (band)", minval = 0.5, maxval = 0.99, step = 0.005, group = grpStruct, tooltip = "Second entry line drawn alongside level 1 to show the 0.71-0.79 entry band, as in the model. Display only.")
 
 grpCol = "Colors"
 bearCol     = input.color(color.red,                    "Major Bearish (bold)", group = grpCol)
@@ -97,6 +98,11 @@ setPivotLow(pvArr, tArr, armArr, runArr, runTArr, k, val, b) =>
 // for the chart to draw. Also emits per-bar confirmed-fractal and minor-break
 // events for the debug layer.
 // -----------------------------------------------------------------------------
+// Price at a Fib fraction, measured with 100% at the FIXED boundary and 0% at
+// the DYNAMIC (impulse) boundary — the convention used by the trade model:
+//   1.0 = origin / SL, 0.0 = impulse extreme / TP, 0.71 = entry.
+priceAtFrac(dir, lo, hi, f) => dir == -1 ? lo + f * (hi - lo) : hi - f * (hi - lo)
+
 msEngine() =>
     confirmed = barstate.isconfirmed
     inWindow  = bar_index > last_bar_index - initLookback
@@ -325,9 +331,9 @@ isNewHTF = ta.change(time(structureTF)) != 0
 // Confirmed 5-fractal markers, stamped at each fractal's own pivot bar time.
 if showDebug and showFractals and isNewHTF
     if not na(fracHiT)
-        label.new(fracHiT, fracHiP, "H", xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_label_down, color = color.new(fracHiCol, 20), textcolor = color.white, size = size.tiny)
+        label.new(fracHiT, fracHiP, "", xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_triangledown, color = fracHiCol, size = size.tiny)
     if not na(fracLoT)
-        label.new(fracLoT, fracLoP, "L", xloc = xloc.bar_time, yloc = yloc.belowbar, style = label.style_label_up, color = color.new(fracLoCol, 20), textcolor = color.white, size = size.tiny)
+        label.new(fracLoT, fracLoP, "", xloc = xloc.bar_time, yloc = yloc.belowbar, style = label.style_triangleup, color = fracLoCol, size = size.tiny)
 
 // Minor structure zigzag — connect consecutive confirmed fractals (light lines).
 var int   lastFT = na
@@ -353,80 +359,90 @@ plotshape(showDebug and showMinorBOS and evMinBull and isNewHTF, title = "Minor 
 // Objects extend right until first touch (frozenTime), then stay fixed. Handles
 // are deleted and rebuilt each bar; all are removed when no leg is active.
 // =============================================================================
-var line  lnHigh = na
-var line  lnLow  = na
-var line  ln000  = na
-var line  ln025  = na
-var line  ln050  = na
-var line  ln075  = na
-var line  ln100  = na
+// Fib is labelled the model's way: 1 (100%) at the FIXED boundary / SL, 0 (0%)
+// at the impulse extreme / TP, with the 0.71 & 0.79 entry band between them.
+var line  lnLegHi = na
+var line  lnLegLo = na
+var line  fL0   = na
+var line  fL50  = na
+var line  fL71  = na
+var line  fL79  = na
+var line  fL100 = na
+var label bL0   = na
+var label bL50  = na
+var label bL71  = na
+var label bL79  = na
+var label bL100 = na
 var box   bxZone = na
 var box   bxFVG  = na
-var line  lnEntry = na
-var line  lnSL    = na
-var line  lnTP    = na
-var label lbTrade = na
+var label lbR   = na
 
-if not na(lnEntry)
-    line.delete(lnEntry)
-if not na(lnSL)
-    line.delete(lnSL)
-if not na(lnTP)
-    line.delete(lnTP)
-if not na(lbTrade)
-    label.delete(lbTrade)
-if not na(lnHigh)
-    line.delete(lnHigh)
-if not na(lnLow)
-    line.delete(lnLow)
-if not na(ln000)
-    line.delete(ln000)
-if not na(ln025)
-    line.delete(ln025)
-if not na(ln050)
-    line.delete(ln050)
-if not na(ln075)
-    line.delete(ln075)
-if not na(ln100)
-    line.delete(ln100)
+if not na(lnLegHi)
+    line.delete(lnLegHi)
+if not na(lnLegLo)
+    line.delete(lnLegLo)
+if not na(fL0)
+    line.delete(fL0)
+if not na(fL50)
+    line.delete(fL50)
+if not na(fL71)
+    line.delete(fL71)
+if not na(fL79)
+    line.delete(fL79)
+if not na(fL100)
+    line.delete(fL100)
+if not na(bL0)
+    label.delete(bL0)
+if not na(bL50)
+    label.delete(bL50)
+if not na(bL71)
+    label.delete(bL71)
+if not na(bL79)
+    label.delete(bL79)
+if not na(bL100)
+    label.delete(bL100)
 if not na(bxZone)
     box.delete(bxZone)
 if not na(bxFVG)
     box.delete(bxFVG)
+if not na(lbR)
+    label.delete(lbR)
 
 if legDir != 0 and not na(legFixedTime)
     legCol = legDir == -1 ? bearCol : bullCol
     rEdge  = na(frozenTime) ? time : frozenTime
+    p0   = priceAtFrac(legDir, legLow, legHigh, 0.0)        // 0  = impulse extreme / TP
+    p50  = priceAtFrac(legDir, legLow, legHigh, 0.5)
+    p71  = priceAtFrac(legDir, legLow, legHigh, entryFib)   // entry 1
+    p79  = priceAtFrac(legDir, legLow, legHigh, entryFib2)  // entry 2
+    p100 = priceAtFrac(legDir, legLow, legHigh, 1.0)        // 1  = fixed boundary / SL
 
     if showZone
-        bxZone := box.new(legFixedTime, zoneTop, rEdge, zoneBot, xloc = xloc.bar_time, border_color = color.new(legCol, 40), bgcolor = zoneCol)
-
-    if showFibs
-        ln100 := line.new(legFixedTime, f100, rEdge, f100, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-        ln075 := line.new(legFixedTime, f075, rEdge, f075, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-        ln050 := line.new(legFixedTime, f050, rEdge, f050, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-        ln025 := line.new(legFixedTime, f025, rEdge, f025, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-        ln000 := line.new(legFixedTime, f000, rEdge, f000, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-
-    if showLegLines
-        lnHigh := line.new(legFixedTime, legHigh, rEdge, legHigh, xloc = xloc.bar_time, color = legCol, width = 3)
-        lnLow  := line.new(legFixedTime, legLow,  rEdge, legLow,  xloc = xloc.bar_time, color = legCol, width = 3)
+        bxZone := box.new(legFixedTime, zoneTop, rEdge, zoneBot, xloc = xloc.bar_time, border_color = color.new(legCol, 60), bgcolor = zoneCol)
 
     if showFVG and not na(bestTop)
         bxFVG := box.new(legFixedTime, bestTop, rEdge, bestBot, xloc = xloc.bar_time, border_color = color.new(legCol, 20), bgcolor = fvgCol)
 
-    // Trade framing: entry = retracement (default 71%), SL = fixed boundary
-    // (100%), TP = impulse boundary (0%). R is constant for a given entry level.
+    if showFibs
+        fL0   := line.new(legFixedTime, p0,   rEdge, p0,   xloc = xloc.bar_time, color = fibCol,     style = line.style_dotted)
+        fL50  := line.new(legFixedTime, p50,  rEdge, p50,  xloc = xloc.bar_time, color = fibCol,     style = line.style_dotted)
+        fL100 := line.new(legFixedTime, p100, rEdge, p100, xloc = xloc.bar_time, color = fibCol,     style = line.style_dotted)
+        fL71  := line.new(legFixedTime, p71,  rEdge, p71,  xloc = xloc.bar_time, color = entryLnCol, width = 1)
+        fL79  := line.new(legFixedTime, p79,  rEdge, p79,  xloc = xloc.bar_time, color = entryLnCol, width = 1)
+        bL0   := label.new(rEdge, p0,   "0",                    xloc = xloc.bar_time, style = label.style_none, textcolor = fibCol,     size = size.small)
+        bL50  := label.new(rEdge, p50,  "0.5",                  xloc = xloc.bar_time, style = label.style_none, textcolor = fibCol,     size = size.tiny)
+        bL71  := label.new(rEdge, p71,  str.tostring(entryFib), xloc = xloc.bar_time, style = label.style_none, textcolor = entryLnCol, size = size.small)
+        bL79  := label.new(rEdge, p79,  str.tostring(entryFib2),xloc = xloc.bar_time, style = label.style_none, textcolor = entryLnCol, size = size.small)
+        bL100 := label.new(rEdge, p100, "1",                    xloc = xloc.bar_time, style = label.style_none, textcolor = fibCol,     size = size.small)
+
+    if showLegLines
+        lnLegHi := line.new(legFixedTime, legHigh, rEdge, legHigh, xloc = xloc.bar_time, color = legCol, width = 2)
+        lnLegLo := line.new(legFixedTime, legLow,  rEdge, legLow,  xloc = xloc.bar_time, color = legCol, width = 2)
+
+    // Trade framing: entry = 0.71 band, SL = level 1 (fixed), TP = level 0.
     if showTrade
-        rng2   = legHigh - legLow
-        entryP = legDir == -1 ? legLow + rng2 * entryFib : legLow + rng2 * (1.0 - entryFib)
-        slP    = legDir == -1 ? legHigh : legLow
-        tpP    = legDir == -1 ? legLow  : legHigh
-        rr     = entryFib / (1.0 - entryFib)
-        lnEntry := line.new(legFixedTime, entryP, rEdge, entryP, xloc = xloc.bar_time, color = entryLnCol, style = line.style_dashed, width = 2)
-        lnSL    := line.new(legFixedTime, slP,    rEdge, slP,    xloc = xloc.bar_time, color = slLnCol,    width = 1)
-        lnTP    := line.new(legFixedTime, tpP,    rEdge, tpP,    xloc = xloc.bar_time, color = tpLnCol,    width = 1)
-        lbTrade := label.new(rEdge, entryP, (legDir == -1 ? "SHORT" : "LONG") + "  R " + str.tostring(rr, "#.##") + "\nEntry " + str.tostring(entryP, format.mintick) + "\nSL " + str.tostring(slP, format.mintick) + "   TP " + str.tostring(tpP, format.mintick), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.gray, 15), textcolor = color.white, size = size.small)
+        rr = entryFib / (1.0 - entryFib)
+        lbR := label.new(rEdge, p71, (legDir == -1 ? "SHORT" : "LONG") + "  R " + str.tostring(rr, "#.##"), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
 
 // Major BOS markers (bold) and Major-tier swing points (prominent).
 plotshape(showBOS and evBearBOS and isNewHTF, title = "Bearish Major BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.small, text = "BOS")
