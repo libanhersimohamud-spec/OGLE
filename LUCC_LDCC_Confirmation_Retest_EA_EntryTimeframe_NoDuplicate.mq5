@@ -1,23 +1,44 @@
 //+------------------------------------------------------------------+
-//|       LUCC_LDCC_Confirmation_Retest_EA_V9-No-Duplicate-Entries    |
+//| LUCC_LDCC_Confirmation_Retest_EA_EntryTimeframe_NoDuplicate.mq5   |
 //|                                                                    |
 //| Expert Advisor port of "LUCC / LDCC Confirmation & Retest         |
-//| Indicator" (Pine v6).  Entry timeframe: 2H (same as V9).           |
+//| Indicator" (Pine v6).                                              |
 //|                                                                    |
-//| ==== NO-DUPLICATE-ENTRIES CHANGE ================================ |
-//| When two or more engines generate the SAME entry (same direction,  |
-//| same CC bar / market structure & timing, and entry/SL/TP within a  |
-//| small tolerance), the EA opens only ONE physical trade. The first  |
-//| engine to fire is the PRIMARY (sends the order and manages it); the |
-//| others become MIRRORS that share the same physical position/ticket |
-//| with no order of their own. At close, the ONE realized outcome is   |
-//| attributed to EVERY owning engine — each records the trade with its |
-//| own bias/daily context and its own win/loss/BE for stats. Each CSV  |
-//| row carries PhysicalExecution (1 = the real order, 0 = mirror) and  |
-//| a shared TradeID, so per-engine stats use all rows while account    |
-//| money sums only PhysicalExecution=1 rows. Truly different entries   |
-//| (different direction / structure / price / target / timing) are     |
-//| NOT merged — each engine trades independently as before.            |
+//| ==== V11 FIXES ================================================== |
+//| Issue 1 (entries not on the configured timeframe). ROOT CAUSE: the |
+//|   retest had a TICK-BASED entry path (MonitorRetest) that opened a  |
+//|   trade the instant price touched the level intrabar, so entries    |
+//|   landed at arbitrary sub-timeframe times and looked like 1H (not   |
+//|   2H) entries. (Signal DETECTION was already strictly on the entry  |
+//|   TF; only the execution timing leaked below it.) FIX: the entry    |
+//|   timeframe is now a single input (InpEntryTimeframe = "Entry       |
+//|   Timeframe"), and the retest is confirmed + executed ONLY on the   |
+//|   CLOSED entry-TF bar. The tick entry path was removed, so every    |
+//|   entry is strictly aligned to the configured Entry Timeframe.      |
+//| Issue 2 (duplicate trades persisted). ROOT CAUSE: (a) there were    |
+//|   TWO entry code paths (tick + bar-close) that could each fire; and |
+//|   (b) the de-dup only merged when the TARGET also matched, so       |
+//|   different-bias engines that produced the SAME entry & stop but    |
+//|   different targets were NOT merged — on a losing setup they all    |
+//|   hit the same stop and showed up as several identical losers. FIX: |
+//|   (a) ONE entry code path only (bar-close); (b) a setup is now the  |
+//|   same physical trade when DIRECTION + entry-TF CC bar + entry +    |
+//|   stop match (target ignored by default, InpMergeRequireSameTarget  |
+//|   to require it too). One physical position per setup; the outcome  |
+//|   is attributed to every engine that generated it.                  |
+//|                                                                    |
+//| ==== NO-DUPLICATE-ENTRIES MODEL ================================= |
+//| The first engine to fire a setup is the PRIMARY (sends & manages   |
+//| the one order); the others become MIRRORS sharing that physical    |
+//| position/ticket with no order of their own. At close the single    |
+//| realized outcome is attributed to EVERY owning engine — each logs   |
+//| the trade with its own bias/daily context and its own win/loss/BE.  |
+//| CSV column PhysicalExecution = 1 for the real order, 0 for mirrors; |
+//| rows share a TradeID, so per-engine stats use all rows while        |
+//| account money sums only PhysicalExecution=1 rows.                   |
+//|                                                                    |
+//| Entry Timeframe is configurable (InpEntryTimeframe): set PERIOD_H2  |
+//| for the 2H build, PERIOD_H1 for the 1H build — one binary, one flip.|
 //|                                                                    |
 //| ==== V9 CHANGE — SIX INDEPENDENT ENGINES ======================== |
 //| Four more fully independent engines are added (six total), each    |
@@ -328,9 +349,10 @@ input group "Filters (isolation / debugging)"
 // setup is taken regardless of session (data-collection mode). Session/UTC are
 // still COMPUTED and LOGGED per trade for later analysis, just never used to
 // block a trade or a reference candle.
-input bool   InpUseBarCloseRetest    = true;  // Detect the retest on bar close too (range brackets the
-                                               // level), not only tick-by-tick — REQUIRED for entries in
-                                               // the tester's "Open prices"/"1 min OHLC" modes
+input bool   InpUseBarCloseRetest    = true;  // V11: retained for the log only. The retest now ALWAYS confirms
+                                               // and enters on the closed Entry-Timeframe bar (the single entry
+                                               // path); the old tick-by-tick intrabar entry was removed so no
+                                               // sub-timeframe entry can occur. This toggle no longer gates entries.
 input bool   InpDebugLog             = true;  // Print a detailed accept/reject trace to the Experts log
 
 input group "Info Panel"
@@ -376,15 +398,28 @@ string g_engName[NUM_ENGINES] = { "1W-1D","2W-2D","10D-2D","5D-1D","5D-2D","1W-2
 string EngineName(int e) { return (e >= 0 && e < NUM_ENGINES) ? g_engName[e] : "?"; }
 
 //======================================================================
-// V8 — ENTRY TIMEFRAME. All entry-signal detection (LUCC/LDCC, CC, RC),
-// the new-bar trigger, pending-order / expiration logic, and every
-// entry-candle count run on this timeframe. V8 raises it from H1 to H2.
+// ENTRY TIMEFRAME (configurable). ALL entry-signal detection (LUCC/LDCC,
+// CC, RC), the new-bar trigger, the retest entry, pending-order &
+// expiration logic, and every entry-candle count run STRICTLY on this
+// timeframe — set it once here and the whole entry engine follows.
 // Nothing else (Weekly/2W bias, Daily/2D confirmation, trade management,
-// targets, stops, partial/BE/lock, CSV structure, stats) changes.
-// ENTRY_TF_SECS mirrors ENTRY_TF in seconds for entry-candle bar counts.
+// targets, stops, partial/BE/lock, CSV structure, stats) depends on it.
+//   Set PERIOD_H2 for the 2H build, PERIOD_H1 for the 1H build, etc.
+// ENTRY_TF_SECS mirrors it in seconds (resolved in OnInit) for the
+// entry-candle bar counts, so those columns stay in entry-candle units.
 //======================================================================
-#define ENTRY_TF       PERIOD_H2
-#define ENTRY_TF_SECS  7200
+input ENUM_TIMEFRAMES InpEntryTimeframe = PERIOD_H2;  // Entry Timeframe
+#define ENTRY_TF       InpEntryTimeframe
+int    g_entryTfSecs = 7200;                          // = PeriodSeconds(InpEntryTimeframe), set in OnInit
+#define ENTRY_TF_SECS  g_entryTfSecs
+
+// V11 duplicate-entry elimination: a "setup" is one physical trade shared by
+// every engine that generated it. false (default) merges whenever the DIRECTION,
+// the Entry-TF CC bar, the entry price and the stop match — i.e. the same
+// physical position — even if the engines' TARGETS differ (so a losing setup can
+// never appear as several identical trades). Set true to ALSO require the same
+// target before merging (keeps different-target engines as separate positions).
+input bool InpMergeRequireSameTarget = false;         // Merge only when target (TP) also matches
 
 //======================================================================
 // Per-direction signal + trade-management state
@@ -549,15 +584,17 @@ bool HasPendingLimitForEpisode(int eng, bool isSell, datetime episode)
 bool SameEntry(bool isSell, datetime ccTime, double entry, double sl, double tp,
                bool oSell, datetime oCC, double oEntry, double oSL, double oTP, double tol)
 {
-   if(oSell != isSell || oCC != ccTime) return false;
-   return MathAbs(oEntry - entry) <= tol && MathAbs(oSL - sl) <= tol && MathAbs(oTP - tp) <= tol;
+   if(oSell != isSell || oCC != ccTime) return false;            // same direction & same Entry-TF CC bar
+   if(MathAbs(oEntry - entry) > tol || MathAbs(oSL - sl) > tol) return false; // same physical entry & stop
+   if(InpMergeRequireSameTarget && MathAbs(oTP - tp) > tol) return false;     // optional: same target too
+   return true;
 }
 // Index of a PRIMARY open trade that this proposed entry duplicates, else -1.
 int FindDuplicateOpen(bool isSell, datetime ccTime, double entry, double sl, double tp, double tol)
 {
    for(int i = 0; i < ArraySize(g_openTrades); i++)
    {
-      if(!g_openTrades[i].isPrimary || g_openTrades[i].positionId <= 0) continue;
+      if(!g_openTrades[i].isPrimary) continue;   // match the physical (primary) records only
       if(SameEntry(isSell, ccTime, entry, sl, tp,
                    g_openTrades[i].isSell, g_openTrades[i].ccTime,
                    g_openTrades[i].entryPrice, g_openTrades[i].slPrice, g_openTrades[i].tpPrice, tol))
@@ -960,19 +997,18 @@ void UpdateDirection(bool isSell, SSignalState &st)
       }
    }
 
-   // Closed-bar RETEST fallback (indicator-faithful): the first bar AFTER the
-   // CC whose range brackets the level is a retest. This is what lets entries
-   // fire in the tester's "Open prices"/"1 min OHLC" modes, where the tick
-   // path in MonitorRetest never samples the intrabar touch. The tick path
-   // still runs for live/every-tick precision; whichever sees the touch first
-   // wins, and positionOpen/rcTime keep them from double-firing.
-   // V6 stale-entry: fold each just-closed bar's profit-direction extreme into the
-   // away tracker too, so the measure stays correct in the tester's Open-prices /
-   // 1-min OHLC modes where the tick path barely samples the intrabar move.
+   // V11: THE SINGLE ENTRY PATH — the retest is confirmed on a CLOSED Entry-
+   // Timeframe bar (the first bar after the CC whose range brackets the retest
+   // level), and the entry executes on that event. Because this runs inside
+   // ProcessNewBar() (once per new Entry-TF bar), every entry is strictly aligned
+   // to the configured Entry Timeframe — never intrabar / a lower timeframe — and
+   // there is exactly ONE code path that can open a trade for a given setup.
+   // Also fold the just-closed bar's profit-direction extreme into the stale-entry
+   // away tracker.
    if(st.refTime != 0 && st.ccTime != 0 && st.rcTime == 0 && BarTime(0) > st.ccTime)
       st.awayExtreme = isSell ? MathMin(st.awayExtreme, BarLow(0)) : MathMax(st.awayExtreme, BarHigh(0));
 
-   if(InpUseBarCloseRetest && st.refTime != 0 && st.ccTime != 0 && st.rcTime == 0
+   if(st.refTime != 0 && st.ccTime != 0 && st.rcTime == 0
       && BarTime(0) > st.ccTime && st.lastAttemptBar != BarTime(0))
    {
       double level    = isSell ? st.refLow : st.refHigh;
@@ -982,7 +1018,7 @@ void UpdateDirection(bool isSell, SSignalState &st)
          st.lastAttemptBar = BarTime(0);
          st.rcLevelTouched = true;   // the retest level WAS reached (for missed-setup analysis)
          g_cntTouch++;
-         Dbg(StringFormat("%s RETEST touch (bar close) @ %s level %.5f",
+         Dbg(StringFormat("%s RETEST (Entry-TF bar close) @ %s level %.5f",
                           isSell ? "SELL" : "BUY", TimeToString(GetNairobiTime(BarTime(0)), TIME_DATE | TIME_MINUTES), level));
          if(TryOpen(isSell, st))
             st.rcTime = BarTime(0);
@@ -991,21 +1027,13 @@ void UpdateDirection(bool isSell, SSignalState &st)
 }
 
 //+------------------------------------------------------------------+
-//| Tick-by-tick Retest Candle detection. Active only while a CC has |
-//| closed (st.ccTime != 0) and no RC has fired yet for this cycle    |
-//| (st.rcTime == 0) — i.e. exactly the "waiting for retest" state.   |
-//| Since UpdateDirection() only sets/clears ccTime on closed bars,   |
-//| this can never start before the CC bar has actually closed, and  |
-//| a reference-candle invalidation on a later closed bar (ccTime     |
-//| reset to 0) automatically cancels an in-progress wait.            |
-//|                                                                    |
-//| "Touch" = the level is reachable by the live market right now:    |
-//| either it sits inside the current Bid/Ask spread, or price        |
-//| jumped straight across it between two consecutive ticks (a        |
-//| plain Bid/Ask-vs-level check alone would miss that second case    |
-//| whenever ticks don't land exactly on the level, e.g. coarser      |
-//| tick generation during backtests). The instant either is true,    |
-//| the order is sent — same tick, no waiting for a candle close.     |
+//| V11: intrabar retest TRACKER (no longer an entry path). Runs each  |
+//| tick while a CC is armed and no RC has fired, and only RECORDS that |
+//| the retest level was reached (rcLevelTouched) and extends the       |
+//| stale-entry away-extreme. It NEVER opens a trade — entries execute  |
+//| strictly on the configured Entry Timeframe via the single bar-close |
+//| retest path in UpdateDirection(). This is what removed the old      |
+//| tick-based (sub-timeframe) entry and the second entry code path.    |
 //+------------------------------------------------------------------+
 void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double mid)
 {
@@ -1028,18 +1056,12 @@ void MonitorRetest(bool isSell, SSignalState &st, double bid, double ask, double
    if(!(straddle || crossed))
       return;
 
-   // Throttle to one entry attempt per H1 bar per side, so a sustained
-   // straddle doesn't spam TryOpen (and the Experts log) every tick.
-   datetime curBar = iTime(_Symbol, ENTRY_TF, 0);
-   st.rcLevelTouched = true;   // the retest level WAS reached (for missed-setup analysis)
-   if(st.lastAttemptBar == curBar)
-      return;
-   st.lastAttemptBar = curBar;
-
-   g_cntTouch++;
-   Dbg(StringFormat("%s RETEST touch (tick) @ level %.5f", isSell ? "SELL" : "BUY", level));
-   if(TryOpen(isSell, st))
-      st.rcTime = curBar; // the currently-forming bar is the RC that opened the trade
+   // V11: intrabar touch is RECORDED only (for the stale-entry & missed-setup
+   // measures) — it NEVER opens a trade here. Entries execute strictly on the
+   // configured Entry Timeframe, through the single bar-close retest path in
+   // UpdateDirection(). This guarantees no sub-timeframe / intrabar entries and
+   // removes the second entry code path that could double-trigger a setup.
+   st.rcLevelTouched = true;
 }
 
 //+------------------------------------------------------------------+
@@ -3774,6 +3796,13 @@ int OnInit()
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpSlippagePoints);
    g_trade.SetTypeFillingBySymbol(_Symbol);
+
+   // Resolve the configured Entry Timeframe's length (seconds) once. All entry
+   // detection & entries use InpEntryTimeframe; this only sizes entry-candle counts.
+   g_entryTfSecs = (int)PeriodSeconds(InpEntryTimeframe);
+   if(g_entryTfSecs <= 0) g_entryTfSecs = 7200;
+   PrintFormat("LUCC/LDCC EA: ENTRY TIMEFRAME = %s (%d s). All entries execute on this timeframe only.",
+               EnumToString(InpEntryTimeframe), g_entryTfSecs);
 
    // Resolve the broker->Nairobi offset FIRST so every logged timestamp is in
    // Africa/Nairobi. (Auto-detect may defer until the first tick if TimeGMT()
