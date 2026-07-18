@@ -7,14 +7,15 @@
 // to. The whole engine — confirmed 5-fractals, the N-tier hierarchy, the Major
 // Leg, its Fibonacci, Premium/Discount zone and qualifying Fair Value Gap — is
 // computed natively at the structure timeframe via request.security() and drawn
-// on the chart with time-anchored objects, so you can drop to a lower timeframe
-// for entries while the H4 Major Leg stays fixed and clean on screen.
+// on the chart with time-anchored objects.
 //
-// Only the structure timeframe is analysed; no other timeframe is calculated or
-// displayed. Only the latest active Major Leg is ever shown. All logic is
-// close-based and non-repainting at the structure timeframe (wicks never confirm
-// a break or an invalidation), and lookahead is off so nothing is read from the
-// future.
+// A DEBUG / VALIDATION layer (toggleable) plots every confirmed 5-fractal, the
+// minor-structure zigzag, minor BOS and the Major-tier swing points, so the
+// hierarchy promotion (minor -> major) can be visually verified. Turn Debug off
+// to show only the clean Major Leg and its Fibonacci.
+//
+// All logic is close-based and non-repainting at the structure timeframe (wicks
+// never confirm a break or invalidation); lookahead is off (no future leak).
 // =============================================================================
 indicator("Major Market Structure Engine (H4)", overlay = true, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
 
@@ -22,41 +23,40 @@ indicator("Major Market Structure Engine (H4)", overlay = true, max_lines_count 
 // Inputs
 // -----------------------------------------------------------------------------
 grpTF = "Structure Timeframe"
-// The engine analyses THIS timeframe only. Default H4. Everything is computed at
-// this resolution regardless of the chart timeframe; no other timeframe is
-// calculated or displayed. Best viewed on the structure timeframe or lower.
 structureTF = input.timeframe("240", "Structure Timeframe", group = grpTF, tooltip = "The single timeframe the entire Major Structure is built from. Default 240 (H4). The chart may be lower (e.g. for entries); the H4 structure stays fixed. Using a chart timeframe ABOVE this is not supported.")
 
-grpDisp = "Display"
+grpDisp = "Display (Major output)"
 showLegLines = input.bool(true,  "Leg High / Leg Low",        group = grpDisp)
 showFibs     = input.bool(true,  "Fibonacci Levels",          group = grpDisp)
 showZone     = input.bool(true,  "Premium / Discount Zone",   group = grpDisp)
 showFVG      = input.bool(true,  "Fair Value Gap",            group = grpDisp)
 showBOS      = input.bool(true,  "Major BOS Markers",         group = grpDisp)
-showSwings   = input.bool(true,  "Swing Structure Points",    group = grpDisp)
+showSwings   = input.bool(true,  "Major Swing Points (SH/SL)",group = grpDisp)
+
+grpDebug = "Debug / Validation"
+showDebug    = input.bool(true, "Enable Debug Hierarchy Visuals", group = grpDebug, tooltip = "Master switch for the validation layer. Turn OFF to show only the Major Leg and its Fibonacci.")
+showFractals = input.bool(true, "    Confirmed 5-Fractals (H/L)", group = grpDebug)
+showMinorZig = input.bool(true, "    Minor Structure Zigzag",     group = grpDebug)
+showMinorBOS = input.bool(true, "    Minor (internal) BOS",       group = grpDebug)
 
 grpInit = "Initialization"
-// The engine reconstructs only the currently-active Major Leg from a bounded
-// window of the most recent structure-timeframe bars (a forward replay of the
-// recent window), so it never anchors to obsolete history and starts up fast.
 initLookback = input.int(2000, "Reconstruction Window (bars)", minval = 100, maxval = 20000, group = grpInit, tooltip = "How many recent structure-timeframe bars to replay when reconstructing the active Major Leg on load. Larger = safer for long-lived legs, smaller = faster startup.")
 
 grpStruct = "Major Structure"
-// Deterministic Major/Minor separation. The Major Leg is anchored to tier
-// (depth-1) of a recursive fractal hierarchy: each tier requires the market to
-// break the previous tier's confirmed structure, so higher depth = fewer, more
-// dominant legs. This is the ONLY selectivity knob and it is structural, not a
-// magnitude threshold.
 depth = input.int(3, "Structure Depth (tiers)", minval = 1, maxval = 6, group = grpStruct, tooltip = "1 = raw 5-fractals, 2 = swing structure, 3 = major (recommended). 4-5 = HTF-only anchors. Each tier needs one more nested break, filtering minor/internal legs.")
 useDisplacement = input.bool(true, "Require Displacement (FVG) on Major BOS", group = grpStruct, tooltip = "A Major BOS only creates a leg if the breaking impulse leaves a Fair Value Gap — an objective footprint of institutional intent. Filters slow, drifty breaks.")
 dispLookback    = input.int(3, "Displacement Window (bars)", minval = 1, maxval = 10, group = grpStruct, tooltip = "Bars around the break scanned for a same-direction FVG (the impulse span). Structural, not a magnitude threshold.")
 
 grpCol = "Colors"
-bearCol  = input.color(color.red,                       "Bearish",   group = grpCol)
-bullCol  = input.color(color.teal,                      "Bullish",   group = grpCol)
-fibCol   = input.color(color.new(color.gray, 0),        "Fib Lines", group = grpCol)
-zoneCol  = input.color(color.new(color.orange, 82),     "Zone Fill", group = grpCol)
-fvgCol   = input.color(color.new(color.blue, 72),       "FVG Fill",  group = grpCol)
+bearCol     = input.color(color.red,                    "Major Bearish (bold)", group = grpCol)
+bullCol     = input.color(color.teal,                   "Major Bullish (bold)", group = grpCol)
+fibCol      = input.color(color.new(color.gray, 0),     "Fib Lines",            group = grpCol)
+zoneCol     = input.color(color.new(color.orange, 82),  "Zone Fill",            group = grpCol)
+fvgCol      = input.color(color.new(color.blue, 72),    "FVG Fill",             group = grpCol)
+fracHiCol   = input.color(color.orange,                 "Fractal High",         group = grpCol)
+fracLoCol   = input.color(color.aqua,                   "Fractal Low",          group = grpCol)
+minorCol    = input.color(color.new(color.gray, 35),    "Minor Legs (light)",   group = grpCol)
+minorBosCol = input.color(color.fuchsia,                "Minor BOS",            group = grpCol)
 
 // Fractal geometry — 5 left, pivot, 5 right = the 11-candle confirmation window.
 LEFT  = 5
@@ -66,8 +66,7 @@ MAX_DEPTH = 6     // hierarchy tier capacity (must be >= the Structure Depth inp
 
 // -----------------------------------------------------------------------------
 // Structure helpers — set a confirmed pivot at a hierarchy tier and roll the
-// running branch-extreme that will be promoted to the next tier up. The "b"
-// value stored per pivot is its bar TIME (ms), used later for time anchoring.
+// running branch-extreme promoted to the next tier up. "b" is the pivot bar TIME.
 // -----------------------------------------------------------------------------
 setPivotHigh(pvArr, tArr, armArr, runArr, runTArr, k, val, b) =>
     array.set(pvArr, k, val)
@@ -88,32 +87,26 @@ setPivotLow(pvArr, tArr, armArr, runArr, runTArr, k, val, b) =>
         array.set(runTArr, k, b)
 
 // -----------------------------------------------------------------------------
-// msEngine — the WHOLE structure/leg/fib/zone/fvg engine, evaluated natively at
-// the structure timeframe (called inside request.security below). It draws
-// nothing; it returns the scalar values the chart side needs, with pivot bar
-// TIMES so the drawings can be time-anchored onto any chart timeframe.
-//
-// N-tier fractal hierarchy: one close-break operator applied recursively. Tier 0
-// = confirmed 5-fractals. A close beyond tier j's latest pivot is a "break" that
-// promotes that tier's running extreme into a pivot of tier j+1. The Major tier
-// (depth-1) therefore forms only after `depth` nested breaks, and its break
-// (gated by displacement) creates the Major Leg.
+// msEngine — the WHOLE engine, evaluated natively at the structure timeframe
+// (inside request.security). Draws nothing; returns scalars (with pivot TIMES)
+// for the chart to draw. Also emits per-bar confirmed-fractal and minor-break
+// events for the debug layer.
 // -----------------------------------------------------------------------------
 msEngine() =>
     confirmed = barstate.isconfirmed
     inWindow  = bar_index > last_bar_index - initLookback
     top       = depth - 1
 
-    var array<float> pvHigh     = array.new_float(MAX_DEPTH, na)
-    var array<int>   pvHighT    = array.new_int(MAX_DEPTH, na)
-    var array<float> pvLow      = array.new_float(MAX_DEPTH, na)
-    var array<int>   pvLowT     = array.new_int(MAX_DEPTH, na)
-    var array<bool>  armHigh    = array.new_bool(MAX_DEPTH, false)
-    var array<bool>  armLow     = array.new_bool(MAX_DEPTH, false)
-    var array<float> runHigh    = array.new_float(MAX_DEPTH, na)
-    var array<int>   runHighT   = array.new_int(MAX_DEPTH, na)
-    var array<float> runLow     = array.new_float(MAX_DEPTH, na)
-    var array<int>   runLowT    = array.new_int(MAX_DEPTH, na)
+    var array<float> pvHigh   = array.new_float(MAX_DEPTH, na)
+    var array<int>   pvHighT  = array.new_int(MAX_DEPTH, na)
+    var array<float> pvLow    = array.new_float(MAX_DEPTH, na)
+    var array<int>   pvLowT   = array.new_int(MAX_DEPTH, na)
+    var array<bool>  armHigh  = array.new_bool(MAX_DEPTH, false)
+    var array<bool>  armLow   = array.new_bool(MAX_DEPTH, false)
+    var array<float> runHigh  = array.new_float(MAX_DEPTH, na)
+    var array<int>   runHighT = array.new_int(MAX_DEPTH, na)
+    var array<float> runLow   = array.new_float(MAX_DEPTH, na)
+    var array<int>   runLowT  = array.new_int(MAX_DEPTH, na)
 
     // Tier 0 input — confirmed 5-fractals feed the base of the hierarchy.
     ph = ta.pivothigh(LEFT, RIGHT)
@@ -122,6 +115,12 @@ msEngine() =>
         setPivotHigh(pvHigh, pvHighT, armHigh, runHigh, runHighT, 0, ph, time[RIGHT])
     if inWindow and not na(pl)
         setPivotLow(pvLow, pvLowT, armLow, runLow, runLowT, 0, pl, time[RIGHT])
+
+    // Debug: every confirmed fractal this bar (price + its pivot-bar time).
+    fracHiP = inWindow and not na(ph) ? ph        : na
+    fracHiT = inWindow and not na(ph) ? time[RIGHT] : na
+    fracLoP = inWindow and not na(pl) ? pl        : na
+    fracLoT = inWindow and not na(pl) ? time[RIGHT] : na
 
     // Displacement — same-direction 3-candle FVG in the impulse around this bar.
     bearDisp = false
@@ -138,6 +137,8 @@ msEngine() =>
     // Cascade the break operator up the tiers (lowest first).
     majBearBOS = false
     majBullBOS = false
+    minBearBrk = false
+    minBullBrk = false
     newMajSH   = false
     newMajSL   = false
     if inWindow and confirmed
@@ -151,6 +152,7 @@ msEngine() =>
             if j < top
                 if bBear
                     array.set(armLow, j, false)
+                    minBearBrk := true
                     rh = array.get(runHigh, j)
                     if not na(rh)
                         setPivotHigh(pvHigh, pvHighT, armHigh, runHigh, runHighT, j + 1, rh, array.get(runHighT, j))
@@ -158,6 +160,7 @@ msEngine() =>
                         newMajSH := j + 1 == top ? true : newMajSH
                 if bBull
                     array.set(armHigh, j, false)
+                    minBullBrk := true
                     rl = array.get(runLow, j)
                     if not na(rl)
                         setPivotLow(pvLow, pvLowT, armLow, runLow, runLowT, j + 1, rl, array.get(runLowT, j))
@@ -172,12 +175,12 @@ msEngine() =>
                     majBullBOS := true
 
     // --- Major Leg state (created from the Major tier, gated by displacement) --
-    var int   legDir      = 0
-    var float legHigh     = na
-    var float legLow      = na
-    var int   legLeftTime = na
-    var bool  touched     = false
-    var int   frozenTime  = na
+    var int   legDir       = 0
+    var float legHigh      = na
+    var float legLow       = na
+    var int   legFixedTime = na   // TIME of the FIXED boundary (Fib start), never changes
+    var bool  touched      = false
+    var int   frozenTime   = na
 
     legCreatedBear = false
     legCreatedBull = false
@@ -192,30 +195,33 @@ msEngine() =>
             legDir := 0
             legInvalidated := true
 
-        // Creation: only when no leg is active, anchored to the Major tier.
+        // Creation: anchored to the Major tier. The FIXED boundary defines the
+        // Fibonacci start and is locked here for the life of the leg.
         if legDir == 0
             majHi  = array.get(pvHigh, top)
             majLo  = array.get(pvLow, top)
             majHiT = array.get(pvHighT, top)
             majLoT = array.get(pvLowT, top)
             if majBearBOS and not na(majHi) and not na(majLo)
-                legDir      := -1
-                legHigh     := majHi
-                legLow      := majLo
-                legLeftTime := majHiT < majLoT ? majHiT : majLoT
-                touched     := false
-                frozenTime  := na
+                legDir       := -1
+                legHigh      := majHi          // FIXED boundary
+                legLow       := majLo          // DYNAMIC boundary (extends on lower lows)
+                legFixedTime := majHiT         // Fib start = fixed major swing high
+                touched      := false
+                frozenTime   := na
                 legCreatedBear := true
             else if majBullBOS and not na(majHi) and not na(majLo)
-                legDir      := 1
-                legLow      := majLo
-                legHigh     := majHi
-                legLeftTime := majHiT < majLoT ? majHiT : majLoT
-                touched     := false
-                frozenTime  := na
+                legDir       := 1
+                legLow       := majLo          // FIXED boundary
+                legHigh      := majHi          // DYNAMIC boundary (extends on higher highs)
+                legFixedTime := majLoT         // Fib start = fixed major swing low
+                touched      := false
+                frozenTime   := na
                 legCreatedBull := true
 
-        // Dynamic boundary tracks new confirmed MINOR (tier-0) extremes.
+        // Dynamic boundary extends the leg to new confirmed MINOR (tier-0) extremes.
+        // Only the dynamic endpoint moves; the fixed boundary above stays put, so
+        // the Fibonacci always spans the FULL active Major Leg, end to end.
         if legDir == -1 and not na(pl) and pl < legLow
             legLow := pl
         if legDir == 1 and not na(ph) and ph > legHigh
@@ -291,28 +297,57 @@ msEngine() =>
                         bestTop  := t
                         bestBot  := b
 
-    // Major-tier swing points (for optional SH/SL markers).
+    // Major-tier swing points (for SH/SL markers).
     shT = array.get(pvHighT, top)
     shP = array.get(pvHigh, top)
     slT = array.get(pvLowT, top)
     slP = array.get(pvLow, top)
 
-    [legDir, legHigh, legLow, f000, f025, f050, f075, f100, zoneTop, zoneBot, bestTop, bestBot, legLeftTime, frozenTime, majBearBOS, majBullBOS, legCreatedBear, legCreatedBull, legInvalidated, newMajSH, newMajSL, shT, shP, slT, slP]
+    [legDir, legHigh, legLow, f000, f025, f050, f075, f100, zoneTop, zoneBot, bestTop, bestBot, legFixedTime, frozenTime, majBearBOS, majBullBOS, legCreatedBear, legCreatedBull, legInvalidated, newMajSH, newMajSL, shT, shP, slT, slP, fracHiP, fracHiT, fracLoP, fracLoT, minBearBrk, minBullBrk]
 
 // -----------------------------------------------------------------------------
 // Evaluate the engine at the structure timeframe (lookahead OFF = no future leak).
 // -----------------------------------------------------------------------------
-[legDir, legHigh, legLow, f000, f025, f050, f075, f100, zoneTop, zoneBot, bestTop, bestBot, legLeftTime, frozenTime, evBearBOS, evBullBOS, evLegBear, evLegBull, evInval, evNewSH, evNewSL, shT, shP, slT, slP] = request.security(syminfo.tickerid, structureTF, msEngine(), lookahead = barmerge.lookahead_off)
+[legDir, legHigh, legLow, f000, f025, f050, f075, f100, zoneTop, zoneBot, bestTop, bestBot, legFixedTime, frozenTime, evBearBOS, evBullBOS, evLegBear, evLegBull, evInval, evNewSH, evNewSL, shT, shP, slT, slP, fracHiP, fracHiT, fracLoP, fracLoT, evMinBear, evMinBull] = request.security(syminfo.tickerid, structureTF, msEngine(), lookahead = barmerge.lookahead_off)
 
 // True only on the first chart bar of each new structure-timeframe bar, so
 // structure-timeframe events fire exactly once even on a lower chart timeframe.
 isNewHTF = ta.change(time(structureTF)) != 0
 
-// -----------------------------------------------------------------------------
-// Drawing — one active leg, time-anchored so it maps onto any chart timeframe.
+// =============================================================================
+// DEBUG / VALIDATION LAYER
+// =============================================================================
+// Confirmed 5-fractal markers, stamped at each fractal's own pivot bar time.
+if showDebug and showFractals and isNewHTF
+    if not na(fracHiT)
+        label.new(fracHiT, fracHiP, "H", xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_label_down, color = color.new(fracHiCol, 20), textcolor = color.white, size = size.tiny)
+    if not na(fracLoT)
+        label.new(fracLoT, fracLoP, "L", xloc = xloc.bar_time, yloc = yloc.belowbar, style = label.style_label_up, color = color.new(fracLoCol, 20), textcolor = color.white, size = size.tiny)
+
+// Minor structure zigzag — connect consecutive confirmed fractals (light lines).
+var int   lastFT = na
+var float lastFP = na
+if showDebug and showMinorZig and isNewHTF
+    if not na(fracHiT)
+        if not na(lastFT)
+            line.new(lastFT, lastFP, fracHiT, fracHiP, xloc = xloc.bar_time, color = minorCol, width = 1)
+        lastFT := fracHiT
+        lastFP := fracHiP
+    if not na(fracLoT)
+        if not na(lastFT)
+            line.new(lastFT, lastFP, fracLoT, fracLoP, xloc = xloc.bar_time, color = minorCol, width = 1)
+        lastFT := fracLoT
+        lastFP := fracLoP
+
+// Minor (internal) BOS markers — small crosses, distinct from Major BOS.
+plotshape(showDebug and showMinorBOS and evMinBear and isNewHTF, title = "Minor Bear BOS", style = shape.xcross, location = location.abovebar, color = minorBosCol, size = size.tiny)
+plotshape(showDebug and showMinorBOS and evMinBull and isNewHTF, title = "Minor Bull BOS", style = shape.xcross, location = location.belowbar, color = minorBosCol, size = size.tiny)
+
+// =============================================================================
+// MAJOR OUTPUT LAYER — one active leg, time-anchored, Fib spanning the full leg.
 // Objects extend right until first touch (frozenTime), then stay fixed. Handles
 // are deleted and rebuilt each bar; all are removed when no leg is active.
-// -----------------------------------------------------------------------------
+// =============================================================================
 var line  lnHigh = na
 var line  lnLow  = na
 var line  ln000  = na
@@ -342,38 +377,35 @@ if not na(bxZone)
 if not na(bxFVG)
     box.delete(bxFVG)
 
-if legDir != 0 and not na(legLeftTime)
+if legDir != 0 and not na(legFixedTime)
     legCol = legDir == -1 ? bearCol : bullCol
     rEdge  = na(frozenTime) ? time : frozenTime
 
     if showZone
-        bxZone := box.new(legLeftTime, zoneTop, rEdge, zoneBot, xloc = xloc.bar_time, border_color = color.new(legCol, 40), bgcolor = zoneCol)
+        bxZone := box.new(legFixedTime, zoneTop, rEdge, zoneBot, xloc = xloc.bar_time, border_color = color.new(legCol, 40), bgcolor = zoneCol)
 
     if showFibs
-        ln100 := line.new(legLeftTime, f100, rEdge, f100, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-        ln075 := line.new(legLeftTime, f075, rEdge, f075, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-        ln050 := line.new(legLeftTime, f050, rEdge, f050, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-        ln025 := line.new(legLeftTime, f025, rEdge, f025, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
-        ln000 := line.new(legLeftTime, f000, rEdge, f000, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln100 := line.new(legFixedTime, f100, rEdge, f100, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln075 := line.new(legFixedTime, f075, rEdge, f075, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln050 := line.new(legFixedTime, f050, rEdge, f050, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln025 := line.new(legFixedTime, f025, rEdge, f025, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
+        ln000 := line.new(legFixedTime, f000, rEdge, f000, xloc = xloc.bar_time, color = fibCol, style = line.style_dotted)
 
     if showLegLines
-        lnHigh := line.new(legLeftTime, legHigh, rEdge, legHigh, xloc = xloc.bar_time, color = legCol, width = 2)
-        lnLow  := line.new(legLeftTime, legLow,  rEdge, legLow,  xloc = xloc.bar_time, color = legCol, width = 2)
+        lnHigh := line.new(legFixedTime, legHigh, rEdge, legHigh, xloc = xloc.bar_time, color = legCol, width = 3)
+        lnLow  := line.new(legFixedTime, legLow,  rEdge, legLow,  xloc = xloc.bar_time, color = legCol, width = 3)
 
     if showFVG and not na(bestTop)
-        bxFVG := box.new(legLeftTime, bestTop, rEdge, bestBot, xloc = xloc.bar_time, border_color = color.new(legCol, 20), bgcolor = fvgCol)
+        bxFVG := box.new(legFixedTime, bestTop, rEdge, bestBot, xloc = xloc.bar_time, border_color = color.new(legCol, 20), bgcolor = fvgCol)
 
-// -----------------------------------------------------------------------------
-// Markers — major BOS (triangles) and confirmed Major-tier swing points. Gated
-// by isNewHTF so each structure-timeframe event is marked exactly once.
-// -----------------------------------------------------------------------------
-plotshape(showBOS and evBearBOS and isNewHTF, title = "Bearish Major BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.tiny, text = "BOS")
-plotshape(showBOS and evBullBOS and isNewHTF, title = "Bullish Major BOS", style = shape.triangleup,   location = location.belowbar, color = bullCol, size = size.tiny, text = "BOS")
+// Major BOS markers (bold) and Major-tier swing points (prominent).
+plotshape(showBOS and evBearBOS and isNewHTF, title = "Bearish Major BOS", style = shape.triangledown, location = location.abovebar, color = bearCol, size = size.small, text = "BOS")
+plotshape(showBOS and evBullBOS and isNewHTF, title = "Bullish Major BOS", style = shape.triangleup,   location = location.belowbar, color = bullCol, size = size.small, text = "BOS")
 
 if showSwings and evNewSH and isNewHTF and not na(shT)
-    label.new(shT, shP, "SH", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(bearCol, 20), textcolor = color.white, size = size.tiny)
+    label.new(shT, shP, "SH", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(bearCol, 0), textcolor = color.white, size = size.small)
 if showSwings and evNewSL and isNewHTF and not na(slT)
-    label.new(slT, slP, "SL", xloc = xloc.bar_time, style = label.style_label_up, color = color.new(bullCol, 20), textcolor = color.white, size = size.tiny)
+    label.new(slT, slP, "SL", xloc = xloc.bar_time, style = label.style_label_up, color = color.new(bullCol, 0), textcolor = color.white, size = size.small)
 
 // -----------------------------------------------------------------------------
 // Alerts — fire once per confirmed structure-timeframe event.
