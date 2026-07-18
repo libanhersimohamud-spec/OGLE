@@ -29,6 +29,18 @@ showZone     = input.bool(true,  "Premium / Discount Zone",   group = grpDisp)
 showFVG      = input.bool(true,  "Fair Value Gap",            group = grpDisp)
 showBOS      = input.bool(true,  "BOS Markers",               group = grpDisp)
 
+grpInit = "Initialization"
+// On load the engine does NOT rebuild structure forward from the oldest candle.
+// Instead it reconstructs only the currently-active Major Leg from a bounded
+// window of the most recent bars (ending at the current candle). Pine executes
+// strictly forward bar-by-bar, so the "scan backwards to reconstruct the active
+// structure" requirement is realised as a bounded recent-window forward replay:
+// replaying only the last `initLookback` bars naturally creates and discards any
+// already-invalidated legs and leaves the engine anchored to the leg that is
+// still active now — while never touching years of obsolete history. Raise this
+// if an active leg legitimately began further back than the default window.
+initLookback = input.int(2000, "Reconstruction Window (bars)", minval = 100, maxval = 20000, group = grpInit, tooltip = "How many recent bars to replay when reconstructing the active Major Leg on load. Larger = safer for long-lived legs, smaller = faster startup.")
+
 grpCol = "Colors"
 bearCol  = input.color(color.red,                       "Bearish",   group = grpCol)
 bullCol  = input.color(color.teal,                      "Bullish",   group = grpCol)
@@ -42,6 +54,14 @@ RIGHT = 5
 MAX_FVG = 300   // hard cap on stored FVGs per active leg (memory guard)
 
 confirmed = barstate.isconfirmed
+
+// Reconstruction window: the engine only acts on bars inside the most recent
+// `initLookback` bars. Bars older than the window are skipped entirely — their
+// pivots are ignored, no legs are built from them, and nothing is drawn — so the
+// engine never anchors to obsolete historical structure and startup stays fast.
+// ta.pivothigh/low are still evaluated every bar (below) so their series stay
+// consistent; only the ACTING on those values is gated by this window.
+inWindow = bar_index > last_bar_index - initLookback
 
 // -----------------------------------------------------------------------------
 // 1. Confirmed market structure (alternating highs & lows)
@@ -61,10 +81,10 @@ var int   confHighBar = na
 var float confLow     = na
 var int   confLowBar  = na
 
-if not na(ph)
+if inWindow and not na(ph)
     confHigh    := ph
     confHighBar := bar_index - RIGHT
-if not na(pl)
+if inWindow and not na(pl)
     confLow    := pl
     confLowBar := bar_index - RIGHT
 
@@ -77,13 +97,13 @@ if not na(pl)
 // -----------------------------------------------------------------------------
 var bool lowArmed  = false
 var bool highArmed = false
-if not na(pl)
+if inWindow and not na(pl)
     lowArmed := true
-if not na(ph)
+if inWindow and not na(ph)
     highArmed := true
 
-bearBOS = confirmed and not na(confLow)  and lowArmed  and close < confLow
-bullBOS = confirmed and not na(confHigh) and highArmed and close > confHigh
+bearBOS = inWindow and confirmed and not na(confLow)  and lowArmed  and close < confLow
+bullBOS = inWindow and confirmed and not na(confHigh) and highArmed and close > confHigh
 if bearBOS
     lowArmed := false
 if bullBOS
@@ -108,7 +128,7 @@ legCreatedBear = false
 legCreatedBull = false
 legInvalidated = false
 
-if confirmed
+if confirmed and inWindow
     // --- Invalidation (close beyond the FIXED boundary) ---------------------
     if legDir == -1 and close > legHigh
         legDir := 0
@@ -175,7 +195,7 @@ if legDir != 0
         zoneBot := f000
 
 // First-touch detection — extension stops once price reaches the entry Fib.
-if confirmed and legDir != 0 and not touched
+if confirmed and inWindow and legDir != 0 and not touched
     if (legDir == -1 and high >= entry) or (legDir == 1 and low <= entry)
         touched     := true
         frozenRight := bar_index
@@ -199,7 +219,7 @@ if legCreatedBear or legCreatedBull
     array.clear(fvgBot)
     array.clear(fvgTyp)
 
-if confirmed and legDir != 0
+if confirmed and inWindow and legDir != 0
     bullFVG = low > high[2]
     bearFVG = high < low[2]
     if bullFVG
