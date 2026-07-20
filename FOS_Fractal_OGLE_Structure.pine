@@ -1,123 +1,271 @@
 //@version=6
 // =============================================================================
-// Fractal-OGLE-Structure (FOS)  —  Pine Script v6 Indicator
-// Version 1.0  —  implemented strictly from the FOS Technical Specification.
+// Fractal-OGLE-Structure (FOS)  —  Pine Script v6
+// Version 2.0  —  Structure-ID engine, explicit finite-state machine.
 //
-// WHAT THIS IS
-//   A state-based market-structure engine built on CONFIRMED Bill Williams
-//   Fractals (Period = 2). It is NOT a conventional Break-of-Structure tool.
-//   Each confirmed BOS builds a complete market LEG (Leg A -> Leg B). Once a
-//   leg exists, ALL internal price action is ignored (Structure Lock) until a
-//   close breaks one of the leg boundaries.
+// ARCHITECTURE OVERVIEW
+//   * Confirmed Bill Williams fractals, CONFIGURABLE period (no hardcoded 2).
+//   * Never repaints: all transitions run on `barstate.isconfirmed`; fractals
+//     confirm via ta.pivothigh/ta.pivotlow(N, N) -> N bars after the pivot.
+//   * One explicit state variable (no boolean soup):
+//         STATE_NO_STRUCTURE / STATE_WAITING /
+//         STATE_ACTIVE_SELL  / STATE_ACTIVE_BUY
+//   * Structure-ID system: every confirmed structure is an immutable object
+//     with a unique incrementing ID; only the single ACTIVE structure is ever
+//     mutated. COMPLETED / INVALID structures are frozen forever and kept in an
+//     array for history / future features. Only the ACTIVE one is drawn.
 //
-// NON-REPAINT GUARANTEE
-//   * Fractals use ta.pivothigh/ta.pivotlow(2, 2) -> confirmed 2 bars later.
-//   * All state transitions run only on `barstate.isconfirmed` (closed bars),
-//     so every `close` comparison uses a final, non-repainting value.
+// AGREED DECISIONS (user-confirmed):
+//   Q1  Leg A = WICK/GAP invalidation -> structure INVALID -> NO_STRUCTURE.
+//       (Original "body-close reversal creates opposite leg" is REMOVED;
+//        opposite direction can only arise from a fresh structureless BOS.)
+//   Q2  Continuation = "freeze-then-seed": on a Leg B break the old structure
+//       is COMPLETED and the SAME break candle becomes the new same-direction
+//       BOS Candidate (Rule 6 forbids only the INVALIDATION candle from seeding).
+//   Q3  Continuation triggers on candle BODY CLOSE beyond Leg B; invalidation
+//       triggers on WICK/GAP beyond Leg A.
+//   Q4  Only the ACTIVE structure is drawn; on freeze its drawings are deleted,
+//       data is retained in the immutable object.
+//   Leg B two-stage (user rule) with Option A (step-down / sticky):
+//       Candidate Leg B = current extreme confirmed fractal of the active leg.
+//       Validated Leg B = Candidate promoted once an OPPOSITE confirmed fractal
+//                         forms AFTER it (a completed swing). Validated Leg B
+//                         only steps DOWN (sell) / UP (buy) through completed
+//                         swings and STAYS until a newer extreme is itself
+//                         validated. ONLY Validated Leg B triggers continuation.
 //
-// LEG LIFECYCLE (per user directive — applies to EVERY leg with no exception):
-//   1. A boundary break creates a BOS Candidate.
-//   2. Wait for the required confirmation fractal (Sell -> first FS-Low after
-//      the candidate; Buy -> first FS-High after the candidate).
-//   3. Only on confirmation is the new Active Leg created.
-//   4. If an opposite BOS Candidate appears before confirmation, the previous
-//      candidate is cancelled and the newest candidate remains.
-//   This same cycle governs the initial leg, every continuation, and every
-//   reversal — identically.
+// PER-CANDLE EVENT PRIORITY (never changes):
+//   1. Invalidation  2. Completion  3. BOS Candidate Detection
+//   4. Fractal / Leg-B Updates      5. Drawing Updates
+//   Enforced structurally: exactly one FSM branch runs per confirmed bar, and
+//   inside the ACTIVE branch invalidation is tested before completion.
 //
-// STATE MACHINE (mapped to the spec's States 1-6):
-//   legDir == 0  -> no Active Leg (States 1-2): boundaries are the latest
-//                   confirmed fractals; a close beyond one opens a Candidate.
-//   candDir != 0 -> Candidate pending (States 3-4): waiting for confirmation;
-//                   opposite candidate cancels the current one.
-//   legDir != 0  -> Active Leg / Structure Lock (States 5-6): only Leg A / Leg B
-//                   boundary breaks matter. Break Leg B => continuation candidate
-//                   (same direction). Break Leg A => reversal candidate (opposite).
-//
-// The code is intentionally sectioned and heavily commented so new features can
-// be added without rewriting the core state machine.
+// MODULES: drawStructure() createStructure() updateLegB() checkInvalidation()
+//          checkContinuation() freezeStructure()  + the FSM driver.
 // =============================================================================
-indicator("Fractal-OGLE-Structure (FOS)", shorttitle = "FOS", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+indicator("Fractal-OGLE-Structure (FOS)", shorttitle = "FOS", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
 
 // =============================================================================
 // SECTION 0 — INPUTS
 // =============================================================================
-showFractals  = input.bool(true, "Show confirmed fractal markers", group = "Fractals")
-showBosLines  = input.bool(true, "Show BOS lines",                  group = "BOS")
-showBosLabels = input.bool(true, "Show BOS / Continuation / Reversal labels", group = "BOS")
-showLegs      = input.bool(true, "Show Leg A / Leg B lines",        group = "Legs / Structure")
-showActiveBox = input.bool(true, "Show Active Leg box",             group = "Legs / Structure")
+fractalPeriod = input.int(2, "Fractal Period", minval = 1, maxval = 20, step = 1, group = "Engine", tooltip = "Bill Williams fractal half-width (bars on each side). 2 = classic 5-bar fractal. The whole engine adapts automatically; nothing is hardcoded.")
 
-colHigh    = input.color(color.red,   "FS-High marker color", group = "Fractals")
-colLow     = input.color(color.green, "FS-Low marker color",  group = "Fractals")
-colBos     = input.color(color.orange,"BOS line color",       group = "BOS")
-colSell    = input.color(color.red,   "Sell leg color",       group = "Legs / Structure")
-colBuy     = input.color(color.green, "Buy leg color",        group = "Legs / Structure")
-colBoxSell = input.color(color.new(color.red,   90), "Sell active-leg fill", group = "Legs / Structure")
-colBoxBuy  = input.color(color.new(color.green, 90), "Buy active-leg fill",  group = "Legs / Structure")
+showFractals = input.bool(false, "Show confirmed fractal markers (aid)", group = "Visuals")
+showBosLines = input.bool(true,  "Show BOS line",                          group = "Visuals")
+showLegs     = input.bool(true,  "Show Leg A / Validated Leg B lines",     group = "Visuals")
+showBox      = input.bool(true,  "Show active structure box",              group = "Visuals")
+showLabels   = input.bool(true,  "Show BOS labels",                        group = "Visuals")
+
+debugMode    = input.bool(false, "Debug Mode", group = "Debug", tooltip = "Shows the state table, the Candidate Leg B (dotted line), and a background tint per state.")
+
+colSell    = input.color(color.red,                 "Sell color",     group = "Colors")
+colBuy     = input.color(color.green,               "Buy color",      group = "Colors")
+colBos     = input.color(color.orange,              "BOS line color", group = "Colors")
+colBoxSell = input.color(color.new(color.red,   90),"Sell box fill",  group = "Colors")
+colBoxBuy  = input.color(color.new(color.green, 90),"Buy box fill",   group = "Colors")
 
 // =============================================================================
-// SECTION 1 — FRACTAL ENGINE  (Bill Williams, Period = 2, confirmed only)
+// SECTION 1 — CONSTANTS (explicit FSM states & structure statuses)
+// =============================================================================
+int STATE_NO_STRUCTURE = 0
+int STATE_WAITING      = 1
+int STATE_ACTIVE_SELL  = 2
+int STATE_ACTIVE_BUY   = 3
+
+int STATUS_ACTIVE      = 0
+int STATUS_COMPLETED   = 1
+int STATUS_INVALID     = 2
+
+// =============================================================================
+// SECTION 2 — FRACTAL ENGINE (configurable period, confirmed only, no repaint)
 // -----------------------------------------------------------------------------
-// ta.pivothigh(2,2) / ta.pivotlow(2,2) return the pivot value only once it is
-// fully confirmed — i.e. 2 bars AFTER the pivot bar. This is the classic
-// 5-bar Bill Williams fractal (2 left + centre + 2 right) and never repaints.
-// The pivot bar sits at (bar_index - 2) at the moment of confirmation.
+// ta.pivothigh(N,N) / ta.pivotlow(N,N) return a value only when the centre bar
+// (bar_index - N) is confirmed as a pivot, i.e. N bars later. Changing the
+// `fractalPeriod` input immediately re-scales the entire engine.
 // =============================================================================
-float ph = ta.pivothigh(2, 2)   // confirmed FS-High value (na when none this bar)
-float pl = ta.pivotlow(2, 2)    // confirmed FS-Low  value (na when none this bar)
-
-bool  newHigh = not na(ph)      // a new confirmed FS-High confirmed on THIS bar
-bool  newLow  = not na(pl)      // a new confirmed FS-Low  confirmed on THIS bar
-int   pivBar  = bar_index - 2   // bar index of the pivot that just confirmed
-
-// Visual: confirmed fractal markers, drawn back on the actual pivot bar via the
-// -2 plot offset. These simply annotate every confirmed fractal (spec §12).
-plotshape(showFractals and newHigh, title = "FS-High", style = shape.triangledown, location = location.abovebar, color = colHigh, size = size.tiny, offset = -2)
-plotshape(showFractals and newLow,  title = "FS-Low",  style = shape.triangleup,   location = location.belowbar, color = colLow,  size = size.tiny, offset = -2)
+float ph      = ta.pivothigh(fractalPeriod, fractalPeriod)  // confirmed FS-High value (na = none)
+float pl      = ta.pivotlow(fractalPeriod, fractalPeriod)   // confirmed FS-Low  value (na = none)
+bool  newHigh = not na(ph)                                  // FS-High confirmed on THIS bar
+bool  newLow  = not na(pl)                                  // FS-Low  confirmed on THIS bar
+int   pivBar  = bar_index - fractalPeriod                   // centre (pivot) bar that just confirmed
 
 // =============================================================================
-// SECTION 2 — PERSISTENT STATE
+// SECTION 3 — STRUCTURE OBJECT (immutable once COMPLETED / INVALID)
 // =============================================================================
-// --- Running "latest confirmed fractal" trackers (value + pivot bar) ---------
+type FosStructure
+    int   id                  // unique, incrementing, never reused
+    int   dir                 // +1 BUY, -1 SELL
+    int   status              // ACTIVE / COMPLETED / INVALID
+    float legA                // reversal/invalidation boundary
+    int   legABar
+    float legBCandidate       // current extreme fractal of the leg (NOT tradeable)
+    int   legBCandidateBar
+    float legBValidated       // completed-swing Leg B (the ONLY continuation boundary)
+    int   legBValidatedBar
+    int   bosCandleBar        // the BOS candidate candle
+    float bosLevel            // broken boundary level (BOS-line start)
+    int   bosLevelBar
+    int   confFractalBar      // confirming fractal pivot bar
+    int   creationBar
+    int   completionBar
+    int   invalidationBar
+    line  bosLine
+    line  legALine
+    line  legBLine            // validated Leg B line
+    line  legBCandLine        // candidate Leg B line (debug only)
+    box   legBox
+    label eventLabel
+
+// =============================================================================
+// SECTION 4 — MODULE FUNCTIONS
+// Pine functions may mutate fields of the object passed in (reference semantics)
+// but cannot write module-level `var`s, so global engine state (trackers,
+// candidate, FSM state) is driven inline in SECTION 6.
+// =============================================================================
+
+// --- drawStructure(): create the on-chart objects for a freshly ACTIVE leg ---
+drawStructure(FosStructure s) =>
+    col   = s.dir == -1 ? colSell : colBuy
+    bxcol = s.dir == -1 ? colBoxSell : colBoxBuy
+    if showBosLines
+        s.bosLine := line.new(s.bosLevelBar, s.bosLevel, s.bosCandleBar, s.bosLevel, xloc = xloc.bar_index, color = colBos, width = 2)
+    if showLabels
+        txt = (s.dir == -1 ? "SELL BOS #" : "BUY BOS #") + str.tostring(s.id)
+        s.eventLabel := label.new(s.bosCandleBar, s.bosLevel, txt, xloc = xloc.bar_index, style = s.dir == -1 ? label.style_label_down : label.style_label_up, color = col, textcolor = color.white, size = size.small)
+    if showLegs
+        // Leg A is fixed for the life of the structure -> extend right.
+        s.legALine := line.new(s.legABar, s.legA, bar_index, s.legA, xloc = xloc.bar_index, color = col, width = 1, style = line.style_dashed, extend = extend.right)
+    if showBox
+        // Box envelope spans Leg A to the current extreme (candidate).
+        top = math.max(s.legA, s.legBCandidate)
+        bot = math.min(s.legA, s.legBCandidate)
+        s.legBox := box.new(math.min(s.legABar, s.legBCandidateBar), top, bar_index, bot, xloc = xloc.bar_index, border_color = col, bgcolor = bxcol)
+    s
+
+// --- createStructure(): build a new ACTIVE structure object -------------------
+createStructure(int dir, float legA, int legABar, float legBCand, int legBCandBar, int bosBar, float bosLevel, int bosLevelBar, int confBar, int id) =>
+    s = FosStructure.new()
+    s.id               := id
+    s.dir              := dir
+    s.status           := STATUS_ACTIVE
+    s.legA             := legA
+    s.legABar          := legABar
+    s.legBCandidate    := legBCand      // the confirming fractal starts as CANDIDATE only
+    s.legBCandidateBar := legBCandBar
+    s.legBValidated    := na            // no validated Leg B yet -> continuation disabled
+    s.legBValidatedBar := na
+    s.bosCandleBar     := bosBar
+    s.bosLevel         := bosLevel
+    s.bosLevelBar      := bosLevelBar
+    s.confFractalBar   := confBar
+    s.creationBar      := bar_index
+    s.completionBar    := na
+    s.invalidationBar  := na
+    drawStructure(s)
+    s
+
+// --- updateLegB(): two-stage Leg B (Candidate -> Validated) + drawing ---------
+// Candidate updates on a new extreme in the leg direction. Validation promotes
+// the candidate the first time an OPPOSITE confirmed fractal forms after it
+// (a completed swing). Option A: Validated Leg B is sticky and only steps in
+// the leg direction as newer extremes get validated.
+updateLegB(FosStructure s) =>
+    // Stage 1 — Candidate update (new extreme).
+    if s.dir == -1 and newLow and pl < s.legBCandidate
+        s.legBCandidate    := pl
+        s.legBCandidateBar := pivBar
+    if s.dir == 1 and newHigh and ph > s.legBCandidate
+        s.legBCandidate    := ph
+        s.legBCandidateBar := pivBar
+    // Stage 2 — Validation (opposite fractal forms AFTER the current candidate).
+    if s.dir == -1 and newHigh and pivBar > s.legBCandidateBar
+        s.legBValidated    := s.legBCandidate
+        s.legBValidatedBar := s.legBCandidateBar
+    if s.dir == 1 and newLow and pivBar > s.legBCandidateBar
+        s.legBValidated    := s.legBCandidate
+        s.legBValidatedBar := s.legBCandidateBar
+    // Drawing — validated Leg B (solid, tradeable boundary).
+    col = s.dir == -1 ? colSell : colBuy
+    if showLegs and not na(s.legBValidated)
+        if na(s.legBLine)
+            s.legBLine := line.new(s.legBValidatedBar, s.legBValidated, bar_index, s.legBValidated, xloc = xloc.bar_index, color = col, width = 2, extend = extend.right)
+        else
+            line.set_xy1(s.legBLine, s.legBValidatedBar, s.legBValidated)
+            line.set_xy2(s.legBLine, bar_index, s.legBValidated)
+    // Drawing — candidate Leg B (dotted, debug only, NOT tradeable).
+    if debugMode
+        if na(s.legBCandLine)
+            s.legBCandLine := line.new(s.legBCandidateBar, s.legBCandidate, bar_index, s.legBCandidate, xloc = xloc.bar_index, color = color.new(col, 40), width = 1, style = line.style_dotted, extend = extend.right)
+        else
+            line.set_xy1(s.legBCandLine, s.legBCandidateBar, s.legBCandidate)
+            line.set_xy2(s.legBCandLine, bar_index, s.legBCandidate)
+    // Drawing — box envelope follows the candidate extreme.
+    if not na(s.legBox)
+        box.set_top(s.legBox, math.max(s.legA, s.legBCandidate))
+        box.set_bottom(s.legBox, math.min(s.legA, s.legBCandidate))
+    s
+
+// --- checkInvalidation(): Leg A violated by WICK or GAP (Q1 / Rule 9) ---------
+checkInvalidation(FosStructure s) =>
+    s.dir == -1 ? high > s.legA : low < s.legA
+
+// --- checkContinuation(): body CLOSE beyond the VALIDATED Leg B (Q3) ----------
+checkContinuation(FosStructure s) =>
+    not na(s.legBValidated) and (s.dir == -1 ? close < s.legBValidated : close > s.legBValidated)
+
+// --- freezeStructure(): mark immutable + remove drawings (Q4) ------------------
+freezeStructure(FosStructure s, int newStatus, int barIdx) =>
+    s.status := newStatus
+    if newStatus == STATUS_COMPLETED
+        s.completionBar := barIdx
+    else
+        s.invalidationBar := barIdx
+    if not na(s.bosLine)
+        line.delete(s.bosLine)
+    if not na(s.legALine)
+        line.delete(s.legALine)
+    if not na(s.legBLine)
+        line.delete(s.legBLine)
+    if not na(s.legBCandLine)
+        line.delete(s.legBCandLine)
+    if not na(s.legBox)
+        box.delete(s.legBox)
+    if not na(s.eventLabel)
+        label.delete(s.eventLabel)
+    s
+
+// =============================================================================
+// SECTION 5 — PERSISTENT ENGINE STATE
+// =============================================================================
+// Running "latest confirmed fractal" trackers.
 var float lastHigh    = na
 var int   lastHighBar = na
 var float lastLow     = na
 var int   lastLowBar  = na
 
-// --- Active Leg --------------------------------------------------------------
-// legDir:  0 = none, +1 = Buy Leg active, -1 = Sell Leg active
-var int   legDir  = 0
-var float legA    = na          // Leg A boundary price (reversal boundary)
-var int   legABar = na
-var float legB    = na          // Leg B boundary price (continuation boundary, dynamic)
-var int   legBBar = na
+// Pending BOS Candidate (exists ONLY in NO_STRUCTURE/WAITING — Rule 5).
+var int   candDir      = 0     // 0 none, +1 buy, -1 sell
+var int   candBar      = na
+var float candLevel    = na
+var int   candLevelBar = na
+var float candLegA     = na
+var int   candLegABar  = na
 
-// --- Pending BOS Candidate ---------------------------------------------------
-// candDir: 0 = none, +1 = Buy candidate, -1 = Sell candidate
-var int   candDir      = 0
-var int   candBar      = na     // bar_index of the candidate (break) candle
-var float candLevel    = na     // the broken boundary price -> BOS line start level
-var int   candLevelBar = na     // bar of the broken boundary -> BOS line start x
-var float candLegA     = na     // snapshot of the prospective new Leg A price
-var int   candLegABar  = na     // snapshot of the prospective new Leg A bar
-
-// --- Drawing handles for the current Active Leg ------------------------------
-var line legALine = na
-var line legBLine = na
-var box  legBox   = na
+// Structure store + active pointer + ID counter + explicit FSM state.
+var array<FosStructure> structures = array.new<FosStructure>()
+var FosStructure        active     = na
+var int                 nextId     = 1
+var int                 st         = STATE_NO_STRUCTURE
 
 // =============================================================================
-// SECTION 3 — MAIN STATE MACHINE  (confirmed bars only => never repaints)
+// SECTION 6 — FSM DRIVER (confirmed bars only => never repaints)
+// Exactly ONE state branch runs per bar; that structurally enforces the event
+// priority and Rule 6 (an invalidation candle can never seed a candidate).
 // =============================================================================
 if barstate.isconfirmed
 
-    // -------------------------------------------------------------------------
-    // 3.a  Update running latest-confirmed fractals.
-    //      Done first so any fractal confirmed on THIS bar (pivot at bar-2,
-    //      which precedes the current close) counts as "the latest confirmed
-    //      fractal immediately preceding" the current candle.
-    // -------------------------------------------------------------------------
+    // (Priority 4a) Update latest-confirmed fractal trackers first, so detection
+    // and Leg A snapshots see the newest fractal that precedes the current close.
     if newHigh
         lastHigh    := ph
         lastHighBar := pivBar
@@ -125,194 +273,144 @@ if barstate.isconfirmed
         lastLow    := pl
         lastLowBar := pivBar
 
-    bool legJustCreated = false
+    // Optional confirmed-fractal markers (development aid; off by default so
+    // internal fractals are not drawn during an active structure — Rule 11).
+    if showFractals and newHigh
+        label.new(pivBar, ph, "H", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_down, color = color.new(colSell, 40), textcolor = color.white, size = size.tiny)
+    if showFractals and newLow
+        label.new(pivBar, pl, "L", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_up, color = color.new(colBuy, 40), textcolor = color.white, size = size.tiny)
 
     // -------------------------------------------------------------------------
-    // 3.b  CONFIRMATION of a pending BOS Candidate  (spec §4).
-    //      Sell candidate  -> confirmed by the first FS-Low  forming AFTER it.
-    //      Buy  candidate  -> confirmed by the first FS-High forming AFTER it.
-    //      "After" = the confirming pivot bar is strictly later than the
-    //      candidate (break) candle: pivBar > candBar.
-    // -------------------------------------------------------------------------
-    bool  doCreate = false
-    int   newDir   = 0
-    float newB     = na
-    int   newBBar  = na
+    if st == STATE_ACTIVE_SELL or st == STATE_ACTIVE_BUY
+        // ===== ACTIVE structure: structure locked; only Leg A / Leg B matter ==
 
-    if candDir == -1 and newLow and pivBar > candBar
-        doCreate := true
-        newDir   := -1
-        newB     := pl          // new Sell Leg B initialises to this confirming FS-Low
-        newBBar  := pivBar
-    else if candDir == 1 and newHigh and pivBar > candBar
-        doCreate := true
-        newDir   := 1
-        newB     := ph          // new Buy Leg B initialises to this confirming FS-High
-        newBBar  := pivBar
+        // (Priority 1) Invalidation — Leg A violated by wick/gap.
+        if checkInvalidation(active)
+            freezeStructure(active, STATUS_INVALID, bar_index)
+            active := na
+            st     := STATE_NO_STRUCTURE
+            // Rule 6: this candle does NOT seed a candidate (no detection runs).
 
-    if doCreate
-        // Classify the event relative to the leg being replaced (spec §8/§9):
-        //   no prior leg      -> initial BOS
-        //   same direction    -> Continuation
-        //   opposite direction-> Reversal
-        int    priorDir = legDir
-        string kind = priorDir == 0 ? "BOS" : (newDir == priorDir ? "CONT" : "REV")
+        // (Priority 2) Completion — body close beyond the VALIDATED Leg B.
+        else if checkContinuation(active)
+            int   d         = active.dir
+            float bLevel    = active.legBValidated
+            int   bLevelBar = active.legBValidatedBar
+            freezeStructure(active, STATUS_COMPLETED, bar_index)
+            active := na
+            // Freeze-then-seed (Q2): the SAME break candle becomes the new
+            // same-direction BOS Candidate; Leg A = latest confirmed opposite fractal.
+            candDir      := d
+            candBar      := bar_index
+            candLevel    := bLevel
+            candLevelBar := bLevelBar
+            if d == -1
+                candLegA    := lastHigh
+                candLegABar := lastHighBar
+            else
+                candLegA    := lastLow
+                candLegABar := lastLowBar
+            st := STATE_WAITING
 
-        // Commit the new Active Leg. Leg A comes from the snapshot taken when the
-        // candidate formed; Leg B is the confirming fractal and becomes dynamic.
-        legDir  := newDir
-        legA    := candLegA
-        legABar := candLegABar
-        legB    := newB
-        legBBar := newBBar
-
-        // --- BOS line (spec §10): horizontal from the broken boundary to the
-        //     BOS candle. ------------------------------------------------------
-        if showBosLines
-            line.new(candLevelBar, candLevel, candBar, candLevel, xloc = xloc.bar_index, color = colBos, width = 2, style = line.style_solid)
-
-        // --- Event label (spec §12) ------------------------------------------
-        if showBosLabels
-            string txt = kind == "BOS"  ? (newDir == -1 ? "Sell BOS"             : "Buy BOS") : kind == "CONT" ? (newDir == -1 ? "Bearish Continuation" : "Bullish Continuation") : (newDir == -1 ? "Bearish Reversal"     : "Bullish Reversal")
-            label.new(candBar, candLevel, txt, xloc = xloc.bar_index, style = newDir == -1 ? label.style_label_down : label.style_label_up, color = newDir == -1 ? colSell : colBuy, textcolor = color.white, size = size.small)
-
-        // --- (Re)draw the Active Leg boundaries & box ------------------------
-        //     Only ONE Active Leg may exist, so previous drawings are removed.
-        if not na(legALine)
-            line.delete(legALine)
-        if not na(legBLine)
-            line.delete(legBLine)
-        if not na(legBox)
-            box.delete(legBox)
-
-        color legCol = newDir == -1 ? colSell : colBuy
-        if showLegs
-            legALine := line.new(legABar, legA, bar_index, legA, xloc = xloc.bar_index, color = legCol, width = 1, style = line.style_dashed, extend = extend.right)
-            legBLine := line.new(legBBar, legB, bar_index, legB, xloc = xloc.bar_index, color = legCol, width = 2, style = line.style_solid,  extend = extend.right)
-        if showActiveBox
-            float boxTop = math.max(legA, legB)
-            float boxBot = math.min(legA, legB)
-            legBox := box.new(math.min(legABar, legBBar), boxTop, bar_index, boxBot, xloc = xloc.bar_index, border_color = legCol, bgcolor = newDir == -1 ? colBoxSell : colBoxBuy)
-
-        candDir        := 0     // candidate consumed
-        legJustCreated := true  // suppress fresh candidate detection on this bar
-
-    // -------------------------------------------------------------------------
-    // 3.c  CANDIDATE DETECTION.
-    //      Skipped on the exact bar a leg was just created, to avoid an instant
-    //      re-trigger against the brand-new boundaries.
-    // -------------------------------------------------------------------------
-    if not legJustCreated
-
-        if legDir == 0
-            // -----------------------------------------------------------------
-            // BOOTSTRAP (States 1-2): no Active Leg yet. Boundaries are the
-            // latest confirmed fractals. Body close only; equal closes ignored;
-            // only the FIRST breaking candle opens a candidate (guarded by the
-            // candDir checks). A sell candidate needs an FS-High for Leg A (and
-            // vice-versa) — otherwise the leg cannot be built, so we wait.
-            // -----------------------------------------------------------------
-            if not na(lastLow) and not na(lastHigh) and close < lastLow
-                if candDir != -1
-                    candDir      := -1
-                    candBar      := bar_index
-                    candLevel    := lastLow
-                    candLevelBar := lastLowBar
-                    candLegA     := lastHigh
-                    candLegABar  := lastHighBar
-            else if not na(lastHigh) and not na(lastLow) and close > lastHigh
-                if candDir != 1
-                    candDir      := 1
-                    candBar      := bar_index
-                    candLevel    := lastHigh
-                    candLevelBar := lastHighBar
-                    candLegA     := lastLow
-                    candLegABar  := lastLowBar
-
+        // (Priority 4b) Otherwise: update Leg B (candidate + validation) & grow box.
         else
-            // -----------------------------------------------------------------
-            // STRUCTURE LOCK (States 5-6): an Active Leg exists. All internal
-            // fractals / closes / swings are ignored for BOS purposes — ONLY
-            // Leg A and Leg B boundaries can produce a new candidate.
-            // -----------------------------------------------------------------
-
-            // Leg B is dynamic: it tracks the extreme confirmed swing of the
-            // active leg (lowest FS-Low for a Sell Leg, highest FS-High for a
-            // Buy Leg). This is the ONLY internal use of fractals while locked.
-            if legDir == -1 and newLow and pl < legB
-                legB    := pl
-                legBBar := pivBar
-                if not na(legBLine)
-                    line.set_xy1(legBLine, legBBar, legB)
-                    line.set_xy2(legBLine, bar_index, legB)
-            if legDir == 1 and newHigh and ph > legB
-                legB    := ph
-                legBBar := pivBar
-                if not na(legBLine)
-                    line.set_xy1(legBLine, legBBar, legB)
-                    line.set_xy2(legBLine, bar_index, legB)
-
-            // Boundary breaks -> candidates. Reversal (Leg A) is evaluated
-            // before continuation (Leg B); they are mutually exclusive anyway
-            // because Leg A and Leg B sit on opposite sides of price.
-            if legDir == -1
-                // Active SELL leg: Leg A = high boundary, Leg B = low boundary.
-                if close > legA and not na(lastLow)
-                    // Reversal -> Buy candidate (opposite cancels any pending).
-                    if candDir != 1
-                        candDir      := 1
-                        candBar      := bar_index
-                        candLevel    := legA
-                        candLevelBar := legABar
-                        candLegA     := lastLow          // new Buy Leg A = latest confirmed FS-Low
-                        candLegABar  := lastLowBar
-                else if close < legB and not na(lastHigh)
-                    // Continuation -> Sell candidate (same direction).
-                    if candDir != -1
-                        candDir      := -1
-                        candBar      := bar_index
-                        candLevel    := legB
-                        candLevelBar := legBBar
-                        candLegA     := lastHigh         // new Sell Leg A = latest confirmed FS-High
-                        candLegABar  := lastHighBar
-
-            else if legDir == 1
-                // Active BUY leg: Leg A = low boundary, Leg B = high boundary.
-                if close < legA and not na(lastHigh)
-                    // Reversal -> Sell candidate (opposite cancels any pending).
-                    if candDir != -1
-                        candDir      := -1
-                        candBar      := bar_index
-                        candLevel    := legA
-                        candLevelBar := legABar
-                        candLegA     := lastHigh         // new Sell Leg A = latest confirmed FS-High
-                        candLegABar  := lastHighBar
-                else if close > legB and not na(lastLow)
-                    // Continuation -> Buy candidate (same direction).
-                    if candDir != 1
-                        candDir      := 1
-                        candBar      := bar_index
-                        candLevel    := legB
-                        candLevelBar := legBBar
-                        candLegA     := lastLow          // new Buy Leg A = latest confirmed FS-Low
-                        candLegABar  := lastLowBar
+            updateLegB(active)
+            if not na(active.legBox)
+                box.set_right(active.legBox, bar_index)
 
     // -------------------------------------------------------------------------
-    // 3.d  Keep the Active Leg box growing to the right while a leg is active.
+    else if st == STATE_WAITING
+        // ===== Candidate pending: wait for confirmation; opposite cancels ======
+
+        // (Confirmation) Sell -> first FS-Low after candidate; Buy -> first FS-High.
+        if candDir == -1 and newLow and pivBar > candBar
+            s = createStructure(-1, candLegA, candLegABar, pl, pivBar, candBar, candLevel, candLevelBar, pivBar, nextId)
+            array.push(structures, s)
+            active := s
+            nextId := nextId + 1
+            candDir := 0
+            st     := STATE_ACTIVE_SELL
+        else if candDir == 1 and newHigh and pivBar > candBar
+            s = createStructure(1, candLegA, candLegABar, ph, pivBar, candBar, candLevel, candLevelBar, pivBar, nextId)
+            array.push(structures, s)
+            active := s
+            nextId := nextId + 1
+            candDir := 0
+            st     := STATE_ACTIVE_BUY
+        else
+            // (Priority 3) Opposite-candidate cancellation (body close only).
+            bool detBuy  = not na(lastHigh) and close > lastHigh
+            bool detSell = not na(lastLow)  and close < lastLow
+            if candDir == -1 and detBuy and not na(lastLow)
+                candDir      := 1
+                candBar      := bar_index
+                candLevel    := lastHigh
+                candLevelBar := lastHighBar
+                candLegA     := lastLow
+                candLegABar  := lastLowBar
+            else if candDir == 1 and detSell and not na(lastHigh)
+                candDir      := -1
+                candBar      := bar_index
+                candLevel    := lastLow
+                candLevelBar := lastLowBar
+                candLegA     := lastHigh
+                candLegABar  := lastHighBar
+
     // -------------------------------------------------------------------------
-    if legDir != 0 and not na(legBox)
-        box.set_right(legBox, bar_index)
+    else
+        // ===== STATE_NO_STRUCTURE: hunt a fresh BOS candidate =================
+        // (Priority 3) Body close beyond the latest confirmed fractal. A sell
+        // needs an FS-High for Leg A (and vice-versa); otherwise wait.
+        bool detBuy  = not na(lastHigh) and close > lastHigh
+        bool detSell = not na(lastLow)  and close < lastLow
+        if detSell and not na(lastHigh)
+            candDir      := -1
+            candBar      := bar_index
+            candLevel    := lastLow
+            candLevelBar := lastLowBar
+            candLegA     := lastHigh
+            candLegABar  := lastHighBar
+            st           := STATE_WAITING
+        else if detBuy and not na(lastLow)
+            candDir      := 1
+            candBar      := bar_index
+            candLevel    := lastHigh
+            candLevelBar := lastHighBar
+            candLegA     := lastLow
+            candLegABar  := lastLowBar
+            st           := STATE_WAITING
 
 // =============================================================================
-// SECTION 4 — STATUS TABLE (optional lightweight diagnostics)
-// -----------------------------------------------------------------------------
-// Small, self-contained readout of the current state. Purely informational and
-// isolated from the engine, so it can be removed or extended freely.
+// SECTION 7 — DEBUG (Priority 5: drawing) — shown only when Debug Mode = ON
 // =============================================================================
-var table fosTbl = table.new(position.top_right, 1, 3, border_width = 1)
-if barstate.islast
-    string sLeg  = legDir == 0 ? "None" : legDir == -1 ? "SELL" : "BUY"
-    string sCand = candDir == 0 ? "None" : candDir == -1 ? "Sell (pending)" : "Buy (pending)"
-    table.cell(fosTbl, 0, 0, "Fractal-OGLE-Structure", text_color = color.white, bgcolor = color.new(color.blue, 20), text_size = size.small)
-    table.cell(fosTbl, 0, 1, "Active Leg: " + sLeg, text_color = color.white, bgcolor = legDir == -1 ? color.new(color.red, 30) : legDir == 1 ? color.new(color.green, 30) : color.new(color.gray, 30), text_size = size.small)
-    table.cell(fosTbl, 0, 2, "Candidate: " + sCand, text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+bgcolor(debugMode ? (st == STATE_ACTIVE_SELL ? color.new(color.red, 92) : st == STATE_ACTIVE_BUY ? color.new(color.green, 92) : st == STATE_WAITING ? color.new(color.yellow, 93) : na) : na)
+
+var table dbg = table.new(position.top_right, 2, 9, border_width = 1)
+if debugMode and barstate.islast
+    string stName   = st == STATE_NO_STRUCTURE ? "NO_STRUCTURE" : st == STATE_WAITING ? "WAITING_FOR_CONFIRMATION" : st == STATE_ACTIVE_SELL ? "ACTIVE_SELL" : "ACTIVE_BUY"
+    string idStr    = na(active) ? "-" : str.tostring(active.id)
+    string legAStr  = na(active) ? "-" : str.tostring(active.legA, format.mintick)
+    string legBvStr = na(active) ? "-" : na(active.legBValidated) ? "-" : str.tostring(active.legBValidated, format.mintick)
+    string legBcStr = na(active) ? "-" : str.tostring(active.legBCandidate, format.mintick)
+    string candStr  = candDir == 0 ? "none" : (candDir == -1 ? "SELL @ " : "BUY @ ") + str.tostring(candLevel, format.mintick)
+    string hiStr    = na(lastHigh) ? "-" : str.tostring(lastHigh, format.mintick)
+    string loStr    = na(lastLow)  ? "-" : str.tostring(lastLow,  format.mintick)
+
+    table.cell(dbg, 0, 0, "FOS — DEBUG",     text_color = color.white, bgcolor = color.new(color.blue, 10), text_size = size.small)
+    table.cell(dbg, 1, 0, "state machine",   text_color = color.white, bgcolor = color.new(color.blue, 10), text_size = size.small)
+    table.cell(dbg, 0, 1, "State",           text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(dbg, 1, 1, stName,            text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(dbg, 0, 2, "Structure ID",    text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 1, 2, idStr,             text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 0, 3, "Leg A",           text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(dbg, 1, 3, legAStr,           text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(dbg, 0, 4, "Leg B (valid)",   text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 1, 4, legBvStr,          text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 0, 5, "Leg B (cand)",    text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(dbg, 1, 5, legBcStr,          text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(dbg, 0, 6, "BOS Candidate",   text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 1, 6, candStr,           text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 0, 7, "Last FS-High",    text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(dbg, 1, 7, hiStr,             text_color = color.white, bgcolor = color.new(color.gray, 20), text_size = size.small)
+    table.cell(dbg, 0, 8, "Last FS-Low",     text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
+    table.cell(dbg, 1, 8, loStr,             text_color = color.white, bgcolor = color.new(color.gray, 30), text_size = size.small)
